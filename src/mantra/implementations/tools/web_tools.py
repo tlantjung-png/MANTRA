@@ -319,7 +319,7 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 try:
                     infos = fut.result(timeout=2)
                 except concurrent.futures.TimeoutError:
-                    _DNS_CACHE[host] = (now, False)
+                    # Don't cache timeout — transient failure should not poison cache
                     return False
                 for family, _, _, _, sockaddr in infos:
                     addr = sockaddr[0]

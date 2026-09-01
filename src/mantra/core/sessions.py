@@ -58,11 +58,17 @@ def derive_name(workspace: str = "", model: str = "") -> str:
 
 def _path(name: str) -> Path:
     # Sanitize name to prevent path traversal (e.g. ../../etc/passwd)
+    # Include hash of original name in fallback to avoid collisions where
+    # distinct unsafe names previously mapped to same generic slug.
+    import hashlib
     safe = re.sub(r"[^a-zA-Z0-9._-]", "-", name).strip("-._")
-    # Also handle slug-style but keep original if safe
+    original = name
     if not safe or safe != name:
-        # Use slug fallback for unsafe names, but preserve extension handling
-        safe = _slug(name) or "session"
+        # Use slug fallback but incorporate hash of original for uniqueness
+        slug_base = _slug(name) or "session"
+        # Short hash of original name to disambiguate different unsafe inputs
+        digest = hashlib.sha256(original.encode("utf-8")).hexdigest()[:6]
+        safe = f"{slug_base}-{digest}"
     # Prevent directory traversal via Path
     safe = Path(safe).name
     return sessions_dir() / f"{safe}.json"
@@ -138,24 +144,39 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
     return str(target)
 
 
+def _legacy_path(name: str) -> Path:
+    """Path used before hash suffix was added, for backward compatibility."""
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "-", name).strip("-._")
+    if not safe or safe != name:
+        safe = _slug(name) or "session"
+    safe = Path(safe).name
+    return sessions_dir() / f"{safe}.json"
+
+
 def load(name: str) -> dict[str, Any] | None:
     """Read a session by name. None when missing or unreadable."""
-    try:
-        with open(_path(name), "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
-        return None
-    return data
+    # Try current hashed path first, then legacy path for old sessions
+    for cand in (_path(name), _legacy_path(name)):
+        try:
+            with open(cand, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+            continue
+        return data
+    return None
 
 
 def delete(name: str) -> bool:
-    try:
-        _path(name).unlink()
-    except OSError:
-        return False
-    return True
+    # Try current path, then legacy
+    for cand in (_path(name), _legacy_path(name)):
+        try:
+            cand.unlink()
+            return True
+        except OSError:
+            continue
+    return False
 
 
 def _summarise(messages: list[Any]) -> str:

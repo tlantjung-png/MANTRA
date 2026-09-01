@@ -353,35 +353,34 @@ class Menu:
         s = self.style
         matches = self.matches
         visible = self._visible()
-        # Row 0 is the prompt line the menu was opened from, so the
-        # first option sits one row below it.
         self._row_base = 2
 
-        rows = [s.bold(self.title) if self.title else ""]
+        # Vampire: title aqua bold, filter amber, selected emerald/aqua.
+        rows = [s._wrap("1;38;5;51", self.title) if self.title else ""]
         if self.allow_filter and self.query:
-            rows.append(s.dim(f"  filter: {self.query}_"))
+            rows.append(s._wrap("38;5;172", f"  filter: {self.query}_"))
         elif self.allow_filter and len(self.options) > self.max_rows:
-            rows.append(s.dim("  type to filter"))
+            rows.append(s._wrap("38;5;240", "  type to filter"))
 
         if not matches:
-            rows.append(s.dim("  (no matches)"))
+            rows.append(s._wrap("38;5;240", "  (no matches)"))
             return rows
 
         for index, option in enumerate(visible):
             marker = "›" if index == self.cursor else " "
             line = f" {marker} {option.text}"
             if index == self.cursor:
-                rows.append(s.cyan(line))
+                rows.append(s._wrap("38;5;51", line))  # aqua selected
             elif not option.enabled:
-                rows.append(s.dim(line))
+                rows.append(s._wrap("38;5;240", line))
             else:
                 rows.append(line)
 
         hidden = len(matches) - len(visible)
         if hidden > 0:
-            rows.append(s.dim(f"   ... {hidden} more"))
+            rows.append(s._wrap("38;5;240", f"   ... {hidden} more"))
         if self.hint:
-            rows.append(s.dim("  " + self.hint))
+            rows.append(s._wrap("38;5;240", "  " + self.hint))
         return rows
 
     # ---- input -----------------------------------------------------------

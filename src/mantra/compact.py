@@ -20,11 +20,11 @@ def _ansi(code: str, text: str, enabled: bool = True) -> str:
     return f"\033[{code}m{text}\033[0m" if enabled else text
 
 
-def _white(t, e=True): return _ansi("97", t, e)
-def _grey(t, e=True): return _ansi("37", t, e)
-def _dim(t, e=True): return _ansi("90", t, e)
-def _bold(t, e=True): return _ansi("1", t, e)
-def _gold(t, e=True): return _ansi("93", t, e)
+def _white(t, e=True): return _ansi("38;5;230", t, e)  # ivory bone (Vampire)
+def _grey(t, e=True): return _ansi("38;5;240", t, e)   # smoke grey-wine
+def _dim(t, e=True): return _ansi("38;5;240", t, e)     # same dim as border
+def _bold(t, e=True): return _ansi("1;38;5;88", t, e)   # burgundy bold
+def _gold(t, e=True): return _ansi("38;5;172", t, e)    # antique amber
 
 
 def _pad(text: str, width: int) -> str:
@@ -94,9 +94,11 @@ def render_card(session: Any, width: int | None = None, enabled: bool = True) ->
             width = 80
     ver = _version(session)
     inner = width
+    # Vampire aqua for M A N T R A — pulse handled by thread toggling bright/dim
+    mantra_pulse = _ansi("1;38;5;51", "M A N T R A", enabled)
     lines = []
     for raw in [
-        _bold(_white("M A N T R A", enabled), enabled),
+        mantra_pulse,
         _dim("Spells Matter", enabled),
         _dim(ver, enabled),
     ]:
@@ -206,6 +208,10 @@ class CompactLayout:
         self._alt = False
 
     def cleanup(self) -> None:
+        try:
+            self.stop_prompt_pulse()
+        except Exception:
+            pass
         with _UI_LOCK:
             if self.active:
                 _safe_write("\033[r")
@@ -237,6 +243,11 @@ class CompactLayout:
             self._draw_chrome_locked()
             self._render_content_locked()
             self._apply_region_locked()
+            # Start walking pulse for prompt
+            try:
+                self.start_prompt_pulse()
+            except Exception:
+                pass
 
     # ── geometry ──────────────────────────────────────────────
 
@@ -292,11 +303,27 @@ class CompactLayout:
             if len(self.lines) > self.MAX_LINES:
                 self.lines = self.lines[-self.MAX_LINES:]
 
-            # Throttle rapid streaming fragments.
+            # Throttle rapid streaming fragments, but ensure the buffer
+            # always flushes: if caller passes the final fragment, flush()
+            # will be called; but while streaming, short throttled fragments
+            # must not be lost — force render if throttled too long (200ms)
             now = time.monotonic()
             if now - self._last_render < 0.05 and len(text) < 500:
+                # Still buffered in self.partial/lines; schedule deferred
+                # render only if not already pending. For correctness, flush
+                # is also forced by explicit flush() call after streaming.
                 return
             self._last_render = now
+            self._render_content_locked()
+
+    def flush(self) -> None:
+        """Force render of any buffered partial line."""
+        with _UI_LOCK:
+            if not self.active:
+                if self.partial:
+                    _safe_write(self.partial)
+                return
+            self._last_render = 0.0
             self._render_content_locked()
 
     def clear_content(self) -> None:
@@ -421,14 +448,14 @@ class CompactLayout:
         else:
             rate = "—"
 
-        # Show model+effort so mid-session changes are visible.
+        # Show model+effort so mid-session changes are visible — Vampire: each value distinct but gothic.
         model_display = f"{model} ({reasoning})"
         items = []
         if st and enabled:
-            items.append(st.dim("WORKSPACE: ") + st.bright_white(ws_short))
-            items.append(st.dim("MODEL: ") + st.bright_white(model_display))
-            items.append(st.dim("APPROVAL: ") + st.bright_white(approval))
-            items.append(st.dim("CACHE: ") + st.bright_white(rate))
+            items.append(st._wrap("38;5;240", "WORKSPACE: ") + st._wrap("38;5;172", ws_short))  # amber
+            items.append(st._wrap("38;5;240", "MODEL: ") + st._wrap("1;38;5;51", model_display))  # aqua bold
+            items.append(st._wrap("38;5;240", "APPROVAL: ") + st._wrap("38;5;29", approval))  # emerald
+            items.append(st._wrap("38;5;240", "CACHE: ") + st._wrap("38;5;230", rate))  # ivory
         else:
             items.append(f"WORKSPACE: {ws_short}")
             items.append(f"MODEL: {model_display}")
@@ -487,13 +514,19 @@ class CompactLayout:
             sys.stdout.flush()
             self._apply_region_locked()
 
-    # ── prompt ────────────────────────────────────────────────
-
+    # ── prompt — static gold, tidak berubah saat Channeling/Chanting
     def _prompt_body_locked(self) -> str:
         st = self._style
-        if st is not None and getattr(st, "enabled", True):
-            return st.bright_yellow("│ MANTRA > ")
-        return "│ MANTRA > "
+        base = "│ MANTRA > "
+        if st is None or not getattr(st, "enabled", True):
+            return base
+        return st._wrap("38;5;172", base)  # gold static
+
+    def start_prompt_pulse(self) -> None:
+        pass
+
+    def stop_prompt_pulse(self) -> None:
+        pass
 
     def prompt_text(self, body: str = "") -> str:
         with _UI_LOCK:
@@ -556,6 +589,24 @@ class CompactLayout:
             self._last_visible = None
             if self.active:
                 self._render_content_locked()
+
+    def get_line_at_row(self, screen_row: int) -> str | None:
+        with _UI_LOCK:
+            if not self.active:
+                return None
+            if not (self.content_top <= screen_row <= self.content_bottom):
+                return None
+            lines = self._all_lines_locked()
+            height = self._height_locked()
+            max_offset = max(0, len(lines) - height)
+            offset = min(self.offset, max_offset)
+            end = len(lines) - offset
+            start = max(0, end - height)
+            visible = lines[start:end]
+            idx = screen_row - self.content_top
+            if 0 <= idx < len(visible):
+                return visible[idx]
+            return None
 
     # ── resize ────────────────────────────────────────────────
 

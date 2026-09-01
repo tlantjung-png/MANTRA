@@ -65,49 +65,29 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 KNOWN_FAILURES_PATH = os.path.join(PROJECT_ROOT, "knowledge", "known-failures.md")
 
 HELP_TEXT = """Commands:
-  /connect              add or switch endpoint — just a URL and key, then
-                        pick from the models it serves. Nothing else to
-                        configure. /connect list, /connect remove <name>
-                        /connect <url> [key] [model]  (all inline)
-  /connect key [name]   replace the stored key. Always asks, so a key that
-                        was mistyped can be put right
-  /model                pick a model from a menu (filters as you type).
-                        Direct: /model <name>  or  /model <name> <effort>
-                        effort: off|minimal|low|medium|high|xhigh · /model help for details
-  /help                 show this help
-  /workspace            print the workspace path and its contents
-  /memory               show the durable memory file for this workspace
-  /diff                 show uncommitted changes in the workspace
-  /undo                 discard uncommitted changes (asks for confirmation)
-  /tools                list the tools this agent can call
-  /approve              pick an approval mode: default|auto|yolo|plan
-  /cost                 token usage for this session
-  /dashboard            show the status overlay (Ctrl+G)
-  /compact              summarise the conversation to free context
-  /clear                drop the conversation, keep the system prompt
-  /reset                start a fresh conversation (files stay on disk)
-  /save [path]          save the session to JSON
-  /load <path>          restore a saved session
-  /resume [name]        pick up a saved session. No name opens a menu;
-                        /resume list shows them all. Sessions are saved
-                        automatically as you work, so this works even
-                        after closing the window
-  /goal <text>          set the standing goal for this session. It is
-                        sent with every turn, so the agent keeps aiming
-                        at it. /goal note <text>, /goal done
-  /skills [name]        skills found in your skills directories.
-                        /skills find <text> · /skills use <name> ·
-                        /skills bundles · /skills launch <bundle> ·
-                        /skills auto [on|off] attaches a skill that
-                        fits what you typed, for that turn only
-  /workflow             run a saved sequence of steps.
-                        /workflow create <name> (one step per line, . to
-                        finish) · /workflow show [name] ·
-                        /workflow launch <name> · /workflow remove <name>
-  /paste                read a multi-line message until a line with only "."
-  /steps [n]            show or set the per-message step limit
-  /verbose              toggle echoing tool output
-  /exit                 leave the console (also: Ctrl+C)
+  /connect              add/switch endpoint — URL + key
+  /connect key [name]   replace stored key
+  /model                pick model — menu or /model <name> [effort]
+  /help                 show help
+  /workspace            show workspace path + files
+  /memory               show memory file
+  /diff                 show uncommitted changes
+  /undo                 discard changes (confirm)
+  /tools                list tools
+  /approve              set approval mode (default|auto|yolo|plan)
+  /cost                 show token usage
+  /dashboard            show status overlay
+  /compact              summarise conversation
+  /clear                clear conversation
+  /reset                reset conversation
+  /resume [name]        resume autosaved session
+  /goal <text>          set session goal (/goal note, /goal done)
+   /skills <name>        attach skill — /skills + space, Tab filter
+  /workflow             run workflow (create|show|launch|remove)
+  /paste                multi-line input (end with .)
+  /steps [n]            set step limit (1-100)
+  /verbose              toggle verbose
+  /exit                 exit (Ctrl+C)
   /                     same as /help
 
 Reference files with @ in any message:
@@ -153,12 +133,12 @@ class Style:
     def bright_magenta(self, t): return self._wrap("95", t)
     def bright_cyan(self, t): return self._wrap("96", t)
     def bright_white(self, t): return self._wrap("97", t)
-    # Neon combos
-    def neon_title(self, t): return self._wrap("1;95", t)  # bold magenta
-    def neon_label(self, t): return self._wrap("93", t)    # bright yellow
-    def neon_value(self, t): return self._wrap("97", t)    # bright white
-    def neon_accent(self, t): return self._wrap("92", t)   # bright green
-    def neon_border(self, t): return self._wrap("96", t)   # bright cyan
+    # Vampire Library — gothic colorful, aqua ENCHANTER
+    def neon_title(self, t): return self._wrap("1;38;5;51", t)  # aqua bold (ENCHANTER biar keliatan)
+    def neon_label(self, t): return self._wrap("38;5;172", t)    # antique amber (you)
+    def neon_value(self, t): return self._wrap("38;5;230", t)    # ivory bone
+    def neon_accent(self, t): return self._wrap("38;5;29", t)   # deep emerald
+    def neon_border(self, t): return self._wrap("38;5;240", t)   # smoke grey-wine
     # Gothic palette
     def grey(self, t): return self._wrap("37", t)         # grey
     def strike(self, t): return self._wrap("9", t)        # strikethrough
@@ -233,9 +213,11 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 class Spinner:
     """Background spinner that pauses for real output."""
 
-    def __init__(self, style: Style, label: str = "Chanting", frame: Any = None, layout: Any = None) -> None:
+    def __init__(self, style: Style, label: str = "Channeling", frame: Any = None, layout: Any = None) -> None:
         self.style = style
         self.label = label
+        self.label_thinking = "Channeling"
+        self.label_working = "Chanting"
         # Optional callable that dresses the line in the container's
         # sides, so a spinner inside a frame stays inside the frame.
         self._frame = frame
@@ -253,12 +235,14 @@ class Spinner:
             elapsed_str = f"{elapsed}s"
         else:
             elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
+        # Gantian di tempat sama: Channeling 0-1s, lalu Chanting — biar Chanting tetap nongol walau cepat
+        cur_label = self.label_thinking if elapsed < 1 else self.label_working
         pulse = int(time.monotonic() * 4) % 6
         if pulse < 3:
-            label_styled = self.style.dim(self.label)
+            label_styled = self.style._wrap("38;5;240", cur_label)
         else:
-            label_styled = self.style.grey(self.label)
-        body = f"{self.style.cyan(frame_char)} {label_styled} {self.style.bright_yellow(elapsed_str)}"
+            label_styled = self.style._wrap("38;5;172", cur_label)
+        body = f"{self.style._wrap('38;5;51', frame_char)} {label_styled} {self.style._wrap('38;5;230', elapsed_str)}"
         if self._layout is not None and self._layout.active:
             return body
         return "\r" + (self._frame(body) if self._frame else body + " ")
@@ -278,6 +262,11 @@ class Spinner:
 
     def start(self):
         if sys.stdout.isatty():
+            try:
+                sys.stdout.write("\033[?25l")
+                sys.stdout.flush()
+            except Exception:
+                pass
             self._thread.start()
         return self
 
@@ -287,6 +276,11 @@ class Spinner:
             self._thread.join(timeout=1)
         if clear:
             self.clear_line()
+        try:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     def clear_line(self):
         with self._lock:
@@ -318,6 +312,32 @@ class Spinner:
 
 # ------------------------------------------------------------- markdown-lite
 
+def _syntax_highlight(line: str, style: Style) -> str:
+    """Generic syntax highlight for any language — Vampire palette, single-pass to avoid ANSI nesting."""
+    import re as _re
+    # Combined pattern with named groups — one pass, no re-highlight of inserted ANSI
+    pattern = _re.compile(
+        r'(?P<str>\"(?:\\.|[^\"\\])*\"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)|'
+        r'(?P<cmt>#.*|//.*|--.*|/\*.*?\*/)|'
+        r'(?P<num>\b\d+(?:\.\d+)?\b)|'
+        r'(?P<kw>\b(?:import|from|as|def|class|return|if|elif|else|for|while|try|except|with|async|await|function|const|let|var|export|require|include|using|namespace|public|private|protected|static|void|int|string|bool|float|double|struct|enum|implements|extends|new|this|super|self)\b)|'
+        r'(?P<typ>\b[A-Z][a-zA-Z0-9_]+\b)'
+    )
+    def _repl(m):
+        if m.group('str'):
+            return style._wrap("38;5;82", m.group('str'))
+        if m.group('cmt'):
+            return style._wrap("38;5;240", m.group('cmt'))
+        if m.group('num'):
+            return style._wrap("38;5;172", m.group('num'))
+        if m.group('kw'):
+            return style._wrap("1;38;5;51", m.group('kw'))
+        if m.group('typ'):
+            txt = m.group('typ')
+            return style._wrap("38;5;230", txt) if len(txt) > 2 else txt
+        return m.group(0)
+    return pattern.sub(_repl, line)
+
 def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
     """Render a single markdown line to ANSI-styled text.
 
@@ -331,94 +351,104 @@ def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
         if stripped.startswith("```"):
             if ctx is not None:
                 ctx._in_code_fence = False
-            return style.dim("│" + "─" * 4)
-        return style.dim(line)
+            return style._wrap("38;5;29", "│" + "─" * 4)
+        return _syntax_highlight(line, style)
     if stripped.startswith("```"):
         if ctx is not None:
             ctx._in_code_fence = True
-        return style.dim("│" + "─" * 4)
+        return style._wrap("38;5;29", "│" + "─" * 4)
 
-    # ── headings ─────────────────────────────────────────
+    # ── headings — Vampire: H1 aqua, H2 ivory, H3 amber ──
     if stripped.startswith("#"):
         level = len(stripped) - len(stripped.lstrip("#"))
         heading = stripped.lstrip("# ").rstrip()
         if level == 1:
-            return style.bold(style.bright_white(heading)) + chr(10) + style.dim(chr(0x2500) * 40)
+            return style._wrap("1;38;5;51", heading) + chr(10) + style._wrap("38;5;88", chr(0x2500) * 40)
         if level == 2:
-            return style.bold(heading) + chr(10) + style.dim(chr(0x2500) * 40)
-        return style.bold(heading)
+            return style._wrap("1;38;5;230", heading) + chr(10) + style._wrap("38;5;240", chr(0x2500) * 40)
+        return style._wrap("38;5;172", heading)
 
     # ── horizontal rule ──────────────────────────────────
     if stripped in ("---", "***", "___") and len(stripped) >= 3:
-        return style.dim(chr(0x2500) * 40)
+        return style._wrap("38;5;240", chr(0x2500) * 40)
 
     # ── blockquote ───────────────────────────────────────
     if stripped.startswith(">"):
         quote = stripped[1:].lstrip()
-        return style.dim("│ ") + style.dim(quote)
+        return style._wrap("38;5;240", "│ ") + style._wrap("38;5;240", quote)
 
-    # ── unordered list ───────────────────────────────────
+    # ── plain code outside fence — still highlight (import, def, etc. tanpa wrapper)
+    if re.match(r"^\s*(import\s|from\s|def\s|class\s|if\s|for\s|while\s|return\b|const\s|let\s|var\s|export\s|require\(|#include|using\s|public\s|private\s|protected\s)", line):
+        return _syntax_highlight(line, style)
+
+    # ── unordered list — emerald ─────────────────────────
     m_list = re.match(r"^(\s*)[-*+]\s+(.*)", line)
     if m_list:
         indent, rest = m_list.group(1), m_list.group(2)
-        return indent + style.bright_magenta("* ") + _inline_md(rest, style)
+        return indent + style._wrap("38;5;29", "* ") + _inline_md(rest, style)
 
-    # ── ordered list ─────────────────────────────────────
+    # ── ordered list — emerald ───────────────────────────
     m_ord = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
     if m_ord:
         indent, num, rest = m_ord.group(1), m_ord.group(2), m_ord.group(3)
-        return indent + style.bright_magenta(num + ". ") + _inline_md(rest, style)
+        return indent + style._wrap("38;5;29", num + ". ") + _inline_md(rest, style)
 
     # ── normal paragraph ─────────────────────────────────
     return _inline_md(line, style)
 
 
 def render_markdown(text: str, style: Style) -> str:
-    """Render Markdown to styled terminal output.
-    """
+    """Render Markdown to styled terminal output — Vampire palette."""
     out_lines = []
     in_fence = False
     for line in text.split("\n"):
         stripped = line.strip()
-        # Code fence toggle.
+        # Code fence toggle — emerald border.
         if stripped.startswith("```"):
             in_fence = not in_fence
-            out_lines.append(style.dim("│" + "─" * 4) if in_fence else style.dim("│" + "─" * 4))
+            out_lines.append(style._wrap("38;5;29", "│" + "─" * 4))
             continue
         if in_fence:
-            out_lines.append(style.dim(line))
+            out_lines.append(_syntax_highlight(line, style))
             continue
-        # Headings.
+        # Headings — Vampire.
         if stripped.startswith("#"):
             level = len(stripped) - len(stripped.lstrip("#"))
             heading = stripped.lstrip("# ").rstrip()
             if level == 1:
-                out_lines.append(style.bold(style.bright_white(heading)))
+                out_lines.append(style._wrap("1;38;5;51", heading))
+            elif level == 2:
+                out_lines.append(style._wrap("1;38;5;230", heading))
             else:
-                out_lines.append(style.bold(heading))
+                out_lines.append(style._wrap("38;5;172", heading))
             if level <= 2:
-                out_lines.append(style.dim(chr(0x2500) * 40))
+                bar = style._wrap("38;5;88", chr(0x2500) * 40) if level == 1 else style._wrap("38;5;240", chr(0x2500) * 40)
+                out_lines.append(bar)
             continue
         # Horizontal rule.
         if stripped in ("---", "***", "___") and len(stripped) >= 3:
-            out_lines.append(style.dim(chr(0x2500) * 40))
+            out_lines.append(style._wrap("38;5;240", chr(0x2500) * 40))
             continue
         # Blockquote.
         if stripped.startswith(">"):
             quote = stripped[1:].lstrip()
-            out_lines.append(style.dim("│ ") + style.dim(quote))
+            out_lines.append(style._wrap("38;5;240", "│ ") + style._wrap("38;5;240", quote))
             continue
-        # Unordered list.
+        # Unordered list — emerald.
         m_list = re.match(r"^(\s*)[-*+]\s+(.*)", line)
         if m_list:
             indent, rest = m_list.group(1), m_list.group(2)
-            out_lines.append(indent + style.bright_magenta("* ") + _inline_md(rest, style))
+            out_lines.append(indent + style._wrap("38;5;29", "* ") + _inline_md(rest, style))
             continue
-        # Ordered list.
+        # Ordered list — emerald.
         m_ord = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
         if m_ord:
             indent, num, rest = m_ord.group(1), m_ord.group(2), m_ord.group(3)
-            out_lines.append(indent + style.bright_magenta(num + ". ") + _inline_md(rest, style))
+            out_lines.append(indent + style._wrap("38;5;29", num + ". ") + _inline_md(rest, style))
+            continue
+        # Plain code outside fence — still highlight (file/model tanpa wrapper)
+        if re.match(r"^\s*(import\s|from\s|def\s|class\s|if\s|for\s|while\s|return\b|const\s|let\s|var\s|export\s|require\(|#include|using\s|public\s|private\s|protected\s)", line):
+            out_lines.append(_syntax_highlight(line, style))
             continue
         # Normal paragraph.
         out_lines.append(_inline_md(line, style))
@@ -426,34 +456,45 @@ def render_markdown(text: str, style: Style) -> str:
 
 
 def _inline_md(line: str, style: Style) -> str:
-    """Inline markdown: code, bold, italic, strikethrough, links."""
+    """Inline markdown: code, bold, italic, strikethrough, links — Vampire."""
     import re as _re
-    # Order matters: process code spans first so their contents stay literal.
-    parts = line.split("`")
+    _ESC = "\x00ESC_BT\x00"
+    line_esc = line.replace("\\`", _ESC)
+    parts = line_esc.split("`")
     for i in range(0, len(parts)):
         if i % 2 == 1:
-            parts[i] = style.bright_magenta(parts[i])
+            # Inline code — lime (file-like) on gothic.
+            parts[i] = style._wrap("38;5;82", parts[i].replace(_ESC, "`"))
         else:
-            segment = parts[i]
-            # Links: [text](url) -> styled text
+            segment = parts[i].replace(_ESC, "`")
+            # Links — aqua (senada ENCHANTER).
             segment = _re.sub(
                 r'\[([^\]]+)\]\([^)]+\)',
-                lambda m: style.bright_cyan(m.group(1)),
+                lambda m: style._wrap("38;5;51", m.group(1).replace("\\[", "[").replace("\\]", "]")),
                 segment,
             )
-            # Bold: **text**
-            segment = _re.sub(r'\*\*(.+?)\*\*', lambda m: style.bright_white(m.group(1)), segment)
-            # Italic: *text*
-            segment = _re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', lambda m: style.bright_magenta(m.group(1)), segment)
-            # Strikethrough: ~~text~~
+            # Bold — ivory.
+            segment = _re.sub(r'\*\*(.+?)\*\*', lambda m: style._wrap("1;38;5;230", m.group(1)), segment)
+            _ESC_STAR = "\x00ESC_ST\x00"
+            segment_esc_star = segment.replace("\\*", _ESC_STAR)
+            # Italic — amber.
+            segment_esc_star = _re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', lambda m: style._wrap("38;5;172", m.group(1)), segment_esc_star)
+            segment = segment_esc_star.replace(_ESC_STAR, "*")
+            # File @mentions — amber (biar file pop, beda dari code).
+            # Handled outside, but keep segment as is.
             segment = _re.sub(r'~~(.+?)~~', lambda m: style.strike(m.group(1)), segment)
             parts[i] = segment
-    return "`".join(parts)
+    return "`".join(parts).replace(_ESC, "`")
 
 
 # @name mentions: a bare word, path, or glob. The lookbehind keeps
 # "user@example.com" and "a@b" from being read as file references.
+# Trailing punctuation like .,;:!?) is stripped later so "@src/app.py." at
+# the end of a sentence still resolves to the file.
 MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_][\w.:/\\\-*]*)")
+# Characters that are often trailing punctuation after a mention and
+# should not be considered part of the path.
+_MENTION_TRIM = ".,;:!?)]'\"`"
 MAX_ATTACH_CHARS = 20_000
 MAX_TOTAL_ATTACH_CHARS = 60_000
 MAX_GLOB_HITS = 20
@@ -530,7 +571,7 @@ def _transcript(messages: list[dict[str, Any]]) -> str:
 # ------------------------------------------------------------------- session
 
 class ConsoleSession:
-    """One REPL session over one persistent local workspace, Grok-style."""
+    """One REPL session over one persistent local workspace."""
 
     def __init__(
         self,
@@ -739,23 +780,24 @@ class ConsoleSession:
             yield
 
     def _format_diff(self, diff_text: str, max_lines: int = 60) -> str:
-        """Colour a unified diff for terminal display."""
+        """Colour a unified diff — wrapped so it always gets syntax color."""
         if not diff_text:
             return ""
         lines = diff_text.splitlines()
         if len(lines) > max_lines:
             lines = lines[:max_lines]
             lines.append(self.style.dim(f"... ({len(diff_text.splitlines()) - max_lines} more lines)"))
-        out = []
+        out = [self.style._wrap("38;5;29", "┌" + "─" * 38)]
         for line in lines:
             if line.startswith("+"):
-                out.append(self.style.green(line))
+                out.append(self.style._wrap("38;5;82", "│ " + line))
             elif line.startswith("-"):
-                out.append(self.style.red(line))
+                out.append(self.style._wrap("38;5;203", "│ " + line))
             elif line.startswith("@@"):
-                out.append(self.style.dim(line))
+                out.append(self.style._wrap("38;5;240", "│ " + line))
             else:
-                out.append(self.style.dim(line))
+                out.append(self.style._wrap("38;5;240", "│ " + line))
+        out.append(self.style._wrap("38;5;29", "└" + "─" * 38))
         return "\n".join(out)
 
     def _note(self, text: str) -> None:
@@ -792,7 +834,26 @@ class ConsoleSession:
                 cmd = args.get("command") or ""
                 if cmd:
                     detail = f" {self.style.dim('>')} {self.style.dim(cmd[:60].upper())}{'...' if len(cmd) > 60 else ''}"
-            self._print(f"  {self.style.dim(f'* STEP {step}')} {self.style.bright_magenta(tool.upper())}{detail}")
+            # Keep Chanting visible during tool steps — write without pausing spinner, keep cursor at prompt
+            msg = f"  {self.style.dim(f'* STEP {step}')} {self.style._wrap('38;5;51', tool.upper())}{detail}"
+            if self.layout is not None and self.layout.active:
+                try:
+                    self.layout.write(msg + "\n")
+                    try:
+                        self.layout.draw_prompt("")
+                    except Exception:
+                        pass
+                    # Redraw Chanting/Channeling border so it doesn't disappear
+                    if getattr(self, "_spinner", None) is not None and getattr(self._spinner, "_layout", None) is not None:
+                        try:
+                            # Force spinner border redraw
+                            self._spinner._last_render = 0
+                        except Exception:
+                            pass
+                except Exception:
+                    self._print(msg)
+            else:
+                self._print(msg)
         elif name == "tool_denied":
             self._print(f"  {self.style.red('✗ DENIED')} {self.style.dim(payload.get('tool','').upper())}")
         elif name == "run_error":
@@ -802,9 +863,36 @@ class ConsoleSession:
             result = payload.get("result")
             ok = payload.get("ok")
             seconds = payload.get("seconds")
-            # Show result for file-edit tools
+            # Show code for file-edit tools — must be visible in conversation with wrapper
             if tool in ("edit_file", "write_file"):
-                if isinstance(result, str) and result.strip():
+                if ok and isinstance(result, str) and result.strip().startswith("OK"):
+                    # Parse path from OK message and show file content with highlight
+                    try:
+                        m = __import__("re").search(r"to\s+(\S+)", result) if "wrote" in result else __import__("re").search(r"edited\s+(\S+)", result)
+                        path = m.group(1).strip().strip("'\"") if m else ""
+                        if path:
+                            try:
+                                full = __import__("os").path.join(self.workspace, path)
+                                if __import__("os").path.isfile(full):
+                                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                                        body = fh.read(8000)
+                                    # Wrap in code fence so syntax highlight applies
+                                    ext = __import__("os").path.splitext(path)[1].lstrip(".") or "txt"
+                                    self._print(self.style._wrap("38;5;29", f"┌ {path} ──"))
+                                    for line in body.splitlines()[:60]:
+                                        self._print(_syntax_highlight(line, self.style))
+                                    self._print(self.style._wrap("38;5;29", "└" + "─" * 38))
+                                    if len(body.splitlines()) > 60:
+                                        self._print(self.style.dim(f"... {len(body.splitlines())-60} more lines"))
+                                else:
+                                    self._print(self._format_diff(result.strip()))
+                            except Exception:
+                                self._print(self._format_diff(result.strip()))
+                        else:
+                            self._print(self._format_diff(result.strip()))
+                    except Exception:
+                        self._print(self._format_diff(result.strip()))
+                elif isinstance(result, str) and result.strip():
                     self._print(self._format_diff(result.strip()))
                 elif self.verbose:
                     detail = self.style.dim("OK" if ok else "FAILED")
@@ -818,13 +906,12 @@ class ConsoleSession:
         if self._abort.is_set():
             raise AbortError("interrupted by operator")
         if self._spinner:
-            # Streamed tokens accumulate on ONE terminal line, so no spinner
-            # tick can ever be safe after the first fragment - a frame drawn
-            # between fragments overwrites the line start and the next
-            # fragment's clear erases everything before it. Kill the spinner
-            # for the rest of the run on the first token.
-            self._spinner.stop(clear=True)
-            self._spinner = None
+            # Keep Channeling/Chanting visible till turn ends — in compact layout
+            # border and content are separate rows, so spinner is safe to keep.
+            # Only kill in non-compact where spinner shares the content line.
+            if self.layout is None or not self.layout.active:
+                self._spinner.stop(clear=True)
+                self._spinner = None
         # Approximate token count: ~4 chars per token.
         self._stream_tokens += max(1, len(piece) // 4)
         rendered = self._stream_renderer.render_piece(piece)
@@ -833,6 +920,10 @@ class ConsoleSession:
                 self.layout.write(f"{self.style.neon_title('ENCHANTER')} ")
                 self._stream_header_done = True
             self.layout.write(rendered)
+            # Ensure partial line is eventually flushed even if throttled
+            # The compact viewport throttles short fragments; schedule a
+            # flush via the layout's flush method on next counter update
+            # or via explicit flush at handle() tail.
             self._update_live_counter()
         else:
             if not self._stream_header_done:
@@ -903,9 +994,14 @@ class ConsoleSession:
         what the model already understands. Unknown references are left
         alone and reported rather than silently dropped.
         """
-        tokens = MENTION_RE.findall(text)
+        # Normalize full-width variants before matching so ＠ and ／ work
+        text_norm = text.replace("＠", "@").replace("／", "/")
+        tokens = MENTION_RE.findall(text_norm)
         if not tokens:
-            return text, []
+            # Also try finding full-width mentions directly if normal found none
+            tokens = MENTION_RE.findall(text)
+            if not tokens:
+                return text, []
 
         # Normalize: a root given with forward slashes compares unequal to
         # normpath output on Windows, which made every mention "no match".
@@ -916,12 +1012,36 @@ class ConsoleSession:
         seen: set[str] = set()
 
         for token in tokens:
-            if token in seen:
+            # Strip surrounding quotes and trailing punctuation that is
+            # sentence punctuation, not part of the path.
+            raw = token.strip().strip("'\"`")
+            trimmed = raw.rstrip(_MENTION_TRIM)
+            # Also handle "@\"src/app.py\"" style where quotes were part of token
+            trimmed = trimmed.strip("'\"`")
+            if not trimmed:
                 continue
-            seen.add(token)
-            paths = self._resolve_mention(token, root)
+            dedup_key = trimmed.lower() if os.name == "nt" else trimmed
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            # Try several variations to be forgiving
+            candidates_to_try = [trimmed]
+            if trimmed != token:
+                candidates_to_try.append(token.strip("'\"`").rstrip(_MENTION_TRIM))
+            # Also try without leading ./ if present
+            if trimmed.startswith("./"):
+                candidates_to_try.append(trimmed[2:])
+            if trimmed.startswith(".\\"):
+                candidates_to_try.append(trimmed[2:])
+            paths: list[str] = []
+            for cand in candidates_to_try:
+                paths = self._resolve_mention(cand, root)
+                if paths:
+                    break
             if not paths:
-                self._note(f"no match for @{token}")
+                # Show the trimmed form in the note so the operator sees
+                # what was actually tried, not the raw token with punctuation.
+                self._note(f"no match for @{trimmed} (tried {candidates_to_try[0]!r})")
                 continue
             for rel in paths:
                 if total >= MAX_TOTAL_ATTACH_CHARS:
@@ -946,9 +1066,18 @@ class ConsoleSession:
     def _resolve_mention(self, token: str, root: str) -> list[str]:
         """Resolve one mention to workspace-relative paths. Escapes refused."""
         root = os.path.realpath(os.path.abspath(root))
+        # Robust trimming: quotes and trailing punctuation, and leading ./
+        orig = token
+        token = token.strip().strip("'\"`").rstrip(_MENTION_TRIM).strip("'\"`")
+        if not token:
+            return []
+        # Try case-insensitive existence check on Windows by probing both forms
         candidate = token.replace("/", os.sep).replace("\\", os.sep)
         if "*" in token:
-            hits = sorted(glob.glob(candidate, root_dir=root, recursive=True))
+            # Normalize pattern for glob: use forward slashes for root_dir glob
+            # which expects POSIX-style patterns on all platforms.
+            cand_posix = token.replace("\\", "/").lstrip("/")
+            hits = sorted(glob.glob(cand_posix, root_dir=root, recursive=True))
             valid: list[str] = []
             for hit in hits:
                 full_hit = os.path.realpath(os.path.join(root, hit))
@@ -1020,7 +1149,7 @@ class ConsoleSession:
         Rebuilt per turn rather than frozen at startup, because the goal
         is set and cleared while the session is running. Appended rather
         than spliced into the base so the standing instructions stay
-        intact when the goal changes.
+        intact when the goal changes. Re-applies total cap after additions.
         """
         prompt = self.system_prompt
         for name in self.active_skills:
@@ -1035,6 +1164,10 @@ class ConsoleSession:
             if skill.resources:
                 prompt += "\n\nBundled with this skill: " + ", ".join(skill.resources)
         if not self.goal:
+            # Re-apply cap even when only skills were added
+            TOTAL_CAP = 20000
+            if len(prompt) > TOTAL_CAP:
+                prompt = prompt[:TOTAL_CAP] + "\n... [truncated — system prompt exceeded cap]"
             return prompt
         lines = [
             "",
@@ -1057,7 +1190,11 @@ class ConsoleSession:
             "clear it without checking by hand. Do not claim it is "
             "complete until it actually is."
         )
-        return prompt + "\n" + "\n".join(lines)
+        prompt = prompt + "\n" + "\n".join(lines)
+        TOTAL_CAP = 20000
+        if len(prompt) > TOTAL_CAP:
+            prompt = prompt[:TOTAL_CAP] + "\n... [truncated — prompt exceeded cap after skill/goal injection]"
+        return prompt
 
     def set_goal(self, text: str) -> None:
         self.goal = text.strip()
@@ -1160,7 +1297,7 @@ class ConsoleSession:
         self.auto_attached = []
 
     def handle(self, text: str) -> RunResult | None:
-        # Startup card disappears on first real work (Grok-style)
+        # Startup card disappears on first real work
         # But skip if viewport has content from a resumed session.
         has_resumed_content = (
             self.layout is not None
@@ -1233,7 +1370,12 @@ class ConsoleSession:
                 tail = self._stream_renderer.flush()
                 if tail:
                     if self.layout is not None and self.layout.active:
-                        self.layout.write(tail)
+                        self.layout.write(tail + "\n")
+                        # Ensure throttled viewport actually renders the final tail
+                        try:
+                            self.layout.flush()
+                        except Exception:
+                            pass
                     elif self.frame is not None:
                         self.frame.write(tail)
                         self.frame.flush()
@@ -1248,17 +1390,29 @@ class ConsoleSession:
                 if self.frame is None:
                     if self.layout is not None and self.layout.active:
                         self.layout.write("\n")
+                        try:
+                            self.layout.flush()
+                        except Exception:
+                            pass
                     else:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
+                else:
+                    # Ensure viewport flush even when tail was empty
+                    if self.layout is not None and self.layout.active:
+                        try:
+                            self.layout.flush()
+                        except Exception:
+                            pass
             elif result is not None and result.final_message:
                 body = render_markdown(result.final_message, self.style)
                 if self.frame is not None:
-                    # Delivered whole, so it can be word-wrapped properly
-                    # instead of streamed a word at a time.
                     self.frame.row(body)
                 else:
                     self._print(f"{self.style.neon_title('ENCHANTER')} {body}")
+            elif result is not None and not result.final_message and not self._streamed_this_run:
+                # Empty final without streaming — agnostic, don't hardcode language
+                pass
             if result is not None:
                 self._record_usage(result)
                 self._record_memory(task, result)
@@ -1331,12 +1485,34 @@ class ConsoleSession:
         tin = int(result.metrics.get("tokens_in", 0))
         tout = int(result.metrics.get("tokens_out", 0))
         cache = int(result.metrics.get("cache_hit", 0))
+        # Fallback to estimated tokens when provider gave no usage or all zeros.
+        # This keeps /cost and the top-bar CACHE useful even when the
+        # endpoint does not return usage (e.g. after stream_options downgrade).
+        if tin == 0 and tout == 0:
+            est_in = self.context.tokens
+            est_out = max(1, len(result.final_message or "") // 4) if result.final_message else 0
+            # If cache was reported but prompt was 0, use cache as at least part of input
+            if cache > 0 and est_in == 0:
+                est_in = cache
+            # Only estimate if we have something to estimate from
+            if est_in > 0 or est_out > 0:
+                if tin == 0:
+                    tin = est_in
+                    result.metrics["tokens_in"] = tin
+                if tout == 0:
+                    tout = est_out
+                    result.metrics["tokens_out"] = tout
+                result.metrics["usage_estimated"] = 1
+        # If cache exceeds prompt (e.g. cached report without prompt), use cache
+        if cache > tin:
+            tin = cache
+            result.metrics["tokens_in"] = tin
         self.totals["tokens_in"] += tin
         self.totals["tokens_out"] += tout
         self.totals["tool_errors"] += int(result.metrics.get("tool_errors", 0))
         self.totals["cache_hit"] += cache
         # Record per-turn metrics for trend analysis.
-        rate = (cache * 100 // tin) if tin > 0 else 0
+        rate = min(100, cache * 100 // tin) if tin > 0 else 0
         self.turn_history.append({
             "turn": self.totals["turns"],
             "tokens_in": tin,
@@ -1562,6 +1738,12 @@ class ConsoleSession:
             self._print(self.style.red(f"  no session named '{name}'"))
             self._print(self.style.dim("  /resume lists them"))
             return False
+        # Workspace guard — don't load k-chat session in k-studio workspace
+        saved_ws = data.get("workspace") or ""
+        if saved_ws and not self._is_same_workspace(saved_ws):
+            self._print(self.style.yellow(f"  session '{name}' belongs to workspace {saved_ws}"))
+            self._print(self.style.dim(f"  current workspace is {self.workspace} — switch workspace or use /resume list to see this workspace's sessions"))
+            return False
         messages = data.get("messages")
         if not isinstance(messages, list) or not messages:
             self._print(self.style.red(f"  session '{name}' has no conversation"))
@@ -1583,6 +1765,14 @@ class ConsoleSession:
         # Adopt the name, so the next autosave continues this session
         # rather than starting a second file beside it.
         self.session_name = name
+        # Hide splash so full history is visible immediately — splash otherwise
+        # covers viewport until next resize/handle hides it.
+        if self.layout is not None and getattr(self.layout, "_splash_visible", False):
+            try:
+                self.layout.hide_splash()
+            except Exception:
+                pass
+            self._splash_visible = False
         self._print(
             self.style.dim(
                 f"  resumed '{name}' - {len(messages)} messages "
@@ -1595,25 +1785,70 @@ class ConsoleSession:
                 continue
             role = msg.get("role", "")
             content = msg.get("content", "")
-            if role == "user" and isinstance(content, str):
-                self._print(f"{self.style.neon_label('you')} {content}")
-            elif role == "assistant" and isinstance(content, str):
-                self._print(f"{self.style.neon_title('ENCHANTER')}")
-                self._print(content)
-            elif role == "tool" and isinstance(content, str):
-                self._print(f"{self.style.dim('tool')} {self.style.dim(content[:200])}")
+            # Handle multimodal/list content
+            if isinstance(content, list):
+                try:
+                    content = " ".join(part.get("text","") for part in content if isinstance(part, dict) and part.get("type")=="text") or str(content)
+                except Exception:
+                    content = str(content)
+            if role == "user":
+                text = content if isinstance(content, str) else str(content or "")
+                if text.strip():
+                    self._print(f"{self.style.neon_label('you')} {text}")
+                else:
+                    self._print(f"{self.style.neon_label('you')} (empty)")
+            elif role == "assistant":
+                # Assistant may have content null + tool_calls — render markdown for body so colors show
+                if isinstance(content, str) and content.strip():
+                    self._print(f"{self.style.neon_title('ENCHANTER')}")
+                    self._print(render_markdown(content, self.style))
+                elif msg.get("tool_calls"):
+                    calls = ", ".join((c.get("function") or {}).get("name","?") for c in msg.get("tool_calls") or [])
+                    self._print(f"{self.style.neon_title('ENCHANTER')} [called {calls}]")
+                    if isinstance(content, str) and content.strip():
+                        self._print(render_markdown(content, self.style))
+                elif isinstance(content, str):
+                    self._print(f"{self.style.neon_title('ENCHANTER')} {content}")
+            elif role == "tool":
+                text = content if isinstance(content, str) else str(content or "")
+                if text.strip():
+                    self._print(f"{self.style.dim('tool')} {self.style.dim(text[:300])}")
+                else:
+                    self._print(f"{self.style.dim('tool')} (no output)")
         summary = data.get("summary") or ""
         if summary:
             self._print(self.style.dim(f"  started with: {summary}"))
+        # Flush viewport so history appears immediately — without this the
+        # throttled writes in CompactLayout.write stay buffered until resize.
+        if self.layout is not None and getattr(self.layout, "active", False):
+            try:
+                self.layout.flush()
+            except Exception:
+                pass
         return True
 
+    def _is_same_workspace(self, saved_ws: str) -> bool:
+        try:
+            cur = os.path.realpath(os.path.abspath(self.workspace or ""))
+            saved = os.path.realpath(os.path.abspath(saved_ws or ""))
+            if os.name == "nt":
+                return cur.lower() == saved.lower()
+            return cur == saved
+        except Exception:
+            return (saved_ws or "") == (self.workspace or "")
+
     def show_sessions(self) -> None:
-        """List what can be resumed."""
-        known = sessions.list_sessions()
+        """List what can be resumed — filtered to current workspace."""
+        all_known = sessions.list_sessions()
+        known = [item for item in all_known if self._is_same_workspace(item.get("workspace") or "")]
         if not known:
-            self._print(self.style.dim("  no saved sessions yet - they are saved as you go"))
+            if all_known:
+                self._print(self.style.dim(f"  no saved sessions for this workspace ({self.workspace})"))
+                self._print(self.style.dim(f"  {len(all_known)} session(s) exist for other workspaces — switch workspace to see them"))
+            else:
+                self._print(self.style.dim("  no saved sessions yet - they are saved as you go"))
             return
-        self._print(self.style.bold("  saved sessions"))
+        self._print(self.style.bold(f"  saved sessions for {self.workspace}"))
         for item in known:
             when = item["saved_at"] or "unknown time"
             turns = item["turns"]
@@ -1629,10 +1864,14 @@ class ConsoleSession:
         self._print(self.style.dim("  /resume <name> to pick one up"))
 
     def pick_session(self) -> bool:
-        """Resume from a menu. False when nothing was chosen."""
-        known = sessions.list_sessions()
+        """Resume from a menu — filtered to current workspace. False when nothing was chosen."""
+        all_known = sessions.list_sessions()
+        known = [item for item in all_known if self._is_same_workspace(item.get("workspace") or "")]
         if not known:
-            self._print(self.style.dim("  no saved sessions yet - they are saved as you go"))
+            if all_known:
+                self._print(self.style.dim(f"  no saved sessions for this workspace ({self.workspace})"))
+            else:
+                self._print(self.style.dim("  no saved sessions yet - they are saved as you go"))
             return False
         options = []
         for item in known:
@@ -2005,32 +2244,30 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
 
 
 SLASH_COMMANDS = [
-    ("/connect", "add or switch endpoint — /connect <url> [key] [model], list, remove, key"),
-    ("/model", "pick a model — /model <name> [effort], or menu"),
-    # After the two a newcomer needs: useful, but not day one.
-    ("/connect key", "replace the stored key for an endpoint"),
-    ("/help", "show the command list"),
-    ("/workspace", "print the workspace path and contents"),
-    ("/memory", "show the durable memory file"),
-    ("/diff", "show uncommitted changes"),
-    ("/undo", "discard uncommitted changes"),
-    ("/tools", "list the tools the agent can call"),
-    ("/approve", "show or switch approval mode"),
-    ("/cost", "token usage for this session"),
-    ("/dashboard", "show the status overlay (Ctrl+G)"),
-    ("/compact", "summarise the conversation"),
-    ("/clear", "drop the conversation"),
-    ("/reset", "start a fresh conversation"),
-    ("/save", "save the session to JSON"),
-    ("/load", "restore a saved session"),
-    ("/resume", "pick up a saved session where it left off"),
-    ("/goal", "set or check the standing goal for this session"),
-    ("/workflow", "run a saved sequence of steps"),
-    ("/skills", "find, read, attach and run skill bundles"),
+    ("/connect", "add/switch endpoint — URL + key"),
+    ("/model", "pick model — menu or /model <name>"),
+    ("/connect key", "replace stored key"),
+    ("/help", "show help"),
+    ("/workspace", "show workspace"),
+    ("/memory", "show memory"),
+    ("/diff", "show changes"),
+    ("/undo", "discard changes"),
+    ("/tools", "list tools"),
+    ("/approve", "set approve mode"),
+    ("/cost", "show usage"),
+    ("/dashboard", "show dashboard"),
+    ("/compact", "summarise chat"),
+    ("/clear", "clear chat"),
+    ("/reset", "reset chat"),
+    ("/resume", "resume session"),
+    ("/goal", "set goal"),
+    ("/workflow", "run workflow"),
+    ("/skills", "attach skill"),
+    ("/skill", "alias /skills"),
     ("/paste", "multi-line input"),
-    ("/steps", "show or set the step limit"),
-    ("/verbose", "toggle tool output echo"),
-    ("/exit", "leave the console"),
+    ("/steps", "set step limit"),
+    ("/verbose", "toggle verbose"),
+    ("/exit", "exit"),
 ]
 
 _SKIP_DIRS = {
@@ -2069,10 +2306,13 @@ class ConsoleCompleter:
                 if len(entries) >= MAX_INDEX_ENTRIES:
                     break
         except OSError:
-            # Silent fallback: one unreadable directory must not break completion.
-            # The previous attempt to print via self._print/self.style crashed
-            # because ConsoleCompleter has neither attribute (see audit).
-            entries = []
+            # Silent fallback: keep previous entries instead of clearing.
+            # Clearing would make @ completion appear broken for 0.5s after
+            # a transient walk error.
+            if not self._entries:
+                entries = []
+            else:
+                return
         self._entries = entries[:MAX_INDEX_ENTRIES]
         self._indexed = True
         self._cache_root = root
@@ -2087,16 +2327,33 @@ class ConsoleCompleter:
         # rather than trusting every caller to pass a sane position.
         cursor = max(0, min(cursor, len(buffer)))
         start = cursor
-        while start > 0 and not buffer[start - 1].isspace():
+        _ZW = "\ufeff\u200b\u200c\u200d\u00a0\u3000"
+        while start > 0 and not buffer[start - 1].isspace() and buffer[start - 1] not in _ZW:
             start -= 1
+        # Skip leading zero-width that may have been left at token start
+        while start < cursor and buffer[start] in _ZW:
+            start += 1
         token = buffer[start:cursor]
-        if token.startswith("@"):
-            return self._complete_path(start, cursor, token[1:])
+        # Strip trailing punctuation from the token for completion purposes
+        # so "@src/app.py," still completes to the file.
+        trim_token = token.rstrip(_MENTION_TRIM)
+        # If trimming changed the token, adjust end position accordingly
+        trim_end = cursor - (len(token) - len(trim_token)) if trim_token != token else cursor
+        # Also handle full-width variants that some keyboards produce
+        if trim_token.startswith("＠"):
+            return self._complete_path(start, trim_end, trim_token[1:])
+        if trim_token.startswith("@"):
+            return self._complete_path(start, trim_end, trim_token[1:])
         # Slash commands: allow leading whitespace and invisible chars, but only when the slash
         # token is the first non-space token (so "hello /help" does not
-        # trigger, but "  /help" does).
-        if token.startswith("/") and buffer[:start].lstrip("\ufeff\u200b\u00a0").strip() == "":
-            return self._complete_command(cursor, token, start)
+        # trigger, but "  /help" does). Strip trailing punctuation so
+        # "/help," still offers completions.
+        # Handle both normal and full-width slash, and be forgiving of invisible leading chars
+        slash_token = trim_token
+        if slash_token.startswith("／") or slash_token.startswith("\uff0f"):
+            slash_token = "/" + slash_token[1:]
+        if slash_token.startswith("/") and _strip_leading_invisible(buffer[:start]).strip() == "":
+            return self._complete_command(trim_end, slash_token, start)
         # Sub-command completions: use lstrip so leading spaces don't break
         # them (operator may indent). Keep start-based token for replacement.
         stripped = buffer.lstrip()
@@ -2106,7 +2363,11 @@ class ConsoleCompleter:
             c = self._complete_connect(buffer, start, cursor, token)
             if c:
                 return c
-        if stripped.startswith("/skills"):
+        if stripped.startswith("/skills") or stripped.startswith("/skill "):
+            c = self._complete_skills(buffer, start, cursor, token)
+            if c:
+                return c
+        if stripped.strip() in ("/skills", "/skill"):
             c = self._complete_skills(buffer, start, cursor, token)
             if c:
                 return c
@@ -2190,72 +2451,49 @@ class ConsoleCompleter:
         return None
 
     def _complete_skills(self, buffer: str, start: int, cursor: int, token: str):
+        # EASY: /skills space [anything] → shows matching skills, filtered by name/type
+        # No other commands, no menu — just skills.
         prefix = buffer[:start]
         parts = prefix.strip().split()
-        if not parts or parts[0] != "/skills":
+        if not parts or parts[0] not in ("/skills", "/skill"):
             return None
-        subcommands = ["list", "show", "use", "apply", "find", "search", "route", "bundles", "bundle", "launch", "run", "auto", "clear", "off", "drop", "on"]
-        skill_names = [s.name for s in skills.list_skills()]
-        bundle_names = list(skills.load_bundles().keys())
-        if len(parts) == 1:
-            candidates = subcommands + skill_names
-            lowered = token.lower()
-            matches = [c for c in candidates if c.lower().startswith(lowered)]
-            if not matches and lowered:
-                matches = [c for c in candidates if lowered in c.lower()]
-            if not matches:
-                return None
-            return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-        elif len(parts) == 2:
-            sub = parts[1].lower()
-            if sub in ("show", "use", "apply", "on"):
-                lowered = token.lower()
-                matches = [n for n in skill_names if n.lower().startswith(lowered)]
-                if not matches and lowered:
-                    matches = [n for n in skill_names if lowered in n.lower()]
-                if not matches:
-                    return None
-                labels = []
-                for n in matches[:50]:
-                    sk = skills.get(n)
-                    desc = sk.description if sk and sk.description else ""
-                    labels.append(f"{n}  {desc[:40]}" if desc else n)
-                return Completion(items=matches[:50], start=start, end=cursor, labels=labels)
-            elif sub in ("find", "search", "route"):
-                lowered = token.lower()
-                if not lowered:
-                    matches = skill_names[:50]
-                else:
-                    matches = []
-                    for sk in skills.list_skills():
-                        if lowered in sk.name.lower() or lowered in (sk.description or "").lower():
-                            matches.append(sk.name)
-                if not matches:
-                    return None
-                return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-            elif sub in ("launch", "run", "bundle", "bundles"):
-                lowered = token.lower()
-                matches = [b for b in bundle_names if b.lower().startswith(lowered)]
-                if not matches and lowered:
-                    matches = [b for b in bundle_names if lowered in b.lower()]
-                if not matches:
-                    return None
-                return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-            elif sub == "auto":
-                candidates = ["on", "off", "bundle"]
-                lowered = token.lower()
-                matches = [c for c in candidates if c.lower().startswith(lowered)]
-                if not matches:
-                    return None
-                return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-        elif len(parts) == 3 and parts[1].lower() == "auto" and parts[2].lower() == "bundle":
-            candidates = ["on", "off"]
-            lowered = token.lower()
-            matches = [c for c in candidates if c.lower().startswith(lowered)]
-            if not matches:
-                return None
-            return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-        return None
+        # Only the first argument after /skills is completed; ignore deeper args
+        if len(parts) > 1:
+            return None
+        known = skills.list_skills()
+        if not known:
+            return None
+        lowered = token.lower()
+        if not lowered:
+            # "/skills " + Tab → show all skills
+            items = sorted(s.name for s in known)[:50]
+            labels = []
+            for n in items:
+                sk = skills.get(n)
+                desc = (sk.description or "")[:40]
+                labels.append(f"{n}  {desc}" if desc else n)
+            return Completion(items=items, start=start, end=cursor, labels=labels)
+        # Filter by name OR description/type (case-insensitive substring)
+        # For very short queries (<3 chars) only match name to avoid noisy description hits
+        matches: list[str] = []
+        for sk in known:
+            if lowered in sk.name.lower():
+                matches.append(sk.name)
+            elif len(lowered) >= 3 and lowered in (sk.description or "").lower():
+                matches.append(sk.name)
+        if not matches:
+            return None
+        # Prefix matches first, then others — both alphabetically
+        prefix_hits = [n for n in matches if n.lower().startswith(lowered)]
+        other_hits = [n for n in matches if n not in prefix_hits]
+        ordered = sorted(prefix_hits) + sorted(other_hits)
+        ordered = ordered[:50]
+        labels = []
+        for n in ordered:
+            sk = skills.get(n)
+            desc = (sk.description or "")[:40] if sk else ""
+            labels.append(f"{n}  {desc}" if desc else n)
+        return Completion(items=ordered, start=start, end=cursor, labels=labels)
 
     def _complete_workflow(self, buffer: str, start: int, cursor: int, token: str):
         prefix = buffer[:start]
@@ -2398,45 +2636,90 @@ def _read_choice(session: "ConsoleSession", prompt_text: str) -> str:
 
 
 def _skills(session: "ConsoleSession", argument: str) -> None:
-    """/skills: discover, read, attach and run skill bundles."""
-    parts = argument.split() if argument else []
-    head = parts[0].lower() if parts else ""
-    rest = " ".join(parts[1:]).strip()
+    """/skills — EASY: type "/skills " + Tab shows all, type to filter by name/type.
 
-    if head == "":
-        known = skills.list_skills()
-        if known:
-            choice = _menu(session, "Skills", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in sorted(known, key=lambda s: s.name)])
-            if choice:
-                _skills_show(session, choice)
-                return
-        _skills_list(session)
+    Usage:
+      /skills              — list all
+      /skills <name>       — attach skill in 1 step (e.g. /skills tdd)
+      /skill is alias for /skills
+    """
+    parts = argument.split() if argument else []
+    raw_head = parts[0] if parts else ""
+    head = raw_head.lower() if parts else ""
+    rest = " ".join(parts[1:]).strip()
+    # Friendly aliases so manual is forgiving
+    alias = {"attach": "use", "detach": "clear", "ls": "list", "info": "show", "cat": "show", "rm": "clear", "search": "find", "route": "find", "run": "launch", "apply": "use", "on": "use"}
+    head = alias.get(head, head)
+
+    if head in ("help", "?", "-h", "--help", "manual", "h"):
+        _skills_help(session)
+    elif head == "":
+        _skills_dashboard(session)
     elif head == "list":
         _skills_list(session)
     elif head == "show":
         _skills_show(session, rest)
-    elif head in ("use", "apply"):
-        _skills_use(session, rest)
+    elif head == "use":
+        # Support "use all" / "use --all" for one-step bulk attach
+        if rest.lower() in ("all", "--all", "autoload", "autoloadall", "allskills", "autoloadallskill"):
+            _skills_use_all(session)
+        else:
+            _skills_use(session, rest)
     elif head in ("bundles", "bundle"):
         _skills_bundles(session)
-    elif head in ("launch", "run"):
+    elif head == "launch":
         _skills_launch(session, rest)
-    elif head in ("find", "search", "route"):
+    elif head == "find":
         _skills_find(session, rest)
     elif head == "auto":
         _skills_auto(session, rest)
+    elif head in ("all", "autoload", "autoloadall", "allskills", "autoloadallskill"):
+        # Direct one-step: /skills all → attach all
+        _skills_use_all(session)
     elif head in ("clear", "off", "drop"):
         if session.active_skills:
             session._print(session.style.dim("  skills detached: " + ", ".join(session.active_skills)))
             session.active_skills = []
         else:
             session._print(session.style.dim("  no skills attached"))
-    elif head == "on":
-        _skills_use(session, rest)
     else:
-        # A bare name is the common case, so it shows rather than
-        # demanding `show` first.
-        _skills_show(session, argument)
+        # EASY: /skills <name> — attach in 1 step, no "use" needed
+        # e.g. /skills tdd  →  same as /skills use tdd
+        if skills.get(argument):
+            _skills_use(session, argument)
+            return
+        elif skills.get(head) and not rest:
+            # Single token like "load-skills-here" — use directly
+            _skills_use(session, head)
+            return
+        else:
+            # Try find — if single hit, use it; else show options
+            hits = skills.find(argument, limit=5)
+            if len(hits) == 1:
+                _skills_use(session, hits[0].name)
+                return
+            elif hits:
+                _skills_find(session, argument)
+                return
+            else:
+                _skills_show(session, argument)
+                return
+
+
+def _skills_help(session: "ConsoleSession") -> None:
+    s = session.style
+    session._print(s.bold("  /skills — EASY"))
+    session._print(s.dim("  Skills are reusable procedures that ride along with a turn."))
+    session._print("")
+    session._print("    /skills              — list all")
+    session._print("    /skills <name>       — attach in 1 step  (e.g. /skills tdd)")
+    session._print("")
+    session._print(s.dim("  type /skills + space, Tab shows all, type to filter by name/type"))
+
+
+def _skills_dashboard(session: "ConsoleSession") -> None:
+    # EASY: no menu, just list.  "/skills space" completion does the filtering.
+    _skills_list(session)
 
 
 def _skills_list(session: "ConsoleSession") -> None:
@@ -2457,36 +2740,20 @@ def _skills_list(session: "ConsoleSession") -> None:
         mark = "*" if skill.name.lower() in session.active_skills else " "
         session._print(f" {mark} {skill.name:<18} {session.style.dim(function)}")
     session._print("")
-    session._print(session.style.dim("  /skills show <name> · /skills use <name> · /skills find <text>"))
+    session._print(session.style.dim("  EASY: /skills <name> to attach  ·  type /skills + space, Tab to filter"))
 
 
 def _skills_show(session: "ConsoleSession", name: str) -> None:
     if not name:
-        known = skills.list_skills()
-        if not known:
-            _skills_list(session)
-            return
-        choice = _menu(session, "Show skill", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in sorted(known, key=lambda s: s.name)])
-        if not choice:
-            _skills_list(session)
-            return
-        name = choice
+        _skills_list(session)
+        return
     found = skills.get(name)
     if found is None:
-        cands = skills.find(name, limit=8)
+        cands = skills.find(name, limit=5)
+        session._print(session.style.red(f"  no skill named '{name}'"))
         if cands:
-            choice = _menu(session, f"Skill '{name}' not found", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in cands])
-            if choice:
-                found = skills.get(choice)
-            else:
-                session._print(session.style.red(f"  no skill named '{name}'"))
-                return
-            if found is None:
-                session._print(session.style.red(f"  no skill named '{name}'"))
-                return
-        else:
-            session._print(session.style.red(f"  no skill named '{name}'"))
-            return
+            session._print(session.style.dim("  did you mean: " + ", ".join(c.name for c in cands)))
+        return
     session._print(session.style.bold(f"  {found.name}"))
     if found.description:
         session._print(session.style.dim(f"  {found.description}"))
@@ -2512,33 +2779,15 @@ def _skills_show(session: "ConsoleSession", name: str) -> None:
 
 def _skills_use(session: "ConsoleSession", name: str) -> None:
     if not name:
-        known = skills.list_skills()
-        if not known:
-            session._print(session.style.dim("  no skills found"))
-            return
-        choice = _menu(session, "Use skill", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in sorted(known, key=lambda s: s.name)])
-        if not choice:
-            session._print(session.style.dim("  usage: /skills use <name>"))
-            return
-        name = choice
+        session._print(session.style.dim("  usage: /skills <name>"))
+        return
     found = skills.get(name)
     if found is None:
-        cands = skills.find(name, limit=8)
+        cands = skills.find(name, limit=5)
+        session._print(session.style.red(f"  no skill named '{name}'"))
         if cands:
-            choice = _menu(session, f"Skill '{name}' not found", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in cands])
-            if choice:
-                found = skills.get(choice)
-                if found:
-                    name = choice
-                else:
-                    session._print(session.style.red(f"  no skill named '{name}'"))
-                    return
-            else:
-                session._print(session.style.red(f"  no skill named '{name}'"))
-                return
-        else:
-            session._print(session.style.red(f"  no skill named '{name}'"))
-            return
+            session._print(session.style.dim("  did you mean: " + ", ".join(c.name for c in cands)))
+        return
     key = found.name.lower()
     if key in session.active_skills:
         session._print(session.style.dim(f"  '{found.name}' is already attached"))
@@ -2546,6 +2795,26 @@ def _skills_use(session: "ConsoleSession", name: str) -> None:
     session.active_skills.append(key)
     session._print(session.style.dim(f"  attached '{found.name}' - it now rides along with every turn"))
     session._print(session.style.dim("  /skills clear to detach"))
+
+
+def _skills_use_all(session: "ConsoleSession") -> None:
+    """One-step bulk attach: /skills all  (also autoload, by type)"""
+    known = skills.list_skills()
+    if not known:
+        session._print(session.style.dim("  no skills found"))
+        session._print(session.style.dim(f"  looked in: {', '.join(str(r) for r in skills.roots())}"))
+        return
+    # If already all attached, say so
+    all_keys = [s.name.lower() for s in known]
+    new = [k for k in all_keys if k not in session.active_skills]
+    if not new:
+        session._print(session.style.dim(f"  all {len(known)} skills already attached"))
+        return
+    for k in new:
+        session.active_skills.append(k)
+    session._print(session.style.dim(f"  attached all {len(new)} skills: " + ", ".join(new)))
+    session._print(session.style.dim("  bundle auto is kept — /skills auto bundle on|off to change"))
+    session._print(session.style.dim("  /skills clear to detach all"))
 
 
 def _skills_bundles(session: "ConsoleSession") -> None:
@@ -2681,30 +2950,11 @@ def _skills_auto(session: "ConsoleSession", argument: str) -> None:
 
 def _skills_find(session: "ConsoleSession", query: str) -> None:
     if not query:
-        known = skills.list_skills()
-        if not known:
-            session._print(session.style.dim("  no skills found"))
-            return
-        choice = _menu(session, "Find skill", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in sorted(known, key=lambda s: s.name)])
-        if choice:
-            _skills_show(session, choice)
-        else:
-            session._print(session.style.dim("  usage: /skills find <what you want to do>"))
+        session._print(session.style.dim("  usage: /skills <name>  — Tab shows all, type to filter"))
         return
     hits = skills.find(query)
     if not hits:
-        known = skills.list_skills()
-        if known:
-            choice = _menu(session, f"No match for '{query}'", [Option(value=s.name, label=s.name, hint=(s.description or "")[:50]) for s in sorted(known, key=lambda s: s.name)])
-            if choice:
-                _skills_show(session, choice)
-                return
         session._print(session.style.dim(f"  nothing matches '{query}'"))
-        return
-    # Show selectable menu for the hits; if cancelled or non-interactive, fall back to text list
-    choice = _menu(session, f"Skills for: {query}", [Option(value=s.name, label=s.name, hint=(skills.routing_table().get(s.name.lower(), {}).get("function") or s.description or "")[:50]) for s in hits])
-    if choice:
-        _skills_show(session, choice)
         return
     session._print(session.style.bold(f"  skills for: {query}"))
     index = skills.routing_table()
@@ -2715,7 +2965,7 @@ def _skills_find(session: "ConsoleSession", query: str) -> None:
             function = function[:57].rstrip() + "..."
         session._print(f"  {found.name:<18} {session.style.dim(function)}")
     session._print("")
-    session._print(session.style.dim("  /skills show <name> to read one"))
+    session._print(session.style.dim("  EASY: /skills <name> to attach"))
 
 
 def _goal(session: "ConsoleSession", argument: str) -> None:
@@ -3549,14 +3799,33 @@ def _needs_first_run(session: "ConsoleSession") -> bool:
     return False
 
 
+def _strip_leading_invisible(s: str) -> str:
+    """Strip BOM, zero-width and other invisible leading characters."""
+    # Include BOM, ZWSP, ZWNJ, ZWJ, NBSP, ideographic space and normal whitespace
+    return s.lstrip("\ufeff\u200b\u200c\u200d\u00a0\u3000 \t\r\n")
+
 def dispatch(session: ConsoleSession, line: str) -> bool:
     """Run a slash command. Returns True when the line was a command."""
-    stripped = line.lstrip("\ufeff\u200b\u00a0 \t\r\n")
+    # Be forgiving: strip invisible leading chars and normalize full-width forms
+    stripped = _strip_leading_invisible(line)
+    # Normalize full-width characters that look like slash or at-sign
+    if stripped.startswith("\uff0f"):
+        stripped = "/" + stripped[1:]
+    if stripped.startswith("／"):
+        stripped = "/" + stripped[1:]
     if not stripped.startswith("/"):
         return False
+    # Strip trailing punctuation that is often typed accidentally after a command
+    stripped = stripped.rstrip(".,;:!?)'\"`")
+    # Also handle quoted commands like "/help" or '/help'
+    stripped = stripped.strip("'\"`")
     parts = stripped.split(None, 1)
-    command = parts[0].lower()
+    command = parts[0].lower().rstrip(".,;:!?")
+    # Normalize any internal full-width slash
+    command = command.replace("\uff0f", "/").replace("／", "/")
     argument = parts[1].strip() if len(parts) > 1 else ""
+    # Also strip surrounding quotes from argument for robustness
+    argument = argument.strip("'\"`")
 
     if command in ("/exit", "/quit"):
         session._print("bye")
@@ -3714,14 +3983,6 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         if session.layout is not None and session.layout.active:
             session.layout.clear_content()
         session._print("conversation reset (files kept)")
-    elif command == "/save":
-        path = argument or os.path.join(session.workspace, ".mantra", "session.json")
-        session.save_session(path)
-    elif command == "/load":
-        if not argument:
-            session._print("usage: /load <path>")
-        else:
-            session.load_session(argument)
     elif command == "/resume":
         parts = argument.split() if argument else []
         if not parts:
@@ -3734,7 +3995,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         _goal(session, argument)
     elif command == "/workflow":
         _workflow(session, argument)
-    elif command == "/skills":
+    elif command in ("/skills", "/skill"):
         _skills(session, argument)
     elif command == "/paste":
         text = _read_multiline(session)
@@ -3896,12 +4157,19 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
             style,
             completer=ConsoleCompleter(session),
             no_popup=False,
+            max_popup=24,
             popup_above=fixed_bottom,
             on_ctrl_g=_ctrl_g_handler,
             on_submit=session.close_prompt if not fixed_bottom else None,
             on_page_up=_page_up if fixed_bottom else None,
             on_page_down=_page_down if fixed_bottom else None,
         )
+        # Viewport getter for selection auto-copy anywhere
+        try:
+            editor.viewport_getter = lambda: list(session.layout.lines) if session.layout and getattr(session.layout, "active", False) else []
+            editor.layout_ref = session.layout
+        except Exception:
+            pass
 
         if fixed_bottom and session.layout is not None:
             editor.on_before_draw = lambda count=0: session.layout.restore_popup_rows(count)
@@ -3913,7 +4181,7 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                     changed = session.layout.check_resize()
                     if changed:
                         content_height = session.layout.content_bottom - session.layout.content_top + 1
-                        editor.max_popup = max(1, min(8, content_height))
+                        editor.max_popup = max(1, min(24, content_height))
                         editor.fixed_row = session.layout.prompt_row
                         return session.prompt_text()
                 return None
@@ -3933,8 +4201,20 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                 editor.fixed_row = session.layout.prompt_row
 
             if fixed_bottom:
+                # Pause walking pulse while typing
+                if session.layout is not None and session.layout.active:
+                    try:
+                        session.layout.stop_prompt_pulse()
+                    except Exception:
+                        pass
                 line = reader(session.prompt_text(), skip_newline=True).strip("﻿​  \t\r\n")
-                # Prompt owned by LineEditor — layout does not redraw here
+                # Resume pulse after input, clear prompt so typed text doesn't linger during Chanting/Channeling
+                if session.layout is not None and session.layout.active:
+                    try:
+                        session.layout.draw_prompt("")
+                        session.layout.start_prompt_pulse()
+                    except Exception:
+                        pass
             elif session.frame is not None:
                 session.frame.row("")
                 line = reader(session.prompt_text()).strip("﻿​  \t\r\n")

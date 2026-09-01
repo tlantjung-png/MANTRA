@@ -15,7 +15,9 @@ from mantra.implementations.sandbox.local_sandbox import LocalSandbox
 from mantra.implementations.tools.command_tool import (
     GitDiffTool,
     GitResetTool,
+    KillShellTool,
     RunCommandTool,
+    ShellOutputTool,
 )
 from mantra.implementations.tools.file_tools import (
     EditFileTool,
@@ -58,6 +60,8 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         EditFileTool,
         ListDirTool,
         RunCommandTool,
+        ShellOutputTool,
+        KillShellTool,
         SearchCodeTool,
         FindFileTool,
         GitDiffTool,
@@ -65,7 +69,19 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         WebFetchTool,
     )
 }
-# Alias without underscore for usability.
+# Canonical name normalization: add alias without underscore by normalizing
+# incoming names at lookup time rather than duplicating entries. Keep alias
+# entry for backward compat (tests index TOOL_REGISTRY directly) but also
+# normalize on lookup to avoid divergence.
+_TOOL_ALIASES: dict[str, str] = {"webfetch": "web_fetch"}
+
+
+def _normalize_tool_name(name: str) -> str:
+    n = (name or "").strip().lower().replace("-", "_")
+    return _TOOL_ALIASES.get(n, n)
+
+
+# Keep backward-compat alias entry so TOOL_REGISTRY["webfetch"] works for direct indexing
 TOOL_REGISTRY["webfetch"] = WebFetchTool
 
 
@@ -109,7 +125,8 @@ def build_tools(names: list[str]) -> list[Tool]:
     seen_classes: set[type[Tool]] = set()
     tools = []
     for name in names:
-        cls = TOOL_REGISTRY.get(name)
+        norm = _normalize_tool_name(name)
+        cls = TOOL_REGISTRY.get(norm)
         if cls is None:
             raise ConfigError(
                 f"unknown tool '{name}' (known: {sorted(TOOL_REGISTRY)})"
@@ -125,8 +142,16 @@ def build_tools(names: list[str]) -> list[Tool]:
 
 
 def _construct(cls, config: dict):
-    """Build component; forward only matching params."""
+    """Build component; forward only matching params, reject unknown keys."""
     params = _constructor_params(cls)
+    # Known keys are constructor params plus the discriminant keys
+    known = set(params.keys()) | {"provider", "type"}
+    unknown = [k for k in config.keys() if k not in known]
+    if unknown:
+        raise ConfigError(
+            f"{cls.__name__} received unknown config keys {sorted(unknown)} "
+            f"(known: {sorted(known)}) — check for typos"
+        )
     kwargs = {}
     for key, value in config.items():
         if key in ("provider", "type"):

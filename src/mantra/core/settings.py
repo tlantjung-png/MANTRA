@@ -19,12 +19,12 @@ DEFAULT_FILE = {
     "endpoints": {},
     "active": {"endpoint": "", "model": "", "reasoning_effort": None},
     "skills": {
-        # Whether the router may attach a skill to a plain prompt. Kept
+        # Whether the router may attach a skill/bundle to a plain prompt. Kept
         # here rather than in the config because it is a preference the
         # operator switches once, and config.json is an input, not a
         # scratchpad - nothing in MANTRA writes back to it.
         "auto": True,
-        "auto_bundle": False,
+        "auto_bundle": True,
     },
 }
 
@@ -100,13 +100,27 @@ def _quarantine(file: Path, reason: str) -> str | None:
         return None
 
 
-def _break_stale_lock(lock_path: Path) -> None:
+def _break_stale_lock(lock_path: Path) -> bool:
+    """Try to break a stale lock atomically. Returns True if removed."""
     try:
-        age = time.time() - os.path.getmtime(lock_path)
-        if age >= _LOCK_STALE_SECONDS:
+        stat = lock_path.stat()
+        age = time.time() - stat.st_mtime
+        if age < _LOCK_STALE_SECONDS:
+            return False
+        # Atomicity: only remove if mtime hasn't changed since we checked.
+        # Use compare-and-remove pattern with a second stat.
+        try:
+            # Re-stat to ensure no one is actively writing (recent mtime change)
+            stat2 = lock_path.stat()
+            if stat2.st_mtime != stat.st_mtime:
+                return False
             lock_path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            return True
     except OSError:
-        pass
+        return False
+    return False
 
 
 def _write(data: dict[str, Any]) -> None:
@@ -121,8 +135,14 @@ def _write(data: dict[str, Any]) -> None:
     data["version"] = _VERSION
     content = json.dumps(data, indent=2, sort_keys=True) + "\n"
     # File lock for inter-process safety (best effort).
+    # Use atomic exclusive create as the sole arbiter; stale check is
+    # opportunistic and its removal is verified to avoid deleting a
+    # freshly created lock from another process.
     lock_path = file.with_suffix(file.suffix + ".lock")
-    _break_stale_lock(lock_path)
+    # Opportunistically break a stale lock before trying; if break fails,
+    # the subsequent open will simply wait.
+    if lock_path.exists():
+        _break_stale_lock(lock_path)
     acquired = False
     lock_fd = None
     start = time.monotonic()
@@ -133,6 +153,12 @@ def _write(data: dict[str, Any]) -> None:
             break
         except FileExistsError:
             time.sleep(0.02)
+            # Opportunistically retry stale break if lock looks old
+            try:
+                if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE_SECONDS:
+                    _break_stale_lock(lock_path)
+            except OSError:
+                pass
         except OSError:
             break
     tmp = file.with_suffix(file.suffix + ".tmp")

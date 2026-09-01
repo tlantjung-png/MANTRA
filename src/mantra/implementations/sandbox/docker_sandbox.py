@@ -26,10 +26,12 @@ class DockerSandbox(Sandbox):
         network_enabled_during_setup: bool = True,
         workdir: str = "/workspace",
     ) -> None:
-        self.image = image
-        self.mem_limit = mem_limit
-        self.network_enabled_during_setup = network_enabled_during_setup
-        self.workdir = workdir
+        # Validate inputs early to surface config errors near construction,
+        # not deep inside setup.
+        self.image = self._validate_image(image)
+        self.mem_limit = self._validate_mem_limit(mem_limit)
+        self.network_enabled_during_setup = bool(network_enabled_during_setup)
+        self.workdir = self._validate_workdir(workdir)
         self._container_id: str | None = None
 
     def setup(self, task: dict) -> None:
@@ -296,6 +298,58 @@ class DockerSandbox(Sandbox):
         if any(c in commit for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", '"', "'")):
             return False
         return True
+
+    @staticmethod
+    def _validate_image(image: str) -> str:
+        import re
+        img = (image or "").strip()
+        if not img or len(img) > 256 or "\n" in img or "\r" in img or "\x00" in img:
+            raise ValueError(f"invalid container image {image!r}")
+        # Allow repo/image:tag@digest with alnum, ., -, _, /, :
+        if not re.match(r"^[a-zA-Z0-9._\-/:@]+$", img):
+            raise ValueError(f"invalid container image {image!r}")
+        if ".." in img or img.startswith("-") or img.startswith("/"):
+            raise ValueError(f"invalid container image {image!r}")
+        return img
+
+    @staticmethod
+    def _validate_mem_limit(mem: str) -> str:
+        import re
+        m = (mem or "").strip().lower()
+        if not re.match(r"^\d+(\.\d+)?[kmg]?b?$", m):
+            raise ValueError(f"invalid memory limit {mem!r} (expected like 512m, 2g, 1g)")
+        # Parse numeric part and enforce sane range 64m to 16g
+        num_str = re.match(r"^(\d+(?:\.\d+)?)", m).group(1)  # type: ignore
+        try:
+            num = float(num_str)
+        except ValueError:
+            raise ValueError(f"invalid memory limit {mem!r}")
+        unit = m[len(num_str):]
+        # Normalize to bytes for range check
+        mult = 1
+        if unit.startswith("k"):
+            mult = 1024
+        elif unit.startswith("m"):
+            mult = 1024 * 1024
+        elif unit.startswith("g"):
+            mult = 1024 * 1024 * 1024
+        bytes_val = num * mult
+        if bytes_val < 64 * 1024 * 1024 or bytes_val > 16 * 1024 * 1024 * 1024:
+            raise ValueError(f"memory limit {mem!r} out of range (64m to 16g)")
+        return m
+
+    @staticmethod
+    def _validate_workdir(wd: str) -> str:
+        import posixpath
+        w = (wd or "").strip()
+        if not w.startswith("/"):
+            raise ValueError(f"workdir must be an absolute POSIX path, got {wd!r}")
+        if "\x00" in w or "\n" in w or "\r" in w or ":" in w:
+            raise ValueError(f"invalid workdir {wd!r}")
+        norm = posixpath.normpath(w)
+        if norm != w:
+            raise ValueError(f"workdir must be normalized, got {wd!r} expected {norm!r}")
+        return w
 
     @staticmethod
     def _run_cli(args: list[str]) -> bool:

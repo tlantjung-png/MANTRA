@@ -24,14 +24,17 @@ class JsonlLogger(Logger):
     def log(self, event: str, payload: dict[str, Any]) -> None:
         record = {"ts": round(time.time(), 3), "event": event, **payload}
         line = json.dumps(record, default=str) + "\n"
-        # Inter-process lock to avoid interleaved lines.
+        # Inter-process lock to avoid interleaved lines. Use atomic exclusive
+        # create as the arbiter; stale handling verifies mtime to avoid
+        # deleting a lock that was just created.
         lock_path = self.path + ".lock"
-        # Brief stale handling.
         try:
-            age = time.time() - os.path.getmtime(lock_path)
-            if age >= 5.0:
+            stat = os.stat(lock_path)
+            if time.time() - stat.st_mtime >= 5.0:
                 try:
-                    os.remove(lock_path)
+                    stat2 = os.stat(lock_path)
+                    if stat2.st_mtime == stat.st_mtime:
+                        os.remove(lock_path)
                 except OSError:
                     pass
         except OSError:
@@ -46,6 +49,18 @@ class JsonlLogger(Logger):
                 break
             except FileExistsError:
                 time.sleep(0.02)
+                try:
+                    s = os.stat(lock_path)
+                    if time.time() - s.st_mtime >= 5.0:
+                        # Verify mtime unchanged before removal
+                        try:
+                            s2 = os.stat(lock_path)
+                            if s2.st_mtime == s.st_mtime:
+                                os.remove(lock_path)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
             except OSError:
                 break
         try:

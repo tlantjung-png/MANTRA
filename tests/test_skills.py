@@ -261,8 +261,10 @@ class CommandTest(unittest.TestCase):
         self.assertIn("behavior-first", self._shown())
 
     def test_a_bare_name_shows_the_skill(self):
+        # Bare name now attaches in one step (easier manual), show still works via "show"
         _skills(self.session, "tdd")
-        self.assertIn("## Procedure", self._shown())
+        self.assertIn("attached 'tdd'", self._shown())
+        self.assertIn("tdd", self.session.active_skills)
 
     def test_show_prints_the_procedure(self):
         _skills(self.session, "show tdd")
@@ -531,6 +533,7 @@ class AutoRouteTest(SkillsFixtureTest):
         self.assertEqual(self.session.active_skills, [])
 
     def test_a_matching_bundle_is_offered_not_launched(self):
+        self.session.config["skills"]["auto_bundle"] = False
         self.assertIsNone(self.session.auto_route("fix the bug"))
         self.assertIn("/skills launch fix-bug", self._shown())
 

@@ -29,6 +29,8 @@ DEFAULTS = {
         "edit_file",
         "list_dir",
         "run_command",
+        "shell_output",
+        "kill_shell",
         "search_code",
         "find_file",
         "git_diff",
@@ -45,9 +47,9 @@ DEFAULTS = {
     # True uses native scrollback; false uses fixed frame.
     "native_scrollback": True,
     "skills": {
-        # Auto-attach skill per turn; bundles only suggested as hints.
+        # Auto-attach skill per turn; bundles auto-launch by default.
         "auto": True,
-        "auto_bundle": False,
+        "auto_bundle": True,
     },
 }
 

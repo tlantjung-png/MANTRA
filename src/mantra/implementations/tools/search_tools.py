@@ -74,11 +74,6 @@ class SearchCodeTool(Tool):
                         real = os.path.realpath(full)
                         if not (real == real_root or real.startswith(real_root + os.sep)):
                             continue
-                    try:
-                        if os.stat(full).st_nlink > 1:
-                            continue
-                    except OSError:
-                        pass
                     if os.path.getsize(full) > _MAX_FILE_BYTES:
                         continue
                 except OSError:
@@ -92,9 +87,18 @@ class SearchCodeTool(Tool):
                     break
             if len(hits) >= _MAX_RESULTS or scanned > 3000:
                 break
+        truncated_note = ""
+        if scanned > 3000:
+            truncated_note = f"\n... [truncated — scanned {scanned} files, ceiling reached; narrow the query or directory]"
         if not hits:
-            return "(no matches)"
-        return "\n".join(hits)
+            return "(no matches)" + truncated_note
+        result = "\n".join(hits)
+        if truncated_note:
+            result += truncated_note
+        # Also note if hit ceiling reached
+        if len(hits) >= _MAX_RESULTS:
+            result += f"\n... [hit ceiling {_MAX_RESULTS} reached; refine query]"
+        return result
 
     @staticmethod
     def _scan_file(full: str, rel: str, query: str, real_root: str | None = None) -> list[str]:
@@ -170,11 +174,11 @@ class FindFileTool(Tool):
                         real = os.path.realpath(full)
                         if not (real == real_root or real.startswith(real_root + os.sep)):
                             continue
-                    try:
-                        if os.stat(full).st_nlink > 1:
-                            continue
-                    except OSError:
-                        pass
+                except OSError:
+                    continue
+                try:
+                    if os.path.getsize(full) > _MAX_FILE_BYTES:
+                        continue
                 except OSError:
                     continue
                 scanned += 1
@@ -183,7 +187,10 @@ class FindFileTool(Tool):
                 if pattern in filename:
                     matches.append(os.path.relpath(full, root))
                     if len(matches) >= _MAX_RESULTS:
-                        return "\n".join(matches)
+                        return "\n".join(matches) + f"\n... [hit ceiling {_MAX_RESULTS} reached]"
             if scanned > 3000:
                 break
-        return "\n".join(matches) or "(no matches)"
+        truncated = ""
+        if scanned > 3000:
+            truncated = f"\n... [truncated — scanned {scanned} files, ceiling reached]"
+        return ("\n".join(matches) or "(no matches)") + truncated

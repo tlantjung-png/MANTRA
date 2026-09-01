@@ -10,14 +10,24 @@ def content_hash(content: str) -> str:
 
 
 class EditLedger:
-    """Per-session path -> hash of last seen content."""
+    """Per-session path -> hash of last seen content, with partial flag."""
 
     def __init__(self) -> None:
         self._seen: dict[str, str] = {}
+        self._partial: set[str] = set()
 
     def remember(self, path: str, content: str) -> None:
-        """Record content hash for path."""
+        """Record content hash for path (full view)."""
         self._seen[self._key(path)] = content_hash(content)
+        self._partial.discard(self._key(path))
+
+    def remember_partial(self, path: str, is_partial: bool) -> None:
+        """Mark whether last view was partial."""
+        key = self._key(path)
+        if is_partial:
+            self._partial.add(key)
+        else:
+            self._partial.discard(key)
 
     def has_seen(self, path: str) -> bool:
         return self._key(path) in self._seen
@@ -25,8 +35,12 @@ class EditLedger:
     def is_current(self, path: str, content: str) -> bool:
         return self._seen.get(self._key(path)) == content_hash(content)
 
+    def is_partial(self, path: str) -> bool:
+        return self._key(path) in self._partial
+
     def forget_all(self) -> None:
         self._seen.clear()
+        self._partial.clear()
 
     @staticmethod
     def _key(path: str) -> str:

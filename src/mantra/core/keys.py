@@ -64,11 +64,47 @@ def _save(data: dict[str, Any]) -> None:
             pass
 
 
+_WARNED_INSECURE = False
+
+
+def _platform_warn_if_insecure() -> None:
+    """Warn once per process when file permissions cannot be enforced."""
+    global _WARNED_INSECURE
+    if os.name != "nt":
+        return
+    # Do not warn for test overrides (temp files), only for real home path
+    # to avoid spamming the test suite.
+    if os.environ.get(_OVERRIDE_ENV):
+        return
+    if _WARNED_INSECURE:
+        return
+    _WARNED_INSECURE = True
+    import warnings
+    warnings.warn(
+        "stored credentials file permissions are not enforced on this platform; "
+        "consider using environment variables for keys on shared machines",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def _restrict_dir(directory: Path) -> None:
     try:
         os.chmod(directory, 0o700)
     except OSError:
         pass
+    if os.name == "nt":
+        # Best-effort ACL tightening via icacls where available; ignore failures.
+        try:
+            import subprocess
+            import getpass
+            user = getpass.getuser()
+            subprocess.run(
+                ["icacls", str(directory), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
 
 
 def _restrict_file(path: Path) -> None:
@@ -76,12 +112,25 @@ def _restrict_file(path: Path) -> None:
 
     Windows honours the read-only bit but not the POSIX mode bits, so
     this is a meaningful guarantee on POSIX and a hint elsewhere. The
-    file is still a plain JSON document either way.
+    file is still a plain JSON document either way. On non-POSIX we emit
+    a warning so the operator understands the threat model.
     """
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
+    if os.name == "nt":
+        _platform_warn_if_insecure()
+        try:
+            import subprocess
+            import getpass
+            user = getpass.getuser()
+            subprocess.run(
+                ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
 
 
 def stored_keys() -> dict[str, str]:

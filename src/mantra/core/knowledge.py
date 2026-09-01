@@ -197,8 +197,11 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
         lock_acquired = False
         lock_handle = None
         try:
-            # Remove stale lock from crashed process.
-            _break_stale_lock(lock_path)
+            # Opportunistically break a stale lock, but treat exclusive create
+            # as the arbiter; stale removal is verified to avoid deleting a
+            # freshly created lock.
+            if os.path.exists(lock_path):
+                _break_stale_lock(lock_path)
             # Brief lock wait on interactive thread.
             start = time.monotonic()
             while time.monotonic() - start < _LOCK_WAIT_SECONDS:
@@ -209,6 +212,11 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     break
                 except FileExistsError:
                     time.sleep(0.02)
+                    try:
+                        if time.time() - os.stat(lock_path).st_mtime >= _LOCK_STALE_SECONDS:
+                            _break_stale_lock(lock_path)
+                    except OSError:
+                        pass
                 except OSError:
                     break
             # Re-read before write to avoid lost update (even without lock).
@@ -259,16 +267,23 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
 def _break_stale_lock(lock_path: str) -> bool:
     """Remove a lock whose holder is no longer around to remove it."""
     try:
-        age = time.time() - os.path.getmtime(lock_path)
+        stat = os.stat(lock_path)
+        age = time.time() - stat.st_mtime
+        if age < _LOCK_STALE_SECONDS:
+            return False
+        # Verify mtime hasn't changed since we checked to avoid deleting
+        # a lock that was just freshly created by another process.
+        try:
+            stat2 = os.stat(lock_path)
+            if stat2.st_mtime != stat.st_mtime:
+                return False
+            os.remove(lock_path)
+            return True
+        except FileNotFoundError:
+            return True
     except OSError:
         return False
-    if age < _LOCK_STALE_SECONDS:
-        return False
-    try:
-        os.remove(lock_path)
-        return True
-    except OSError:
-        return False
+    return False
 
 
 def _read_file(path: str) -> str:

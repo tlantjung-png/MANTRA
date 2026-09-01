@@ -31,6 +31,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
     tool_acc: dict[int, dict[str, str]] = {}
     usage: dict | None = None
     malformed = 0
+    malformed_total = 0
     seen_done = False
 
     for raw in lines:
@@ -45,8 +46,11 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             chunk = json.loads(data)
         except json.JSONDecodeError:
             malformed += 1
+            malformed_total += 1
             if malformed > 20:
-                raise LLMError("stream contained too many malformed chunks")
+                raise LLMError("stream contained too many consecutive malformed chunks (20)")
+            if malformed_total > 100:
+                raise LLMError(f"stream contained too many malformed chunks total ({malformed_total}) — possible protocol mismatch")
             continue  # tolerate keep-alive / noise
         malformed = 0
         # Usage may be in final chunk without choices; read early.
@@ -103,13 +107,20 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
         name = slot["name"].strip()
         if not name:
             raise LLMError(f"stream tool_call {i} missing name")
+        raw_args = slot["args"] or "{}"
         try:
-            arguments = json.loads(slot["args"] or "{}")
+            arguments = json.loads(raw_args)
         except json.JSONDecodeError as exc:
-            # Mid-stream cut leaves partial JSON; surface as LLMError.
-            raise LLMError(
-                f"the response ended mid-tool-call ({name or 'call ' + str(i)}): {exc}"
-            ) from exc
+            # Try quoted-escapes repair for Windows paths
+            try:
+                from mantra.core.tool_repairs import repair_quoted_escapes_json_text
+
+                fixed = repair_quoted_escapes_json_text(raw_args)
+                arguments = json.loads(fixed)
+            except Exception:
+                raise LLMError(
+                    f"the response ended mid-tool-call ({name or 'call ' + str(i)}): {exc}"
+                ) from exc
         if not isinstance(arguments, dict):
             raise LLMError(f"tool arguments not an object for '{name}'")
         tool_calls.append(
@@ -262,11 +273,15 @@ class OpenAICompatClient(LLMClient):
         """Did the server complain about this field?
 
         Empty detail no longer counts as blamed — it would incorrectly shed
-        features on auth/format errors. Only explicit mention counts.
+        features on auth/format errors. Only explicit mention counts, with
+        word-boundary check to avoid false positives from unrelated substrings.
         """
         if not detail:
             return False
-        return field.lower() in detail.lower()
+        import re as _re
+        # Require field appears as a distinct token, not a substring of another word
+        pattern = r"(?<![a-z0-9_])" + _re.escape(field.lower()) + r"(?![a-z0-9_])"
+        return bool(_re.search(pattern, detail.lower()))
 
     def _headers(self) -> dict[str, str]:
         # Environment first, stored credential second.
@@ -310,12 +325,21 @@ class OpenAICompatClient(LLMClient):
                 except Exception:
                     raise
             # Agnostic fallback: if chat fails and provider offers Responses API, try it
+            # Preserve original error for diagnostics if fallback also fails
+            _orig_exc = exc
+            _orig_detail = detail
             if exc.code in (400, 500):
                 try:
                     # Probe: does {base}/responses exist? Try it before surfacing 400/500
-                    return self._request_via_responses(body)
-                except Exception:
-                    pass
+                    resp = self._request_via_responses(body)
+                    # Log that fallback was used (visible via logger if attached)
+                    return resp
+                except Exception as _fb_exc:
+                    # Fallback failed — chain original error for diagnostics
+                    raise LLMError(
+                        f"chat completions failed (HTTP {exc.code}): {_orig_detail[:300] or 'no detail'}; "
+                        f"fallback to responses also failed: {_fb_exc}"
+                    ) from _orig_exc
             raise
         try:
             data = json.loads(raw)
@@ -331,8 +355,6 @@ class OpenAICompatClient(LLMClient):
                 f"{self.base_url}/chat/completions returned no choices"
             )
 
-        if not isinstance(data, dict):
-            raise LLMError("LLM response not a JSON object")
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise LLMError(f"{self.base_url}/chat/completions returned no choices")
@@ -362,7 +384,14 @@ class OpenAICompatClient(LLMClient):
                 try:
                     arguments = json.loads(args_raw or "{}")
                 except json.JSONDecodeError as exc:
-                    raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
+                    # Try quoted-escapes repair for Windows paths
+                    try:
+                        from mantra.core.tool_repairs import repair_quoted_escapes_json_text
+
+                        fixed = repair_quoted_escapes_json_text(args_raw or "{}")
+                        arguments = json.loads(fixed)
+                    except Exception:
+                        raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
                 if not isinstance(arguments, dict):
                     raise LLMError(f"tool arguments not an object for '{name}'")
             else:
@@ -528,9 +557,14 @@ class OpenAICompatClient(LLMClient):
                     raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io2.BytesIO(raw2))
                 except Exception:
                     raise
+            _orig = exc
+            _orig_detail2 = detail
             if exc.code in (400, 500):
                 try:
                     return self._request_via_responses(body)
-                except Exception:
-                    pass
+                except Exception as _fb2:
+                    raise LLMError(
+                        f"streaming chat failed (HTTP {exc.code}): {_orig_detail2[:300] or 'no detail'}; "
+                        f"fallback also failed: {_fb2}"
+                    ) from _orig
             raise

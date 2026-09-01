@@ -74,20 +74,32 @@ def load_all() -> dict[str, Any]:
     return data
 
 
-def _break_stale(lock_path: Path) -> None:
+def _break_stale(lock_path: Path) -> bool:
     try:
-        age = time.time() - os.path.getmtime(lock_path)
-        if age >= _LOCK_STALE:
-            lock_path.unlink(missing_ok=True)
+        stat = lock_path.stat()
+        age = time.time() - stat.st_mtime
+        if age < _LOCK_STALE:
+            return False
+        # Verify mtime unchanged to avoid deleting a freshly created lock
+        try:
+            stat2 = lock_path.stat()
+            if stat2.st_mtime != stat.st_mtime:
+                return False
+        except OSError:
+            return False
+        lock_path.unlink(missing_ok=True)
+        return True
     except OSError:
-        pass
+        return False
+    return False
 
 
 def _save_all(data: dict[str, Any]) -> bool:
     target = workflows_path()
-    # File lock for inter-process safety.
+    # File lock for inter-process safety — atomic exclusive create is arbiter.
     lock_path = target.with_suffix(target.suffix + ".lock")
-    _break_stale(lock_path)
+    if lock_path.exists():
+        _break_stale(lock_path)
     acquired = False
     fd = None
     start = time.monotonic()
@@ -98,6 +110,11 @@ def _save_all(data: dict[str, Any]) -> bool:
             break
         except FileExistsError:
             time.sleep(0.02)
+            try:
+                if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE:
+                    _break_stale(lock_path)
+            except OSError:
+                pass
         except OSError:
             break
     try:

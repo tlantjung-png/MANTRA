@@ -1,10 +1,20 @@
-"""File tools: read, write, edit, list with caps and ledger."""
+"""File tools: read, write, edit, list with caps, ledger, and harness repairs.
+
+Adapted from Command Code read-tool harness engineering:
+- 3 ceilings: 2000 lines / 128KB / 2000ch per line
+- Recovery notes instead of silent empty
+- Dedup self-expiring cache
+- Partial-view ledger
+- Unicode/did-you-mean retry
+"""
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shlex
+import unicodedata
 from typing import Any
 
 from mantra.interfaces.sandbox import Sandbox
@@ -12,35 +22,502 @@ from mantra.interfaces.tool import Tool
 
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
-_MAX_READ_CHARS = 20000
+_MAX_READ_CHARS = 20000  # legacy cap for non-windowed callers
 _MAX_WRITE_CHARS = 1_000_000
 
+# Command Code ceilings
+_LINE_WINDOW = 2000
+_BYTE_BUDGET = 128 * 1024  # 128KB
+_PER_LINE_CLAMP = 2000
+
+# File ledger for dedup persistence (harness read-ledger-*.json)
+_LEDGER_DIR = os.path.join(os.path.expanduser("~"), ".mantra", "state")
+_LEDGER_FILE = os.path.join(_LEDGER_DIR, "read-ledger.json")
+
+def _get_file_sha256(full_path: str) -> str:
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(full_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+def _load_ledger() -> dict[str, Any]:
+    try:
+        if os.path.exists(_LEDGER_FILE):
+            import json
+            with open(_LEDGER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+
+def _save_ledger(ledger: dict[str, Any]) -> None:
+    try:
+        os.makedirs(_LEDGER_DIR, exist_ok=True)
+        tmp = _LEDGER_FILE + f".{os.getpid()}.tmp"
+        import json
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(ledger, f, indent=2)
+        # Atomic move
+        os.replace(tmp, _LEDGER_FILE)
+    except Exception:
+        pass
+
+def _is_strict_positive_int(s: str, allow_zero: bool = False) -> bool:
+    """harness Convert-StrictPositiveInt: regex ^(0|[1-9][0-9]*)$, no 2abc, no 1.5"""
+    if not isinstance(s, str):
+        s = str(s)
+    if not re.match(r"^(0|[1-9][0-9]*)$", s):
+        return False
+    if not allow_zero and s == "0":
+        return False
+    try:
+        if int(s) > 2147483647:
+            return False
+    except Exception:
+        return False
+    return True
+
+def _is_blocked_path_harness(path: str) -> str | None:
+    """harness Test-BlockedPath: device namespace, trailing dot/space, ADS, CON/PRN etc."""
+    if not path or not path.strip():
+        return "path is empty"
+    if path.startswith("\\\\?\\") or path.startswith("\\\\.\\"):
+        return "device namespace paths are blocked"
+    parts = [p for p in re.split(r"[\\/]", path) if p != ""]
+    if not parts:
+        return "path has no file name"
+    for part in parts:
+        if part.endswith(".") or part.endswith(" "):
+            return "path segments may not end in a dot or space"
+    last = parts[-1]
+    if ":" in last:
+        return "alternate data streams are blocked"
+    if re.match(r"^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", last):
+        return "device names are blocked"
+    return None
+
+_DEVICE_BLOCKLIST = ("/dev/zero", "/dev/urandom", "/dev/stdin")
+
+def _is_blocked_device(path: str) -> bool:
+    p = path.replace("\\", "/")
+    for blocked in _DEVICE_BLOCKLIST:
+        if p == blocked or p.startswith(blocked + "/"):
+            return True
+    # Block all /proc — not just /proc/self/fd
+    if p == "/proc" or p.startswith("/proc/"):
+        return True
+    if p.startswith("/dev/"):
+        # any /dev/ is suspicious unless explicitly allowed
+        if p in ("/dev/null",):
+            return False
+        return True
+    return False
+
+def _normalize_narrow_space(s: str) -> str:
+    # NARROW NO-BREAK SPACE (U+202F) vs regular space
+    return s.replace("\u202f", " ").replace("\u00a0", " ")
+
+def _candidate_spellings(path: str) -> list[str]:
+    cands = []
+    # narrow <-> regular, NFD/NFC, curly quotes
+    variants = [path]
+    # narrow space
+    if "\u202f" in path or " " in path:
+        variants.append(_normalize_narrow_space(path))
+        variants.append(path.replace(" ", "\u202f"))
+    # quotes
+    for v in list(variants):
+        if "'" in v:
+            variants.append(v.replace("'", "’"))
+        if "’" in v:
+            variants.append(v.replace("’", "'"))
+    # NFD/NFC
+    for v in list(variants):
+        try:
+            variants.append(unicodedata.normalize("NFD", v))
+            variants.append(unicodedata.normalize("NFC", v))
+        except Exception:
+            pass
+    # dedup preserve order
+    seen = set()
+    out = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out[:7]
+
+def _levenshtein(a: str, b: str, max_dist: int = 2) -> int:
+    if abs(len(a) - len(b)) > max_dist:
+        return max_dist + 1
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur.append(min(prev[j] + 1, cur[j-1] + 1, prev[j-1] + cost))
+        prev = cur
+        if min(prev) > max_dist:
+            return max_dist + 1
+    return prev[-1]
 
 class ReadFileTool(Tool):
     name = "read_file"
     description = (
         "Read a text file relative to the workspace root. "
-        "Content is truncated after 20000 characters."
+        "Supports offset/limit window (default 0/2000), 128KB byte budget, 2000ch/line clamp. "
+        "Also accepts glob via path (e.g. src/**/*.ts) or comma-separated list."
     )
     parameters: dict[str, Any] = {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "Relative file path"}},
+        "properties": {
+            "path": {"type": "string", "description": "Relative file path or glob"},
+            "offset": {"type": "integer", "description": "Start line (0-indexed)"},
+            "limit": {"type": "integer", "description": "Max lines to return"},
+        },
         "required": ["path"],
     }
     ledger = None  # injected by registry
 
-    def execute(self, sandbox: Sandbox, path: str) -> str:
+    def __init__(self) -> None:
+        # dedup cache: (path, offset, limit) -> (mtime, size, content)
+        self._dedup: dict[tuple[str, int, int], tuple[float, int, str]] = {}
+
+    def execute(self, sandbox: Sandbox, path: str, offset: int = 0, limit: int = 2000) -> str:  # type: ignore[override]
+        # repairs for null string etc handled in tool_repairs, but be defensive
+        if path is None:
+            return "ERROR: path is required"
+        if not isinstance(path, str):
+            path = str(path)
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
+        # harness strict int validation (read-safe.ps1:19) — reject "2abc", "1.5"
+        # Use string check before int conversion for strictness
+        if isinstance(offset, str):
+            if not _is_strict_positive_int(offset, allow_zero=True):
+                return f"ERROR: offset must be a non-negative integer, got {offset!r}"
+            offset = int(offset)
+        elif not isinstance(offset, int):
+            try:
+                offset = int(offset)
+            except Exception:
+                return "ERROR: offset must be integer"
+        if isinstance(limit, str):
+            if not _is_strict_positive_int(limit, allow_zero=True):
+                return f"ERROR: limit must be a non-negative integer, got {limit!r}"
+            limit = int(limit)
+        elif not isinstance(limit, int):
+            try:
+                limit = int(limit)
+            except Exception:
+                return "ERROR: limit must be integer"
+        if offset < 0 or limit < 0:
+            return "ERROR: offset/limit must be >=0"
+        if limit == 0:
+            limit = _LINE_WINDOW
+        if limit > 5000:
+            limit = 5000
+        # harness blocked paths (device namespace, CON/PRN, trailing dot/space, ADS)
+        blocked = _is_blocked_path_harness(path)
+        if blocked:
+            return f"ERROR: refusing to read path {path!r}: {blocked}"
+        if _is_blocked_device(path):
+            return f"ERROR: refusing to read device path {path}"
+
+        # Handle bulk via glob or comma list (merged read_file)
+        # If path contains glob chars, expand — guard traversal in pattern
+        if any(c in path for c in ["*", "?", "[", "**"]):
+            # Block patterns that could escape workspace (e.g. ../../etc/passwd)
+            if ".." in path.replace("\\", "/").split("/") or path.startswith("/") or ":\\" in path:
+                return f"ERROR: refusing to read pattern {path!r}: traversal blocked"
+            if _is_blocked_path_harness(path) or _is_blocked_device(path):
+                return f"ERROR: refusing to read pattern {path!r}: blocked"
+            return self._execute_bulk(sandbox, path, offset, limit)
+        # Comma-separated list heuristic — handle both / and \ separators
+        if "," in path and "/" not in path.split(",")[0] and "\\" not in path.split(",")[0]:
+            # Heuristic: comma-separated list of files
+            parts = [p.strip() for p in path.split(",") if p.strip()]
+            if len(parts) > 1:
+                # Validate each part before bulk
+                for p in parts:
+                    if _is_blocked_path_harness(p) or _is_blocked_device(p):
+                        return f"ERROR: refusing to read path {p!r}: blocked"
+                    if ".." in p.replace("\\", "/").split("/"):
+                        return f"ERROR: refusing to read path {p!r}: traversal blocked"
+                return self._execute_bulk_list(sandbox, parts, limit)
+
+        return self._execute_single(sandbox, path, offset, limit)
+
+    def _execute_bulk(self, sandbox: Sandbox, pattern: str, offset: int, limit: int) -> str:
+        root = getattr(sandbox, "root", None)
+        if root is None:
+            return "ERROR: bulk read not supported in this sandbox"
         try:
-            content = sandbox.read_file(path)
-        except Exception as exc:  # noqa: BLE001
-            return f"ERROR: cannot read {path}: {exc}"
+            import pathlib
+            pat = pattern.replace("\\", "/").lstrip("/")
+            # Ensure root is str for glob, handle Windows
+            root_str = str(pathlib.Path(root))
+            matches = glob.glob(pat, root_dir=root_str, recursive=True)
+            files = []
+            for m in matches:
+                # m is POSIX relative, convert to OS path for isfile check
+                full = os.path.join(root_str, m.replace("/", os.sep))
+                if os.path.isfile(full):
+                    files.append(m)
+            total_matched = len(files)
+            truncated_match_note = ""
+            if total_matched > 20:
+                truncated_match_note = f" (showing first 20 of {total_matched} matched, rest omitted by per-call ceiling)"
+                files = files[:20]
+            if not files:
+                return f"Note: no files matched pattern {pattern!r}"
+            # Aggregate with cap ~100KB across files
+            out_parts: list[str] = []
+            total = 0
+            skipped = 0
+            for rel in sorted(files)[:20]:
+                res = self._execute_single(sandbox, rel, 0, 400)  # per-file window
+                # Strip notes for bulk, keep content
+                if res.startswith("ERROR") or res.startswith("Note:"):
+                    continue
+                chunk = f"--- {rel} ---\n{res}\n"
+                if total + len(chunk) > 100_000:
+                    skipped = len(files) - len(out_parts)
+                    break
+                out_parts.append(chunk)
+                total += len(chunk)
+            header = f"READ {len(out_parts)}/{total_matched} files matched {pattern!r}{truncated_match_note}"
+            if skipped:
+                header += f" (+{skipped} more, aggregate cap 100KB)"
+            return header + "\n" + "\n".join(out_parts)
+        except Exception as exc:
+            return f"ERROR: glob failed for {pattern!r}: {exc}"
+
+    def _execute_bulk_list(self, sandbox: Sandbox, paths: list[str], limit: int) -> str:
+        out_parts: list[str] = []
+        total = 0
+        for rel in paths[:20]:
+            res = self._execute_single(sandbox, rel.strip(), 0, 400)
+            if res.startswith("ERROR"):
+                out_parts.append(f"--- {rel} ---\n{res}\n")
+                continue
+            chunk = f"--- {rel} ---\n{res}\n"
+            if total + len(chunk) > 100_000:
+                out_parts.append(f"... aggregate cap 100KB, {len(paths)-len(out_parts)} more skipped")
+                break
+            out_parts.append(chunk)
+            total += len(chunk)
+        return f"READ {len(out_parts)}/{len(paths)} files\n" + "\n".join(out_parts)
+
+    def _execute_single(self, sandbox: Sandbox, path: str, offset: int, limit: int) -> str:
+        # Dedup check: same window of unchanged file (in-memory + file ledger)
+        root = getattr(sandbox, "root", None)
+        dedup_key = (path, offset, limit)
+        try:
+            if root is not None:
+                full_check = os.path.join(root, path)
+                st = os.stat(full_check)
+                mtime, size = st.st_mtime, st.st_size
+                # File ledger check (persistent) — use case-sensitive key on
+                # POSIX and case-insensitive only on Windows.
+                try:
+                    ledger = _load_ledger()
+                    real = os.path.realpath(full_check)
+                    key = real.lower() if os.name == "nt" else real
+                    entry = ledger.get(key)
+                    if entry and entry.get("sha256") == _get_file_sha256(full_check) and entry.get("fullView"):
+                        # Only dedup if current request is also for full view
+                        prev_limit = entry.get("limit", _LINE_WINDOW)
+                        if offset == 0 and limit >= _LINE_WINDOW and limit >= prev_limit:
+                            _save_ledger({k: v for k, v in ledger.items() if k != key})
+                            return f'Note: unchanged read for {path!r} offset={offset} limit={limit} — already in history (file ledger), reuse previous result.'
+                except Exception:
+                    pass
+                cached = self._dedup.get(dedup_key)
+                if cached and cached[0] == mtime and cached[1] == size:
+                    # Self-expiring: consume record
+                    del self._dedup[dedup_key]
+                    return f'Note: unchanged read for {path!r} offset={offset} limit={limit} — already in history, reuse previous result.'
+        except Exception:
+            pass
+
+        # Try reading; on failure try candidate spellings
+        content: str | None = None
+        last_exc: Exception | None = None
+        candidates = [path] + _candidate_spellings(path)[1:]
+        for cand in candidates:
+            try:
+                # Check sandbox confinement via sandbox.read_file
+                # For local sandbox we can also check device block already done
+                content = sandbox.read_file(cand)
+                if cand != path:
+                    path = cand  # use successful spelling
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if content is None:
+            # Not found — did-you-mean
+            if root is not None:
+                try:
+                    # substring match + levenshtein 2
+                    base = os.path.basename(path)
+                    candidates = []
+                    for dirpath, _, filenames in os.walk(root):
+                        for fn in filenames:
+                            if base.lower() in fn.lower():
+                                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                                candidates.append(rel)
+                            elif _levenshtein(base.lower(), fn.lower(), 2) <= 2:
+                                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                                candidates.append(rel)
+                            if len(candidates) >= 5:
+                                break
+                        if len(candidates) >= 5:
+                            break
+                    if candidates:
+                        return f"ERROR: file not found {path!r} — did you mean: {', '.join(candidates[:3])}?"
+                except Exception:
+                    pass
+            return f"ERROR: cannot read {path!r}: {last_exc}"
+
+        # Handle binary / mime — sample multiple windows, not just first 4k
+        # Check first 8k, middle, and last 4k for null bytes
+        _sample = content[:8192]
+        if len(content) > 16384:
+            mid = len(content)//2
+            _sample += content[mid:mid+4096]
+            _sample += content[-4096:]
+        elif len(content) > 8192:
+            _sample += content[-4096:]
+        if "\x00" in _sample:
+            # Try mime
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".svg":
+                pass  # svg is xml, allow
+            elif ext in (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".tar", ".gz"):
+                mime = ext.lstrip(".")
+                if ext == ".pdf":
+                    return f"Note: {path!r} is a PDF ({len(content)} bytes). Use pdftotext or read specific pages."
+                return f"Note: {path!r} is binary ({mime}, {len(content)} bytes) — not displayed."
+
+        # Empty file
+        if not content:
+            # Remember empty for ledger
+            if self.ledger is not None:
+                self.ledger.remember(path, content)
+            return f"Note: {path!r} is empty (0 lines)."
+
+        lines = content.splitlines()
+        total_lines = len(lines)
+
+        # Past EOF
+        if offset >= total_lines:
+            return f"Note: offset {offset} is beyond end of {path!r} ({total_lines} lines). Retry with smaller offset (e.g. offset=0, limit=2000)."
+
+        # Window
+        window = lines[offset : offset + limit]
+        # Per-line clamp — avoid splitting surrogate pair
+        clamped = False
+        for i, line in enumerate(window):
+            if len(line) > _PER_LINE_CLAMP:
+                cut = _PER_LINE_CLAMP
+                # Avoid splitting high surrogate
+                if 0xD800 <= ord(line[cut-1]) <= 0xDBFF and cut < len(line) and 0xDC00 <= ord(line[cut]) <= 0xDFFF:
+                    cut -= 1
+                window[i] = line[:cut] + f" ... [line {offset+i+1} truncated at {_PER_LINE_CLAMP} chars]"
+                clamped = True
+
+        # Byte budget
+        text = "\n".join(window)
+        truncated_by_bytes = False
+        if len(text.encode("utf-8", errors="replace")) > _BYTE_BUDGET:
+            raw = "\n".join(window).encode("utf-8", errors="replace")
+            cut = min(_BYTE_BUDGET, len(raw) - 1)
+            while cut > 0 and cut < len(raw) and (raw[cut] & 0xC0) == 0x80:
+                cut -= 1
+            text = raw[:cut].decode("utf-8", errors="replace")
+            # Ensure we cut at line boundary if possible
+            text = text.rsplit("\n", 1)[0]
+            truncated_by_bytes = True
+
+        # Build header with resume info
+        remaining = total_lines - (offset + len(window))
+        header = ""
+        if offset != 0 or limit != _LINE_WINDOW or truncated_by_bytes or clamped or len(window) < total_lines:
+            header = f"Note: {path!r} ({total_lines} lines, showing {len(window)} lines offset={offset} limit={limit}"
+            if truncated_by_bytes:
+                header += f", byte cap {_BYTE_BUDGET//1024}KB hit"
+            if clamped:
+                header += f", {sum(1 for l in window if 'truncated' in l)} lines clamped at {_PER_LINE_CLAMP}ch"
+            if remaining > 0:
+                header += f", {remaining} more lines remain — retry with offset={offset+len(window)}"
+            header += ").\n"
+
+        result = header + text
+        # Remember for ledger — track whether view was partial
         if self.ledger is not None:
+            # Store full content hash regardless, but remember partial flag
             self.ledger.remember(path, content)
-        if len(content) > _MAX_READ_CHARS:
-            content = content[:_MAX_READ_CHARS] + "\n... [truncated]"
-        return content
+            # Also store ledger partial state via attribute if available
+            try:
+                if hasattr(self.ledger, "remember_partial"):
+                    self.ledger.remember_partial(path, is_partial=(len(window) < total_lines or truncated_by_bytes))
+            except Exception:
+                pass
+
+        # Dedup: store for future unchanged check (in-memory + file ledger)
+        try:
+            if root is not None:
+                full = os.path.join(root, path)
+                st = os.stat(full)
+                self._dedup[dedup_key] = (st.st_mtime, st.st_size, content[:1000])
+                # File ledger persistence
+                try:
+                    ledger = _load_ledger()
+                    real_full = os.path.realpath(full)
+                    key = real_full.lower() if os.name == "nt" else real_full
+                    ledger[key] = {
+                        "path": full,
+                        "sha256": _get_file_sha256(full),
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                        "fullView": not (len(window) < total_lines or truncated_by_bytes),
+                        "offset": offset,
+                        "limit": limit,
+                    }
+                    # Prune file ledger to 200 entries
+                    if len(ledger) > 200:
+                        # Remove oldest by mtime
+                        oldest = min(ledger.items(), key=lambda x: x[1].get("mtime", 0))[0]
+                        ledger.pop(oldest, None)
+                    _save_ledger(ledger)
+                except Exception:
+                    pass
+                # Prune cache
+                if len(self._dedup) > 100:
+                    # remove oldest
+                    self._dedup.pop(next(iter(self._dedup)))
+        except Exception:
+            pass
+
+        # Legacy truncation note for old callers expecting _MAX_READ_CHARS
+        if len(result) > _MAX_READ_CHARS and not header:
+            result = result[:_MAX_READ_CHARS] + "\n... [truncated]"
+
+        return result
 
 
 class WriteFileTool(Tool):
@@ -60,6 +537,11 @@ class WriteFileTool(Tool):
     def execute(self, sandbox: Sandbox, content: str, path: str) -> str:
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
+        blocked = _is_blocked_path_harness(path)
+        if blocked:
+            return f"ERROR: refusing to write path {path!r}: {blocked}"
+        if _is_blocked_device(path):
+            return f"ERROR: refusing to write device path {path}"
         if not isinstance(content, str):
             content = str(content)
         if len(content) > _MAX_WRITE_CHARS:
@@ -104,8 +586,9 @@ class EditFileTool(Tool):
             content = sandbox.read_file(path)
         except Exception as exc:  # noqa: BLE001
             return f"ERROR: cannot read {path}: {exc}"
-        if "[truncated]" in content:
-            return f"ERROR: {path} is too large to edit with edit_file (content truncated); use write_file with complete content"
+        if len(content) > _BYTE_BUDGET:
+            # For large files, require write_file with complete content
+            return f"ERROR: {path} is too large to edit with edit_file ({len(content)} bytes > {_BYTE_BUDGET}); use write_file with complete content"
         if self.ledger is not None:
             if not self.ledger.has_seen(path):
                 return (
@@ -117,6 +600,12 @@ class EditFileTool(Tool):
                     f"ERROR: {path} changed on disk since your last read - "
                     "read it again, then retry the edit"
                 )
+            # Check partial view
+            try:
+                if hasattr(self.ledger, "is_partial") and self.ledger.is_partial(path):
+                    return f"ERROR: Only part of {path!r} has been read (windowed view). Read with larger limit or use write_file."
+            except Exception:
+                pass
         else:
             # No ledger is wiring bug; fail closed.
             return "ERROR: edit ledger not configured"
@@ -183,3 +672,4 @@ class ListDirTool(Tool):
             marker = "/" if os.path.isdir(full) else ""
             lines.append(entry + marker)
         return "\n".join(lines) or "(empty directory)"
+

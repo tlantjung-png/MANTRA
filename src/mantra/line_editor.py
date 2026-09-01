@@ -29,6 +29,9 @@ KEY_END = "key:end"
 KEY_PAGE_UP = "key:page-up"
 KEY_PAGE_DOWN = "key:page-down"
 KEY_RESIZE = "key:resize"
+KEY_CTRL_LEFT = "key:ctrl-left"
+KEY_CTRL_RIGHT = "key:ctrl-right"
+KEY_SHIFT_ENTER = "key:shift-enter"
 
 _WINDOWS_SPECIALS: dict[str, str] = {
     "H": KEY_UP,
@@ -59,6 +62,123 @@ _POSIX_SPECIALS: dict[str, str] = {
     "2~": KEY_DELETE,
     "3~": KEY_DELETE,
 }
+
+def _prev_word_pos(text: str, pos: int) -> int:
+    if pos <= 0:
+        return 0
+    i = pos
+    while i > 0 and text[i-1].isspace():
+        i -= 1
+    while i > 0 and not text[i-1].isspace():
+        i -= 1
+    return i
+
+def _next_word_pos(text: str, pos: int) -> int:
+    n = len(text)
+    if pos >= n:
+        return n
+    i = pos
+    while i < n and not text[i].isspace():
+        i += 1
+    while i < n and text[i].isspace():
+        i += 1
+    return i
+
+def _is_shift_pressed() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetKeyState(0x10) & 0x8000)
+    except Exception:
+        return False
+
+def _get_clipboard_text() -> str:
+    try:
+        if os.name == "nt":
+            import subprocess
+            try:
+                out = subprocess.run(["powershell", "-command", "Get-Clipboard"], capture_output=True, text=True, timeout=2)
+                if out.returncode == 0 and out.stdout is not None:
+                    txt = out.stdout
+                    if txt.endswith("\r\n"):
+                        txt = txt[:-2]
+                    elif txt.endswith("\n"):
+                        txt = txt[:-1]
+                    if txt:
+                        return txt
+            except Exception:
+                pass
+            try:
+                import ctypes
+                ctypes.windll.user32.OpenClipboard(0)
+                try:
+                    h = ctypes.windll.user32.GetClipboardData(13)
+                    if not h:
+                        return ""
+                    ctypes.windll.kernel32.GlobalLock.restype = ctypes.c_void_p
+                    ptr = ctypes.windll.kernel32.GlobalLock(h)
+                    if not ptr:
+                        return ""
+                    try:
+                        text = ctypes.wstring_at(ptr)
+                        return text or ""
+                    finally:
+                        ctypes.windll.kernel32.GlobalUnlock(h)
+                finally:
+                    ctypes.windll.user32.CloseClipboard()
+            except Exception:
+                pass
+        else:
+            import subprocess
+            for cmd in (["pbpaste"], ["xclip", "-o", "-selection", "clipboard"], ["xsel", "-b", "-o"]):
+                try:
+                    out = subprocess.run(cmd, capture_output=True, text=True, timeout=1)
+                    if out.returncode == 0 and out.stdout:
+                        return out.stdout
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return ""
+
+def _set_clipboard_text(text: str) -> None:
+    try:
+        if os.name == "nt":
+            import subprocess
+            try:
+                p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, text=True)
+                p.communicate(text, timeout=2)
+                if p.returncode == 0:
+                    return
+            except Exception:
+                pass
+            try:
+                import ctypes
+                ctypes.windll.user32.OpenClipboard(0)
+                try:
+                    ctypes.windll.user32.EmptyClipboard()
+                    data = text.encode("utf-16-le") + b"\x00\x00"
+                    h = ctypes.windll.kernel32.GlobalAlloc(0x0002, len(data))
+                    if h:
+                        ptr = ctypes.windll.kernel32.GlobalLock(h)
+                        ctypes.memmove(ptr, data, len(data))
+                        ctypes.windll.kernel32.GlobalUnlock(h)
+                        ctypes.windll.user32.SetClipboardData(13, h)
+                finally:
+                    ctypes.windll.user32.CloseClipboard()
+            except Exception:
+                pass
+        else:
+            import subprocess
+            for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"], ["xsel", "-b", "-i"]):
+                try:
+                    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                    p.communicate(text.encode("utf-8"), timeout=1)
+                    if p.returncode == 0:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
 HINT = ""
 
@@ -124,6 +244,11 @@ class LineEditor:
         self._term_cols: int | None = None
         self._term_rows: int | None = None
 
+        # Selection auto-copy
+        self._sel_anchor: int | None = None
+        self._sel_end: int | None = None
+        self._sel_active = False
+
     # ── public API ────────────────────────────────────────────
 
     def read(self, prompt: str = "", skip_newline: bool = False) -> str:
@@ -145,6 +270,12 @@ class LineEditor:
         drawn = 0
         self._dismissed = False
         self._last_token = None
+        # Enable bracketed paste
+        try:
+            sys.stdout.write("\033[?2004h")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
         try:
             with self._raw_mode():
@@ -226,6 +357,124 @@ class LineEditor:
                     elif key == KEY_DELETE:
                         buffer = buffer[:cursor] + buffer[cursor + 1 :]
                         popup, selected = self._recompute(buffer, cursor, selected)
+                    elif key == KEY_CTRL_LEFT:
+                        cursor = _prev_word_pos(buffer, cursor)
+                        popup, selected = self._recompute(buffer, cursor, selected)
+                    elif key == KEY_CTRL_RIGHT:
+                        cursor = _next_word_pos(buffer, cursor)
+                        popup, selected = self._recompute(buffer, cursor, selected)
+                    elif key == KEY_SHIFT_ENTER:
+                        buffer = buffer[:cursor] + "\n" + buffer[cursor:]
+                        cursor += 1
+                        self._last_token = None
+                        popup, selected = self._recompute(buffer, cursor, selected)
+                    elif isinstance(key, str) and key.startswith("\x1b[200~"):
+                        pasted = key[len("\x1b[200~"):]
+                        if pasted.endswith("\x1b[201~"):
+                            pasted = pasted[:-len("\x1b[201~")]
+                        pasted = pasted.replace("\r\n", "\n").replace("\r", "\n")
+                        buffer = buffer[:cursor] + pasted + buffer[cursor:]
+                        cursor += len(pasted)
+                        popup, selected = self._recompute(buffer, cursor, selected)
+                    elif hasattr(key, "button") and hasattr(key, "row"):
+                        # Mouse selection — auto copy
+                        is_prompt = self.fixed_row is not None and key.row == self.fixed_row
+                        if key.pressed and key.button == 0:
+                            if self._sel_anchor is None:
+                                if is_prompt:
+                                    pvis = visible_len(prompt)
+                                    col = max(0, key.column - pvis - 1)
+                                    self._sel_anchor = max(0, min(len(buffer), col))
+                                    self._sel_end = self._sel_anchor
+                                    self._sel_active = True
+                                else:
+                                    self._sel_anchor = 0
+                                    self._sel_end = 0
+                                    self._sel_active = True
+                            else:
+                                if is_prompt:
+                                    pvis = visible_len(prompt)
+                                    col = max(0, key.column - pvis - 1)
+                                    cur = max(0, min(len(buffer), col))
+                                    self._sel_end = cur
+                            drawn = self._draw(prompt, buffer, cursor, popup, selected, drawn)
+                            continue
+                        else:
+                            if self._sel_anchor is not None and self._sel_active:
+                                try:
+                                    if is_prompt and self._sel_end is not None:
+                                        start = min(self._sel_anchor, self._sel_end)
+                                        finish = max(self._sel_anchor, self._sel_end)
+                                        if start == finish:
+                                            pvis = visible_len(prompt)
+                                            col = max(0, key.column - pvis - 1)
+                                            end = max(0, min(len(buffer), col))
+                                            start = min(self._sel_anchor, end)
+                                            finish = max(self._sel_anchor, end)
+                                        if start != finish:
+                                            sel_text = buffer[start:finish]
+                                            _set_clipboard_text(sel_text)
+                                            try:
+                                                layout = getattr(self, "layout_ref", None)
+                                                msg = self.style.dim("copied")
+                                                if layout is not None and getattr(layout, "active", False):
+                                                    layout.draw_border_status(msg)
+                                                    import time as _t
+                                                    _t.sleep(0.7)
+                                                    layout.draw_border_status("")
+                                                else:
+                                                    sys.stdout.write("\r\033[K" + msg + "\n")
+                                                    sys.stdout.flush()
+                                                    import time as _t
+                                                    _t.sleep(0.35)
+                                                    sys.stdout.write("\033[1A\r\033[K")
+                                                    sys.stdout.flush()
+                                            except Exception:
+                                                pass
+                                    else:
+                                        try:
+                                            layout = getattr(self, "layout_ref", None)
+                                            raw = None
+                                            if layout is not None and hasattr(layout, "get_line_at_row"):
+                                                raw = layout.get_line_at_row(key.row)
+                                            if raw is None:
+                                                getter = getattr(self, "viewport_getter", None)
+                                                if callable(getter):
+                                                    lines = getter()
+                                                    if lines and key.row:
+                                                        idx = max(0, min(len(lines)-1, key.row - 3))
+                                                        raw = lines[idx] if 0 <= idx < len(lines) else ""
+                                            if raw:
+                                                import re as _re2
+                                                clean = _re2.sub(r"\x1b\[[0-9;]*m", "", raw).strip()
+                                                if clean:
+                                                    _set_clipboard_text(clean)
+                                                    try:
+                                                        layout = getattr(self, "layout_ref", None)
+                                                        msg = self.style.dim("copied")
+                                                        if layout is not None and getattr(layout, "active", False):
+                                                            layout.draw_border_status(msg)
+                                                            import time as _t
+                                                            _t.sleep(0.7)
+                                                            layout.draw_border_status("")
+                                                        else:
+                                                            sys.stdout.write("\r\033[K" + msg + "\n")
+                                                            sys.stdout.flush()
+                                                            import time as _t
+                                                            _t.sleep(0.35)
+                                                            sys.stdout.write("\033[1A\r\033[K")
+                                                            sys.stdout.flush()
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                            self._sel_anchor = None
+                            self._sel_end = None
+                            self._sel_active = False
+                            drawn = self._draw(prompt, buffer, cursor, popup, selected, drawn)
+                            continue
                     elif key == KEY_UP:
                         if popup and popup.items:
                             selected = max(0, selected - 1)
@@ -254,10 +503,22 @@ class LineEditor:
                         cursor += 1
                         self._last_token = None
                         popup, selected = self._recompute(buffer, cursor, selected)
+                    elif key == "\x16":  # Ctrl+V paste
+                        clip = _get_clipboard_text()
+                        if clip:
+                            clip = clip.replace("\r\n", "\n").replace("\r", "\n")
+                            buffer = buffer[:cursor] + clip + buffer[cursor:]
+                            cursor += len(clip)
+                            popup, selected = self._recompute(buffer, cursor, selected)
                     else:
                         continue
                     drawn = self._draw(prompt, buffer, cursor, popup, selected, drawn)
         finally:
+            try:
+                sys.stdout.write("\033[?2004l")
+                sys.stdout.flush()
+            except Exception:
+                pass
             self._finish(drawn, skip_newline=skip_newline)
 
         return buffer
@@ -347,19 +608,38 @@ class LineEditor:
             except Exception:
                 cols = 80
 
+            # For display, render Shift+Enter newline as ↵ so prompt stays single row
+            display_buffer = buffer.replace("\n", " ↵ ")
+            display_cursor = cursor + buffer[:cursor].count("\n") * 2
             pvis = visible_len(prompt)
             space = max(0, cols - pvis)
 
             if space <= 0:
                 shown = ""
                 cpos = 0
-            elif len(buffer) <= space:
-                shown = buffer
-                cpos = cursor
+            elif len(display_buffer) <= space:
+                shown = display_buffer
+                cpos = display_cursor
             else:
-                start = max(0, cursor - space + 1)
-                shown = buffer[start : start + space]
-                cpos = cursor - start
+                start = max(0, display_cursor - space + 1)
+                shown = display_buffer[start : start + space]
+                cpos = display_cursor - start
+
+            # Highlight selection while dragging
+            if self._sel_active and self._sel_anchor is not None and self._sel_end is not None:
+                s_disp = min(self._sel_anchor, self._sel_end) + buffer[:min(self._sel_anchor, self._sel_end)].count("\n") * 2
+                e_disp = max(self._sel_anchor, self._sel_end) + buffer[:max(self._sel_anchor, self._sel_end)].count("\n") * 2
+                s = s_disp
+                e = e_disp
+                if s != e:
+                    if len(display_buffer) > space:
+                        start = max(0, display_cursor - space + 1)
+                        sel_s = max(0, s - start)
+                        sel_e = max(0, min(len(shown), e - start))
+                        if sel_s < sel_e:
+                            shown = shown[:sel_s] + "\033[7m" + shown[sel_s:sel_e] + "\033[0m" + shown[sel_e:]
+                    else:
+                        shown = shown[:s] + "\033[7m" + shown[s:e] + "\033[0m" + shown[e:]
 
             out.write(shown)
 
@@ -501,7 +781,14 @@ class LineEditor:
 
             char = msvcrt.getwch()
             if char in ("\x00", "\xe0"):
-                return _WINDOWS_SPECIALS.get(msvcrt.getwch(), char)
+                second = msvcrt.getwch()
+                if second == "s":
+                    return KEY_CTRL_LEFT
+                if second == "t":
+                    return KEY_CTRL_RIGHT
+                return _WINDOWS_SPECIALS.get(second, char)
+            if char == "\r" and _is_shift_pressed():
+                return KEY_SHIFT_ENTER
             if char == "\x1b":
                 if self._input_pending():
                     seq = sys.stdin.read(1)
@@ -538,14 +825,62 @@ class LineEditor:
 
         char = sys.stdin.read(1)
         if char != "\x1b":
+            if char in ("\r", "\n") and _is_shift_pressed():
+                return KEY_SHIFT_ENTER
             return char
         if not self._input_pending():
             return char
         seq = sys.stdin.read(1)
         if seq == "[":
+            # Check for bracketed paste start 200~
+            # Peek ahead
+            if self._input_pending():
+                # Try to read rest of CSI
+                buf = ""
+                # Read up to 6 chars or until alpha/~
+                while True:
+                    if not self._input_pending():
+                        break
+                    ch = sys.stdin.read(1)
+                    buf += ch
+                    if ch.isalpha() or ch == "~":
+                        break
+                    if len(buf) > 6:
+                        break
+                full = seq + buf
+                if full == "[200~":
+                    # Bracketed paste start — read until 201~
+                    pasted = ""
+                    while True:
+                        ch = sys.stdin.read(1)
+                        pasted += ch
+                        if pasted.endswith("\x1b[201~"):
+                            pasted = pasted[:-len("\x1b[201~")]
+                            break
+                        if len(pasted) > 10000:
+                            break
+                    return "\x1b[200~" + pasted + "\x1b[201~"
+                if full == "[1;5A":
+                    return KEY_UP
+                if full == "[1;5B":
+                    return KEY_DOWN
+                if full == "[1;5C":
+                    return KEY_CTRL_RIGHT
+                if full == "[1;5D":
+                    return KEY_CTRL_LEFT
+                if full in ("[13;2u", "[13u"):
+                    return KEY_SHIFT_ENTER
+                if buf == "<":
+                    return "\x1b"
+                # Fallback to table
+                if buf in _POSIX_SPECIALS:
+                    return _POSIX_SPECIALS[buf]
+                if buf and buf[0] in _POSIX_SPECIALS:
+                    return _POSIX_SPECIALS[buf[0]]
+                return char
             buf = sys.stdin.read(1)
             if buf == "<":
-                return "\x1b"  # mouse event ignored
+                return "\x1b"
             rest = buf + (sys.stdin.read(1) if buf in "356" else "")
             return _POSIX_SPECIALS.get(rest, char)
         return char

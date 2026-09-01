@@ -13,37 +13,81 @@ from mantra.core.exceptions import AbortError, SandboxError
 from mantra.interfaces.sandbox import ExecResult, Sandbox
 
 # Heuristic patterns for shell traversal; best effort, not a boundary.
+# The host sandbox executes with shell=True so containment cannot be
+# guaranteed; this check is defence-in-depth only. Use the container
+# sandbox when strong isolation is required.
 _TRAVERSAL_RE = re.compile(r"(\.\.[\\/]|[\\/]\.\.)")
 _ABSOLUTE_WIN_RE = re.compile(r"[a-zA-Z]:[\\/]")
+# Additional shell-meta patterns that can hide traversal inside
+# expansions such as $(...), `...`, ${...}, %VAR%, or encoded forms.
+_SHELL_EXPANSION_RE = re.compile(r"(\$\(|\$\{|`.*`|\${|%[A-Za-z_]+%)")
+_ENCODED_TRAVERSAL_RE = re.compile(r"(%2e%2e|%252e|\\u002e|\\x2e)", re.IGNORECASE)
 
 _MAX_READ_BYTES = 500_000
 _MAX_EXEC_BYTES = 1_000_000
 
 
+def _strip_quoted(s: str) -> str:
+    """Remove content inside single/double quotes to avoid false positives."""
+    # Replace quoted segments with spaces so positions preserved
+    def _repl(m: re.Match[str]) -> str:
+        return " " * len(m.group(0))
+    # \" or \' handling is imperfect but sufficient for heuristic
+    s = re.sub(r'"[^"]*"', _repl, s)
+    s = re.sub(r"'[^']*'", _repl, s)
+    return s
+
 def _contains_traversal(command: str) -> bool:
-    """Heuristic: does command likely escape workspace?"""
+    """Heuristic: does command likely escape workspace?
+
+    This is defence-in-depth only. The host sandbox uses shell=True and
+    cannot guarantee containment; operators needing strong isolation must
+    use the container sandbox.
+    """
     if not command:
         return False
     # Skip checks for URL like strings inside the command to avoid
     # flagging https:// as an absolute path. Strip URL schemes before test.
     stripped = re.sub(r"https?://[^\s]+", "", command, flags=re.IGNORECASE)
     stripped = re.sub(r"file://[^\s]+", "", stripped, flags=re.IGNORECASE)
+    # Decode common URL-encoding that can hide ".." (e.g. %2e%2e, %252e).
+    try:
+        import urllib.parse as _up
+        # Two rounds of unquote to catch double-encoding.
+        decoded = _up.unquote(_up.unquote(stripped))
+    except Exception:
+        decoded = stripped
+    if _ENCODED_TRAVERSAL_RE.search(stripped) or _ENCODED_TRAVERSAL_RE.search(decoded):
+        return True
+    # Block shell expansions that can hide paths: $(...), `...`, ${...}, %VAR%
+    if _SHELL_EXPANSION_RE.search(stripped) or _SHELL_EXPANSION_RE.search(decoded):
+        # Conservative: any command that uses expansions to build paths is
+        # treated as needing container isolation; block in host sandbox.
+        if re.search(r"(\$\(|\$\{|`)", stripped):
+            return True
     # Block home-directory expansion which escapes the workspace via shell
-    if re.search(r"(?:^|[\s\"'`;|&])~", stripped):
+    # Avoid flagging quoted strings like echo "~" or echo "$HOME"
+    stripped_unquoted = _strip_quoted(stripped)
+    decoded_unquoted = _strip_quoted(decoded)
+    if re.search(r"(?:^|[\s;|&])~", stripped_unquoted):
         return True
-    if re.search(r"\$(?:HOME|USERPROFILE|HOMEPATH)", stripped, flags=re.IGNORECASE):
+    if re.search(r"\$(?:HOME|USERPROFILE|HOMEPATH|\{HOME|\{USERPROFILE)", stripped_unquoted, flags=re.IGNORECASE):
         return True
-    if re.search(r"%\s*USERPROFILE\s*%", stripped, flags=re.IGNORECASE):
+    if re.search(r"%\s*USERPROFILE\s*%", stripped_unquoted, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\$(?:HOME|USERPROFILE|HOMEPATH|\{HOME|\{USERPROFILE)", decoded_unquoted, flags=re.IGNORECASE):
+        return True
+    if re.search(r"%\s*USERPROFILE\s*%", decoded_unquoted, flags=re.IGNORECASE):
         return True
     # Block any parent directory reference, even without slash like `cd ..`
     # or `dir ..` which still escapes the workspace.
-    if ".." in stripped:
-        # Ensure it is a path component and not part of a larger token like ...
-        if re.search(r"(?:^|[\s\"'/\\:])\.\.(?:$|[\s\"'/\\])", stripped) or _TRAVERSAL_RE.search(stripped):
-            return True
-        # Also block the common traversal substring to be safe for `..\`
-        if _TRAVERSAL_RE.search(stripped):
-            return True
+    # Check both raw and decoded forms.
+    for target in (stripped, decoded):
+        if ".." in target:
+            if re.search(r"(?:^|[\s\"'/\\:])\.\.(?:$|[\s\"'/\\])", target) or _TRAVERSAL_RE.search(target):
+                return True
+            if _TRAVERSAL_RE.search(target):
+                return True
     # Check absolute paths in arguments only, not the executable name.
     # Split into tokens and check from the second token onwards.
     tokens = stripped.split()
@@ -55,6 +99,20 @@ def _contains_traversal(command: str) -> bool:
             token = token.strip()
             if len(token) > 1 and not token.startswith("//"):
                 return True
+        # Also check decoded args for obfuscated absolute paths (e.g. %20)
+        try:
+            decoded_args = _up.unquote(args_stripped)
+        except Exception:
+            decoded_args = args_stripped
+        if _ABSOLUTE_WIN_RE.search(decoded_args):
+            return True
+        # Also check for decoded absolute POSIX path that may have been hidden
+        if "/" in decoded_args and re.search(r"(?:^|\s)/[^\s]+", decoded_args):
+            # Verify decoded absolute path not just // (protocol relative)
+            for tok in re.findall(r"(?:^|\s)(/[^\s]+)", decoded_args):
+                tok = tok.strip()
+                if len(tok) > 1 and not tok.startswith("//"):
+                    return True
     return False
 
 

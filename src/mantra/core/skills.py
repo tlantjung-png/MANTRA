@@ -10,12 +10,8 @@ from typing import Any
 
 _OVERRIDE_ENV = "MANTRA_SKILLS"
 
-# Directories to check when no override is set. The HARNESSY project
-# lives outside this repo, which is the whole reason the search is
-# configurable rather than hardcoded to one path.
+# Directories to check when no override is set.
 _CANDIDATE_ROOTS = (
-    "HARNESSY/skills",
-    "HARNESSY-STUDIO/skills",
     ".mantra/skills",
 )
 
@@ -95,6 +91,9 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     ``key: value`` lines. A file with no frontmatter is all body, which
     is a valid skill.
     """
+    # Strip BOM if present (Windows files may start with \ufeff)
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
     if not text.startswith("---"):
         return {}, text
     lines = text.split("\n")
@@ -107,7 +106,11 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
                 key, _, value = line.partition(":")
                 key = key.strip().lower()
                 if key:
-                    meta[key] = value.strip().strip("\"'")
+                    # Only strip matching outer quotes
+                    v = value.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                        v = v[1:-1]
+                    meta[key] = v
             return meta, "\n".join(lines[index + 1 :])
     # An unterminated block is not frontmatter, it is a horizontal rule.
     return {}, text
@@ -162,7 +165,8 @@ def load_all() -> dict[str, Skill]:
         if not root.is_dir():
             continue
         try:
-            entries = sorted(entry for entry in root.iterdir() if entry.is_dir())
+            # Sort by name string to avoid pathlib _parts_normcase race on Windows 3.14
+            entries = sorted((e for e in root.iterdir() if e.is_dir()), key=lambda p: p.name.lower())
         except OSError:  # pragma: no cover - unreadable directory
             continue
         for entry in entries:
