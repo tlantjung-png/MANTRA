@@ -13,9 +13,69 @@ from typing import Any, Callable
 # Re-export shared primitives so every module agrees on width and size.
 # Previously this file counted wide chars (2 cols) while console/compact
 # counted 1, causing cursor drift for CJK paths. Centralised in term.py.
-from mantra.term import term_size, visible_len  # noqa: F401
+from mantra.term import safe_write, term_size, visible_len  # noqa: F401
 
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
+
+# SGR mouse report body: [ESC [] < button ; column ; row M|m — the "<"
+# is optional because some collection paths strip it before parsing.
+_SGR_MOUSE = re.compile(r"<?(\d+);(\d+);(\d+)([Mm])")
+
+
+class MouseEvent:
+    """A parsed SGR mouse report."""
+
+    __slots__ = ("button", "column", "row", "pressed")
+
+    def __init__(self, button: int, column: int, row: int, pressed: bool) -> None:
+        self.button = button
+        self.column = column
+        self.row = row
+        self.pressed = pressed
+
+
+def _parse_sgr_body(body: str):
+    """MouseEvent from the text after ``ESC [``, or ESC when malformed."""
+    m = _SGR_MOUSE.match(body)
+    if not m:
+        return "\x1b"
+    button, column, row, state = m.groups()
+    return MouseEvent(int(button), int(column), int(row), state == "M")
+
+
+# Bracketed-paste body is kept verbatim: a lost tail would re-read as
+# stray keys. Ends at ESC[201~, EOF, or an idle gap.
+_PASTE_IDLE = 0.75  # seconds without input -> treat the paste as finished
+
+
+def _assemble_bracketed_paste(read_char, ready, idle_grace: float = _PASTE_IDLE) -> str:
+    """Collect a bracketed-paste body after ESC[200~ has been consumed.
+
+    ``read_char`` yields the next character (blocking); ``ready()``
+    reports whether input is pending right now.
+    """
+    import time
+
+    parts: list[str] = []
+    tail = ""
+    last = time.monotonic()
+    marker = "\x1b[201~"
+    while True:
+        if not ready():
+            if time.monotonic() - last > idle_grace:
+                break
+            time.sleep(0.004)
+            continue
+        ch = read_char()
+        if not ch:
+            break
+        last = time.monotonic()
+        parts.append(ch)
+        tail = (tail + ch)[-len(marker):]
+        if tail == marker:
+            del parts[-len(marker):]
+            break
+    return "".join(parts)
 
 
 # Key constants for special keys that don't map to a single character.
@@ -43,7 +103,7 @@ _WINDOWS_SPECIALS: dict[str, str] = {
     "G": KEY_HOME,
     "O": KEY_END,
     "R": KEY_DELETE,
-    # VT sequences sent by some terminals for arrows/insert/delete.
+    # VT arrow codes, for terminals that report arrows this way on Windows.
     "A": KEY_UP,
     "B": KEY_DOWN,
     "C": KEY_RIGHT,
@@ -84,6 +144,56 @@ def _next_word_pos(text: str, pos: int) -> int:
         i += 1
     return i
 
+
+def _clip_vis(text: str, width: int) -> str:
+    """Truncate text so its visible width fits ``width`` columns."""
+    if width <= 0:
+        return ""
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        w = visible_len(ch)
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
+def _size_chip(buffer: str) -> str:
+    """Dim row marker: line and character counts of the prompt buffer.
+
+    ``· 3 lines · 421 chars`` - the explicit size readout for a paste,
+    so the operator always knows how much text entered the buffer.
+    """
+    lines = buffer.count("\n") + 1
+    plural = "s" if lines != 1 else ""
+    return f"· {lines} line{plural} · {len(buffer):,} chars"
+
+
+def _line_window(text: str, caret: int, width: int) -> tuple[int, int, str]:
+    """A horizontal window of ``text`` that keeps the caret visible.
+
+    Returns (char index where the window starts, visible offset of the
+    caret inside the returned string, shown text). Wide characters count
+    by visible column width, so the window is measured in columns, not
+    Python characters: a CJK char occupies two columns but one index.
+    """
+    if width <= 0:
+        return 0, 0, ""
+    n = len(text)
+    cum = [0] * (n + 1)
+    for i, ch in enumerate(text):
+        cum[i + 1] = cum[i] + visible_len(ch)
+    caret_vis = cum[min(caret, n)]
+    if cum[n] <= width:
+        return 0, caret_vis, text
+    start = 0
+    while start < caret and cum[start] < caret_vis - (width - 1):
+        start += 1
+    shown = _clip_vis(text[start:], width)
+    return start, caret_vis - cum[start], shown
+
 def _is_shift_pressed() -> bool:
     try:
         import ctypes
@@ -92,6 +202,8 @@ def _is_shift_pressed() -> bool:
         return False
 
 def _get_clipboard_text() -> str:
+    # Clipboard read: subprocess first, ctypes fallback on Windows;
+    # pbpaste/xclip/xsel chain on POSIX.
     try:
         if os.name == "nt":
             import subprocess
@@ -141,6 +253,8 @@ def _get_clipboard_text() -> str:
     return ""
 
 def _set_clipboard_text(text: str) -> None:
+    # Clipboard write: clip subprocess, then ctypes fallback on Windows;
+    # pbcopy/xclip/xsel chain on POSIX.
     try:
         if os.name == "nt":
             import subprocess
@@ -249,6 +363,17 @@ class LineEditor:
         self._sel_end: int | None = None
         self._sel_active = False
 
+        # Keys buffered elsewhere (e.g. by the turn-scoped scroll reader
+        # while a task streams) that the editor must deliver at its next
+        # read, before touching the terminal.
+        self.preload: list[str] = []
+
+        # Multi-line prompt ("paste box") state: absolute rows currently
+        # covered above the input row while the buffer spans several
+        # lines, so the next draw/cleanup knows exactly what to restore.
+        self._box_rows: list[int] = []
+        self._box_active = False
+
     # ── public API ────────────────────────────────────────────
 
     def read(self, prompt: str = "", skip_newline: bool = False) -> str:
@@ -260,7 +385,9 @@ class LineEditor:
 
         head, sep, prompt = prompt.rpartition("\n")
         if sep:
-            sys.stdout.write(head + sep)
+            # Multi-line prompt: write the head immediately; only the tail
+            # becomes the live editable line.
+            safe_write(head + sep)
             sys.stdout.flush()
 
         buffer = ""
@@ -270,7 +397,12 @@ class LineEditor:
         drawn = 0
         self._dismissed = False
         self._last_token = None
-        # Enable bracketed paste
+        # Enable bracketed paste only. Mouse reporting is deliberately NOT
+        # enabled here: with it on, every drag is handed to the app and the
+        # terminal's native selection over the conversation stops working,
+        # which is the one thing users reach for first. The SGR parsing
+        # below stays available for surfaces that do capture the mouse
+        # (e.g. the turn-scoped scroll reader while a task streams).
         try:
             sys.stdout.write("\033[?2004h")
             sys.stdout.flush()
@@ -288,7 +420,11 @@ class LineEditor:
                     if key == KEY_RESIZE:
                         # The host may have moved the fixed prompt to a new bottom row.
                         # A resize redraws the whole layout, so discard any popup-row
-                        # bookkeeping tied to the old geometry before repainting.
+                        # bookkeeping tied to the old geometry before repainting. A
+                        # multi-line box also forgets its old row numbers - the next
+                        # draw starts fresh with the new geometry.
+                        self._box_rows = []
+                        self._box_active = False
                         if self.on_resize is not None:
                             try:
                                 new_prompt = self.on_resize()
@@ -377,6 +513,16 @@ class LineEditor:
                         cursor += len(pasted)
                         popup, selected = self._recompute(buffer, cursor, selected)
                     elif hasattr(key, "button") and hasattr(key, "row"):
+                        # Wheel: SGR buttons 64 (up) and 65 (down). Scroll the
+                        # viewport exactly like the keyboard PageUp/PageDown
+                        # paths, so wheel and keys behave the same.
+                        if key.pressed and key.button in (64, 65):
+                            if key.button == 64 and self.on_page_up is not None:
+                                self.on_page_up()
+                            elif key.button == 65 and self.on_page_down is not None:
+                                self.on_page_down()
+                            self._region_cleared = True
+                            continue
                         # Mouse selection — auto copy
                         is_prompt = self.fixed_row is not None and key.row == self.fixed_row
                         if key.pressed and key.button == 0:
@@ -396,7 +542,9 @@ class LineEditor:
                                     pvis = visible_len(prompt)
                                     col = max(0, key.column - pvis - 1)
                                     cur = max(0, min(len(buffer), col))
-                                    self._sel_end = cur
+                                    # Inclusive of the release cell, so a
+                                    # drag ending on "o" copies "hello".
+                                    self._sel_end = min(len(buffer), cur + 1)
                             drawn = self._draw(prompt, buffer, cursor, popup, selected, drawn)
                             continue
                         else:
@@ -442,6 +590,8 @@ class LineEditor:
                                                 if callable(getter):
                                                     lines = getter()
                                                     if lines and key.row:
+                                                        # Rough offset: the getter's rows exclude
+                                                        # chrome, so back up three screen rows.
                                                         idx = max(0, min(len(lines)-1, key.row - 3))
                                                         raw = lines[idx] if 0 <= idx < len(lines) else ""
                                             if raw:
@@ -476,13 +626,22 @@ class LineEditor:
                             drawn = self._draw(prompt, buffer, cursor, popup, selected, drawn)
                             continue
                     elif key == KEY_UP:
-                        if popup and popup.items:
+                        if "\n" in buffer and self._box_active:
+                            # Multi-line prompt open: arrows edit the
+                            # pasted block instead of scrolling the
+                            # transcript. No completion popup in a box.
+                            cursor = self._vertical_caret(buffer, cursor, -1)
+                            popup = None
+                        elif popup and popup.items:
                             selected = max(0, selected - 1)
                         elif self.on_page_up is not None:
                             self.on_page_up()
                             self._region_cleared = True
                     elif key == KEY_DOWN:
-                        if popup and popup.items:
+                        if "\n" in buffer and self._box_active:
+                            cursor = self._vertical_caret(buffer, cursor, 1)
+                            popup = None
+                        elif popup and popup.items:
                             selected = min(len(popup.items) - 1, selected + 1)
                         elif self.on_page_down is not None:
                             self.on_page_down()
@@ -537,18 +696,238 @@ class LineEditor:
         self._last_token = token
         return completion, min(selected, len(completion.items) - 1)
 
+    # ── multi-line prompt (paste box) ────────────────────────
+
+    def _vertical_caret(self, buffer: str, cursor: int, delta: int) -> int:
+        """Move the caret one line up/down, keeping its column where possible.
+
+        Used by Up/Down while the multi-line prompt is open, so arrow
+        keys edit the pasted block instead of scrolling the transcript.
+        """
+        if not buffer:
+            return cursor
+        lines = buffer.split("\n")
+        starts = []
+        idx = 0
+        for line in lines:
+            starts.append(idx)
+            idx += len(line) + 1
+        # Caret line and column (the caret may sit on a newline boundary).
+        cl = min(len(lines) - 1, buffer[:cursor].count("\n"))
+        col = max(0, cursor - starts[cl])
+        col = min(col, len(lines[cl]))
+        target = cl + delta
+        if target < 0 or target >= len(lines):
+            return cursor
+        return starts[target] + min(col, len(lines[target]))
+
+    def _box_geometry(self):
+        """(layout, cols, content_top, fixed_row) when a multi-line box can
+        be drawn above the fixed bottom prompt, else None."""
+        if not self.popup_above or self.fixed_row is None:
+            return None
+        layout = getattr(self, "layout_ref", None)
+        if layout is None or not getattr(layout, "active", False):
+            return None
+        try:
+            cols = int(getattr(layout, "_cols", 0) or 0)
+            top = int(getattr(layout, "content_top", 0) or 0)
+        except Exception:
+            return None
+        if cols < 20 or top < 1 or self.fixed_row <= top:
+            return None
+        return layout, cols, top, self.fixed_row
+
+    def _leave_box(self, clear_prompt: bool) -> None:
+        """Undo a multi-line box: clear its rows and restore content/chrome."""
+        rows, self._box_rows = self._box_rows, []
+        self._box_active = False
+        layout = getattr(self, "layout_ref", None)
+        try:
+            for r in rows:
+                if r >= 1 and (self.fixed_row is None or r != self.fixed_row):
+                    safe_write(f"\033[{r};1H\033[2K")
+            if clear_prompt and self.fixed_row is not None:
+                safe_write(f"\033[{self.fixed_row};1H\033[2K")
+            if layout is not None and getattr(layout, "active", False) and hasattr(layout, "redraw_content_and_chrome"):
+                layout.redraw_content_and_chrome()
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _draw_box(self, prompt, buffer, cursor, drawn_prev: int) -> int:
+        """Render a multi-line buffer as a box that expands upward.
+
+        The caret line sits at the bottom prompt row, earlier lines get
+        rows above it, and the box's top border rises with the content,
+        tail-clipping with a count of hidden lines when it would exceed
+        the content area.
+        """
+        geo = self._box_geometry()
+        if geo is None:
+            return 0
+        layout, cols, top, fixed = geo
+        out = sys.stdout
+
+        # First box frame: a full repaint clears any rows the previous
+        # prompt left in the content area.
+        if not self._box_active:
+            try:
+                layout.redraw_content_and_chrome()
+            except Exception:
+                pass
+            self._box_rows = []
+        else:
+            old_rows = list(self._box_rows)
+            for r in old_rows:
+                if 1 <= r <= fixed:
+                    safe_write(f"\033[{r};1H\033[2K")
+
+        lines = buffer.split("\n")
+        total_lines = len(lines)
+        caret_line = min(total_lines - 1, buffer[:cursor].count("\n"))
+        # Column of the caret inside its line.
+        start = 0
+        for _ in range(caret_line):
+            start = buffer.index("\n", start) + 1
+        caret_col = cursor - start
+
+        # Prompt label = prompt text minus its absolute-positioning prefix.
+        label = prompt
+        head, sep, tail = label.rpartition("\n")
+        if sep:
+            label = tail
+        label = re.sub(r"^\033\[\d+(?:;\d+)?H\033\[2K", "", label)
+
+        # The box top border must stay at or below content_top: line rows
+        # may occupy at most fixed - top rows (the caret row included).
+        max_lines = max(1, fixed - top)
+        first = max(0, caret_line + 1 - max_lines)
+        vis_lines = lines[first : caret_line + 1]
+        k = len(vis_lines)  # visible lines, caret line last (bottom)
+        border_row = fixed - k  # top edge of the box rises with k
+
+        # Rows freed by a smaller box (e.g. a deleted newline) must go
+        # back to showing content, not stay blank. The box covers
+        # border_row..fixed; rows above the new border were covered
+        # before only if the box used to be taller.
+        old_rows = list(getattr(self, "_box_rows", []))
+        self._box_rows = []
+        if old_rows:
+            new_band = set(range(max(1, border_row), fixed + 1))
+            if not new_band.issuperset(old_rows):
+                try:
+                    layout.redraw_content_and_chrome()
+                except Exception:
+                    pass
+        self._box_active = True
+
+        wall = self._box_wall() or ""
+        label_vis = visible_len(label)
+        # The real layout's bone label already opens the box ("│ MANTRA >").
+        # Plain prompts (tests, read_choice) may not carry the wall, so
+        # close the left edge the same way to keep the box a single shape.
+        plain_label = re.sub(r"\033\[[0-9;]*m", "", label).strip()
+        if not plain_label.startswith("│") and wall:
+            label = wall + " " + label
+            label_vis = visible_len(label)
+
+        # Every line's text starts at the label's gutter column so the
+        # box reads as one aligned editor; upper rows blank the gutter.
+        gutter = max(1, label_vis)
+        avail = max(0, cols - gutter - 1)  # minus the right wall
+
+        # ── compose each row ────────────────────────────────────
+        rows_text: list[tuple[int, str]] = []  # (absolute row, text)
+        dim = getattr(self.style, "dim", None) or (lambda t: t)
+        chip = _size_chip(buffer)
+        if first > 0:
+            # Drop the chip's own leading "· " so the clip marker reads
+            # "… 9 more above · 30 lines · 421 chars" (one separator).
+            chip = f"… {first} more above · " + chip.removeprefix("· ")
+        edge = layout.box_edge_row(dim(chip)) if hasattr(layout, "box_edge_row") else dim(chip)
+        rows_text.append((border_row, edge))
+
+        # Upper rows reuse the label's gutter width as a blank prefix.
+        if wall:
+            blank_prefix = wall + " " + " " * max(0, label_vis - 2)
+        else:
+            blank_prefix = " " * label_vis
+
+        for i, text in enumerate(vis_lines):
+            if i == k - 1:
+                # Caret line: label + text windowed around the caret.
+                _, caret_disp, shown = _line_window(text, caret_col, avail)
+                pad = max(0, avail - visible_len(shown))
+                rows_text.append((fixed, label + shown + " " * pad + wall))
+            else:
+                shown = _clip_vis(text, avail)
+                pad = max(0, avail - visible_len(shown))
+                rows_text.append((border_row + 1 + i, blank_prefix + shown + " " * pad + wall))
+
+        # ── write ───────────────────────────────────────────────
+        for row_abs, text in rows_text:
+            if 1 <= row_abs <= fixed:
+                safe_write(f"\033[{row_abs};1H\033[2K{text}")
+        self._box_rows = [r for r, _ in rows_text if 1 <= r <= fixed]
+
+        # Cursor at the caret column on the prompt row.
+        col = max(1, label_vis + caret_disp + 1)
+        safe_write(f"\033[{fixed};{col}H")
+        out.flush()
+        return 0
+
     # ── rendering ─────────────────────────────────────────────
+
+    def _box_wall(self) -> str | None:
+        """Styled right wall when this editor owns the layout's boxed prompt row.
+
+        The editor repaints the prompt row on every keystroke, so it must
+        reserve the last column and re-emit the wall after the input text.
+        """
+        if not self.popup_above or self.fixed_row is None:
+            return None
+        layout = getattr(self, "layout_ref", None)
+        if layout is None or not getattr(layout, "active", False):
+            return None
+        try:
+            if int(getattr(layout, "prompt_row", 0) or 0) != self.fixed_row:
+                return None
+            glyph = layout.wall_glyph()
+        except Exception:
+            return None
+        return glyph if glyph else None
 
     def _draw(self, prompt, buffer, cursor, popup, selected, drawn) -> int:
         out = sys.stdout
 
-        # Auto-compute fixed_row if not set externally.
-        if self.popup_above and self.fixed_row is None:
+        # The active compact layout is the single source of truth for
+        # geometry: its prompt_row always wins over any cached or
+        # term_size-derived value, so a resize repaint can never race a
+        # stale editor position. The term_size fallback remains for
+        # standalone editors that have no layout attached.
+        layout = getattr(self, "layout_ref", None)
+        if layout is not None and getattr(layout, "active", False):
+            try:
+                self.fixed_row = int(
+                    getattr(layout, "prompt_row", 0) or self.fixed_row or 0
+                )
+            except Exception:
+                pass
+        elif self.popup_above and self.fixed_row is None:
             try:
                 _, rows = term_size()
                 self.fixed_row = rows
             except Exception:
                 pass
+
+        # A multi-line buffer on the fixed bottom prompt renders as a
+        # real box that expands upward (a paste box) instead of
+        # collapsing every newline to a ↵ marker on a single row.
+        if self._box_geometry() is not None and "\n" in buffer:
+            return self._draw_box(prompt, buffer, cursor, drawn)
+        if self._box_active:
+            self._leave_box(clear_prompt=False)
 
         # If fixed_row moved (resize), clear old prompt row that is now inside content
         if self.fixed_row is not None and self._prev_fixed_row is not None and self.fixed_row != self._prev_fixed_row:
@@ -608,32 +987,50 @@ class LineEditor:
             except Exception:
                 cols = 80
 
+            # The boxed bottom prompt reserves its right wall column, so
+            # text never escapes the box (the wall is re-emitted below).
+            box_wall = self._box_wall()
+            wall_vis = 1 if box_wall is not None else 0
+
             # For display, render Shift+Enter newline as ↵ so prompt stays single row
             display_buffer = buffer.replace("\n", " ↵ ")
             display_cursor = cursor + buffer[:cursor].count("\n") * 2
             pvis = visible_len(prompt)
-            space = max(0, cols - pvis)
+            space = max(0, cols - pvis - wall_vis)
 
+            # A single very wide line (no newlines) is horizontally
+            # clipped; reserve a right-edge chip reporting its size so a
+            # huge one-line paste is never silently truncated. Fitting
+            # and clipping are measured in visible columns, not Python
+            # characters, so wide (CJK) input cannot overflow the box.
+            wide_chip = ""
             if space <= 0:
                 shown = ""
                 cpos = 0
-            elif len(display_buffer) <= space:
+            elif visible_len(display_buffer) <= space:
                 shown = display_buffer
                 cpos = display_cursor
             else:
-                start = max(0, display_cursor - space + 1)
-                shown = display_buffer[start : start + space]
-                cpos = display_cursor - start
+                if self.popup_above and self.fixed_row is not None:
+                    wide_chip = _size_chip(buffer)
+                    chip_vis = visible_len(wide_chip)
+                    avail = max(0, space - chip_vis)
+                    start, cpos, shown = _line_window(display_buffer, display_cursor, avail)
+                else:
+                    start, cpos, shown = _line_window(display_buffer, display_cursor, space)
 
-            # Highlight selection while dragging
+            # Highlight selection while dragging. ``start`` (from
+            # _line_window) is the char offset where the window begins;
+            # shown is a contiguous slice of display_buffer from that
+            # offset, so char offsets within it are exact even when wide
+            # characters are present.
             if self._sel_active and self._sel_anchor is not None and self._sel_end is not None:
                 s_disp = min(self._sel_anchor, self._sel_end) + buffer[:min(self._sel_anchor, self._sel_end)].count("\n") * 2
                 e_disp = max(self._sel_anchor, self._sel_end) + buffer[:max(self._sel_anchor, self._sel_end)].count("\n") * 2
                 s = s_disp
                 e = e_disp
                 if s != e:
-                    if len(display_buffer) > space:
-                        start = max(0, display_cursor - space + 1)
+                    if visible_len(display_buffer) > space:
                         sel_s = max(0, s - start)
                         sel_e = max(0, min(len(shown), e - start))
                         if sel_s < sel_e:
@@ -641,7 +1038,18 @@ class LineEditor:
                     else:
                         shown = shown[:s] + "\033[7m" + shown[s:e] + "\033[0m" + shown[e:]
 
-            out.write(shown)
+            safe_write(shown)
+            if wide_chip:
+                # Right-edge chip on the same row (ends flush at the last
+                # column, just before the box wall), so the text window +
+                # chip never wrap.
+                col = pvis + space - visible_len(wide_chip)
+                safe_write(f"\033[{col + 1}G" + self.style.dim(wide_chip))
+
+            # Close the box: re-emit the right wall on the prompt row so
+            # each keystroke leaves the box's right edge intact.
+            if box_wall is not None:
+                out.write(f"\033[{cols}G" + box_wall)
 
             # Step 5: Draw popup above the prompt.
             rows: list[str] = []
@@ -649,7 +1057,10 @@ class LineEditor:
                 for index in range(min(self.max_popup, len(popup.items))):
                     label = popup.label(index)
                     if index == selected:
-                        rows.append(f"  {self.style.cyan('> ' + label)}")
+                        # Crimson like the menu's selected row, so the
+                        # completion popup speaks the same "picked" language
+                        # as every other picker in the console.
+                        rows.append(f"  {self.style.selected('> ' + label)}")
                     else:
                         rows.append(f"    {self.style.dim(label)}")
 
@@ -675,12 +1086,12 @@ class LineEditor:
                     for i, row_text in enumerate(rows):
                         row = self.fixed_row - 2 - n + 1 + i
                         if row >= 1:
-                            out.write(f"\033[{row};1H\033[2K{row_text}")
+                            safe_write(f"\033[{row};1H\033[2K{row_text}")
                     out.write(f"\033[{self.fixed_row};1H")   # absolute: move cursor to prompt row
                 else:
                     out.write(f"\033[{n}A")
                     for i, row_text in enumerate(rows):
-                        out.write("\r\033[2K" + row_text)
+                        safe_write("\r\033[2K" + row_text)
                         if i < n - 1:
                             out.write("\n")
                     out.write("\033[1B")
@@ -688,7 +1099,7 @@ class LineEditor:
             elif rows:
                 for row in rows:
                     out.write("\n\033[K")
-                    out.write(row)
+                    safe_write(row)
                 out.write(f"\033[{len(rows)}A")
 
             # Step 6: Position cursor at the typed text position.
@@ -705,6 +1116,11 @@ class LineEditor:
 
     def _finish(self, drawn: int, skip_newline: bool = False) -> None:
         out = sys.stdout
+
+        # A multi-line box owns its rows and restores content/chrome itself.
+        if self._box_active:
+            self._leave_box(clear_prompt=True)
+            drawn = 0
 
         if drawn:
             if self.popup_above and self.fixed_row is not None:
@@ -742,10 +1158,43 @@ class LineEditor:
     @contextmanager
     def _raw_mode(self):
         if os.name == "nt":
+            # Enable VT input processing for the duration of the read so
+            # conhost / Windows Terminal wrap pastes in ESC[200~..ESC[201~
+            # (bracketed paste) now that ``read()`` requested it with
+            # ESC[?2004h. Without ENABLE_VIRTUAL_TERMINAL_INPUT, pasted
+            # text is delivered as raw key events where every newline is
+            # a \r that lands on the submit key - the paste "submits
+            # itself" line by line instead of entering the buffer.
+            #
+            # Only the VT-input bit is OR-ed in: ENABLE_QUICK_EDIT_MODE
+            # (0x0040) and every other flag stay untouched, so native
+            # text selection over the transcript keeps working while the
+            # prompt is open. The original mode is restored on exit.
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            original = None
+            try:
+                mode = wintypes.DWORD()
+                if (
+                    handle not in (None, 0, -1)
+                    and kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+                ):
+                    original = mode.value
+                    if not original & 0x0200:  # ENABLE_VIRTUAL_TERMINAL_INPUT
+                        kernel32.SetConsoleMode(handle, original | 0x0200)
+            except Exception:
+                original = None
             try:
                 yield
             finally:
-                pass
+                if original is not None:
+                    try:
+                        kernel32.SetConsoleMode(handle, original)
+                    except Exception:
+                        pass
             return
         import termios
         import tty
@@ -758,12 +1207,31 @@ class LineEditor:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
-    def _read_key(self) -> str:
+    def _read_key(self, stop=None, timeout: float | None = None) -> str | None:
+        """Read one key, or None on timeout/stop.
+
+        ``stop`` is a threading.Event consulted while waiting; ``timeout``
+        bounds the wait. The plain prompt loop calls this with no
+        arguments (wait forever); the turn-scoped scroll reader passes a
+        stop event and a short timeout so its thread can end promptly when
+        the task does, without stealing the user's keys.
+        """
+        # Deliver keys buffered during a streaming turn first, so typing
+        # that happened while the agent worked is not lost, and so a
+        # non-scroll key swallowed by the scroll reader reaches the prompt.
+        if self.preload:
+            return self.preload.pop(0)
         if os.name == "nt":
             import msvcrt
             import time
 
             while not msvcrt.kbhit():
+                if stop is not None and stop.is_set():
+                    return None
+                if timeout is not None:
+                    timeout -= 0.02
+                    if timeout <= 0:
+                        return None
                 # Throttle size poll to avoid per-loop overhead.
                 try:
                     now = time.monotonic()
@@ -777,10 +1245,12 @@ class LineEditor:
                             return KEY_RESIZE
                 except Exception:
                     pass
-                time.sleep(0.05)
+                time.sleep(0.02)
 
             char = msvcrt.getwch()
             if char in ("\x00", "\xe0"):
+                # Extended-key prefix; s/t are the magic Ctrl+Left/Ctrl+Right
+                # second bytes, the rest resolve through the specials table.
                 second = msvcrt.getwch()
                 if second == "s":
                     return KEY_CTRL_LEFT
@@ -791,21 +1261,70 @@ class LineEditor:
                 return KEY_SHIFT_ENTER
             if char == "\x1b":
                 if self._input_pending():
-                    seq = sys.stdin.read(1)
-                    if seq == "[":
-                        buf = sys.stdin.read(1)
-                        if buf == "<":
-                            return "\x1b"  # mouse event ignored
-                        return self._finish_esc("[" + buf)
+                    # Read the sequence through msvcrt, never sys.stdin:
+                    # mixing the two on this platform stalls or drops bytes.
+                    seq = msvcrt.getwch()
+                    if seq != "[":
+                        return self._finish_esc(seq)
+                    # Collect the CSI (everything up to its terminating
+                    # letter or ~) so bracketed-paste start (200~) is
+                    # recognized instead of being swallowed by the generic
+                    # ESC table lookup - that used to drop the brackets and
+                    # let every newline inside a paste hit the submit key.
+                    buf = ""
+                    waited = 0
+                    while True:
+                        if not self._input_pending():
+                            waited += 1
+                            if waited > 10:  # ~50ms grace for the rest of the burst
+                                break
+                            time.sleep(0.005)
+                            continue
+                        waited = 0
+                        ch = msvcrt.getwch()
+                        if ch == "<":
+                            return self._read_sgr_mouse(msvcrt.getwch)
+                        buf += ch
+                        if ch == "~" or ch.isalpha() or len(buf) > 16:
+                            break
+                    if buf == "200~":
+                        pasted = _assemble_bracketed_paste(
+                            msvcrt.getwch, lambda: msvcrt.kbhit()
+                        )
+                        return "\x1b[200~" + pasted + "\x1b[201~"
+                    # Same CSI mapping as the POSIX path: arrows, ctrl
+                    # arrows, page keys, and the generic specials table.
+                    if buf == "1;5A":
+                        return KEY_UP
+                    if buf == "1;5B":
+                        return KEY_DOWN
+                    if buf == "1;5C":
+                        return KEY_CTRL_RIGHT
+                    if buf == "1;5D":
+                        return KEY_CTRL_LEFT
+                    if buf in ("13;2u", "13u"):
+                        return KEY_SHIFT_ENTER
+                    if buf in _POSIX_SPECIALS:
+                        return _POSIX_SPECIALS[buf]
+                    if buf and buf[0] in _POSIX_SPECIALS:
+                        return _POSIX_SPECIALS[buf[0]]
+                    return "\x1b"
             return char
 
         import select
         import time as _time
         while True:
             try:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                ready, _, _ = select.select([sys.stdin], [], [], 0.02)
             except (OSError, ValueError):
                 ready = [sys.stdin]
+
+            if stop is not None and stop.is_set():
+                return None
+            if timeout is not None:
+                timeout -= 0.02
+                if timeout <= 0:
+                    return None
 
             try:
                 now = _time.monotonic()
@@ -828,37 +1347,43 @@ class LineEditor:
             if char in ("\r", "\n") and _is_shift_pressed():
                 return KEY_SHIFT_ENTER
             return char
-        if not self._input_pending():
+        if not self._await_more_input():
             return char
         seq = sys.stdin.read(1)
         if seq == "[":
             # Check for bracketed paste start 200~
             # Peek ahead
-            if self._input_pending():
-                # Try to read rest of CSI
+            if self._await_more_input():
+                # Try to read rest of CSI; an SGR mouse report ("<b;c;rm")
+                # has its own terminator and length, so it is collected
+                # separately instead of through the 6-char CSI limit.
                 buf = ""
-                # Read up to 6 chars or until alpha/~
+                sgr = False
                 while True:
-                    if not self._input_pending():
+                    if not self._await_more_input():
                         break
                     ch = sys.stdin.read(1)
                     buf += ch
+                    if not sgr and buf == "<":
+                        sgr = True
+                    if sgr:
+                        if ch in ("M", "m") or len(buf) > 32:
+                            break
+                        continue
                     if ch.isalpha() or ch == "~":
                         break
                     if len(buf) > 6:
                         break
+                if sgr:
+                    return _parse_sgr_body(buf)
                 full = seq + buf
                 if full == "[200~":
-                    # Bracketed paste start — read until 201~
-                    pasted = ""
-                    while True:
-                        ch = sys.stdin.read(1)
-                        pasted += ch
-                        if pasted.endswith("\x1b[201~"):
-                            pasted = pasted[:-len("\x1b[201~")]
-                            break
-                        if len(pasted) > 10000:
-                            break
+                    # Bracketed paste start — collect the body whole so a
+                    # big multi-line paste is inserted as text and never
+                    # leaks stray newlines into the submit path.
+                    pasted = _assemble_bracketed_paste(
+                        lambda: sys.stdin.read(1), lambda: self._input_pending()
+                    )
                     return "\x1b[200~" + pasted + "\x1b[201~"
                 if full == "[1;5A":
                     return KEY_UP
@@ -881,14 +1406,48 @@ class LineEditor:
             buf = sys.stdin.read(1)
             if buf == "<":
                 return "\x1b"
+            # "3"/"5"/"6" start legacy sequences (e.g. ESC 3 ~): read the
+            # completing char instead of treating the digit as a literal.
             rest = buf + (sys.stdin.read(1) if buf in "356" else "")
             return _POSIX_SPECIALS.get(rest, char)
         return char
 
+    def _read_sgr_mouse(self, read_one) -> str:
+        """Collect the rest of an SGR mouse report and parse it.
+
+        Called after ESC [ < has been consumed; ``read_one`` yields one
+        character from the terminal. Returns the MouseEvent, or ESC when
+        the report is malformed so the popup is not disturbed.
+
+        Every read is gated on ``_input_pending`` so a partial or
+        interrupted report can never block the editor: if the terminal
+        stops mid-sequence, we give up after the pending check fails.
+        """
+        body = ""
+        for _ in range(32):
+            if not self._input_pending():
+                break
+            ch = read_one()
+            if not ch:
+                break
+            body += ch
+            if ch in ("M", "m"):
+                break
+        return _parse_sgr_body(body)
+
     def _finish_esc(self, prefix: str) -> str:
         rest = prefix
-        while True:
+        # Bounded: only consume characters that are actually pending, so a
+        # lone ESC or a truncated sequence returns instead of blocking the
+        # editor forever waiting for a completion that never arrives. A
+        # short grace period (_await_more_input) covers the case where the
+        # sequence's later bytes simply haven't landed yet.
+        for _ in range(8):
+            if not self._await_more_input():
+                break
             ch = sys.stdin.read(1)
+            if not ch:
+                break
             rest += ch
             if ch.isalpha() or ch == "~":
                 break
@@ -896,6 +1455,25 @@ class LineEditor:
         if inner.startswith("3") or inner.startswith("5") or inner.startswith("6"):
             return _POSIX_SPECIALS.get(inner[:2], "\x1b")
         return _POSIX_SPECIALS.get(inner[:2], "\x1b")
+
+    def _await_more_input(self, max_wait: float = 0.05, poll: float = 0.005) -> bool:
+        """True if more bytes show up within a short grace window.
+
+        Escape sequences can arrive split across reads; waiting briefly
+        prevents a delayed arrow or paste wrapper from being read as a
+        lone Escape or dropped entirely.
+        """
+        if self._input_pending():
+            return True
+        import time
+
+        waited = 0.0
+        while waited < max_wait:
+            time.sleep(poll)
+            waited += poll
+            if self._input_pending():
+                return True
+        return False
 
     def _input_pending(self) -> bool:
         if os.name == "nt":

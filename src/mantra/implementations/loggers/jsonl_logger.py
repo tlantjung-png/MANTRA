@@ -22,6 +22,8 @@ class JsonlLogger(Logger):
         self._lock = threading.Lock()
 
     def log(self, event: str, payload: dict[str, Any]) -> None:
+        # Payload spreads last, so it can override ts/event; default=str
+        # stringifies values that JSON cannot serialize.
         record = {"ts": round(time.time(), 3), "event": event, **payload}
         line = json.dumps(record, default=str) + "\n"
         # Inter-process lock to avoid interleaved lines. Use atomic exclusive
@@ -63,6 +65,12 @@ class JsonlLogger(Logger):
                     pass
             except OSError:
                 break
+        if not acquired:
+            # Another process holds the inter-process lock: skip this
+            # record rather than risk interleaved, corrupt lines. The
+            # logger never raises; losing one record under contention is
+            # the documented trade.
+            return
         try:
             with self._lock:
                 try:

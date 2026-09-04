@@ -4,5 +4,7 @@
   "base_commit": null,
   "problem_statement": "The function greet() in greet.py returns 'helo'. Fix it so it returns 'hello'. Run the tests to confirm.",
   "setup_cmd": null,
-  "test_cmd": "python -m unittest test_greet -v"
+  "test_cmd": "python -m unittest test_greet -v",
+  "clone_timeout": 300,
+  "setup_timeout": 600
 }

@@ -29,6 +29,8 @@ def sessions_dir() -> Path:
 
 
 def _slug(text: str) -> str:
+    # Slug: lowercase alphanumeric runs joined by hyphens, shared by all
+    # name-derivation paths.
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
 
 
@@ -39,7 +41,7 @@ def derive_name(workspace: str = "", model: str = "") -> str:
     keeps two sessions from the same directory from colliding, and it
     sorts usefully because it reads year-month-day.
     """
-    import uuid
+    import uuid  # Imported lazily: only needed on the rare same-second collision.
 
     base = _slug(Path(workspace or "").name) if workspace else ""
     if not base and model:
@@ -64,9 +66,8 @@ def _path(name: str) -> Path:
     safe = re.sub(r"[^a-zA-Z0-9._-]", "-", name).strip("-._")
     original = name
     if not safe or safe != name:
-        # Use slug fallback but incorporate hash of original for uniqueness
+        # Fallback slug plus a short hash keeps distinct unsafe names unique.
         slug_base = _slug(name) or "session"
-        # Short hash of original name to disambiguate different unsafe inputs
         digest = hashlib.sha256(original.encode("utf-8")).hexdigest()[:6]
         safe = f"{slug_base}-{digest}"
     # Prevent directory traversal via Path
@@ -79,6 +80,30 @@ def _path(name: str) -> Path:
 # Long tool output is trimmed rather than the message dropped, because a
 # dropped message can orphan the tool call it answers.
 _MAX_MESSAGE_CHARS = 20_000
+
+# Inter-process save lock: an exclusive create is the arbiter, matching
+# the settings and workflow stores.
+_LOCK_STALE_SECONDS = 5.0
+_LOCK_WAIT = 0.5
+
+
+def _break_stale_lock(lock_path: Path) -> bool:
+    try:
+        stat = lock_path.stat()
+        age = time.time() - stat.st_mtime
+        if age < _LOCK_STALE_SECONDS:
+            return False
+        try:
+            stat2 = lock_path.stat()
+            if stat2.st_mtime != stat.st_mtime:
+                return False
+            lock_path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            return True
+    except OSError:
+        return False
+    return False
 
 
 def _trim_messages(messages: list[Any]) -> list[Any]:
@@ -106,6 +131,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
         "version": _VERSION,
         "name": name,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # Caller payload spread last, so it can override metadata keys.
         **payload,
     }
     messages = record.get("messages")
@@ -122,16 +148,50 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
     except OSError:
         pass
     content = json.dumps(record, ensure_ascii=False, indent=2)
-    tmp = target.with_suffix(target.suffix + ".tmp")
+    # Inter-process lock: two consoles autosaving the same session name
+    # must not interleave. If the lock cannot be taken in time, skip the
+    # save rather than write a half-written transcript over a good one.
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    if lock_path.exists():
+        _break_stale_lock(lock_path)
+    acquired = False
+    lock_fd = None
+    start = time.monotonic()
+    while time.monotonic() - start < _LOCK_WAIT:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            acquired = True
+            break
+        except FileExistsError:
+            time.sleep(0.02)
+            try:
+                if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE_SECONDS:
+                    _break_stale_lock(lock_path)
+            except OSError:
+                pass
+        except OSError:
+            # Lock creation failed for a non-conflict reason: skip the save.
+            break
+    if not acquired:
+        return None
+    # Unique temp name: no fixed path for a planted symlink, no shared
+    # file for two writers to interleave into.
+    import tempfile
+
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
         try:
-            os.chmod(tmp, 0o600)
+            os.chmod(tmp_name, 0o600)
         except OSError:
             pass
-        tmp.replace(target)
+        os.replace(tmp_name, target)
     except OSError:
+        # Fallback: direct write, risking a partially written file rather
+        # than losing the transcript entirely.
         try:
             with open(target, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
@@ -141,6 +201,21 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
                 pass
         except OSError:
             return None
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    finally:
+        if acquired and lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     return str(target)
 
 
@@ -169,7 +244,8 @@ def load(name: str) -> dict[str, Any] | None:
 
 
 def delete(name: str) -> bool:
-    # Try current path, then legacy
+    """Remove a saved session. True only when a file was actually unlinked."""
+    # Try the current hashed path first, then the legacy path.
     for cand in (_path(name), _legacy_path(name)):
         try:
             cand.unlink()
@@ -233,7 +309,7 @@ def list_sessions(limit: int = 20) -> list[dict[str, Any]]:
                 "workspace": data.get("workspace") or "",
                 "model": data.get("model") or "",
                 "turns": sum(1 for m in messages if isinstance(m, dict)
-                             and m.get("role") == "user"),
+                             and m.get("role") == "user"),  # one turn per user message
                 "messages": len(messages),
                 "summary": data.get("summary") or _summarise(messages),
                 "path": str(file),

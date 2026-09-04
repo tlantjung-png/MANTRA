@@ -103,6 +103,9 @@ class _Style:
     def bold(self, t):
         return f"\033[1m{t}\033[0m"
 
+    def selected(self, t):
+        return f"\033[1;38;5;131m{t}\033[0m"
+
 
 class _FakeCompleter:
     """Completes tokens after '@' or a leading '/'."""
@@ -154,6 +157,11 @@ class Screen:
             params = match.group(1)
             # Skip synchronized output sequences (start with ? or >)
             if not params.startswith("?") and not params.startswith(">"):
+                # SGR colour codes carry multi-part params (e.g.
+                # 1;38;5;131) a real terminal ignores; don't int() them.
+                if match.group(2) == "m":
+                    index = match.end()
+                    continue
                 count = int(params) if params else 1
                 self._csi(match.group(2), count)
             index = match.end()
@@ -468,6 +476,7 @@ class ConsoleCompleterTest(unittest.TestCase):
             root = self.root
 
         class _Session:
+            # The completer only reads sandbox.root and workspace.
             sandbox = _Sandbox()
             workspace = self.root
 

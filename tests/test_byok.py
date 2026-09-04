@@ -26,6 +26,7 @@ from unittest import mock
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
+# Bootstrap imports so the suite runs from a checkout without installation.
 for _path in (os.path.join(_PROJECT_ROOT, "src"), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
@@ -147,6 +148,7 @@ class KeyStoreTest(TempStorage, unittest.TestCase):
             self.skipTest("POSIX permission bits only")
         store_key("SOME_KEY", "value")
         mode = os.stat(credentials_path()).st_mode & 0o777
+        # Owner read/write only: the stored value must not be world-readable.
         self.assertEqual(mode, 0o600)
 
 
@@ -383,6 +385,7 @@ class ReasoningEffortTest(unittest.TestCase):
         # A local server may 400 on the unknown field; the request must
         # succeed on retry with the field dropped, not fail the turn.
         self.recorder = _Recorder(failures=[(400, "Unknown parameter: reasoning_effort")])
+        # Swap setUp's urlopen patch for the failing recorder mid-test.
         self.patches[0].stop()
         self.patches[0] = mock.patch.object(urllib.request, "urlopen", self.recorder)
         self.patches[0].start()
@@ -394,6 +397,8 @@ class ReasoningEffortTest(unittest.TestCase):
         self.assertEqual(self.recorder.bodies[0]["reasoning_effort"], "high")
 
     def test_reasoning_models_get_the_completion_budget(self):
+        # A 400 naming max_completion_tokens forces the retry that
+        # renames the token field for the rest of the session.
         self.recorder = _Recorder(
             failures=[(400, "Unsupported parameter: 'max_tokens' is not supported "
                            "with this model. Use 'max_completion_tokens' instead.")]
@@ -786,5 +791,5 @@ class ModelCompletionTest(unittest.TestCase):
         _Session.sandbox = _Sandbox()
         from mantra.console import ConsoleCompleter
 
-        # An out-of-range cursor must raise IndexError, not crash.
+        # A cursor past the end is clamped and returns None, not an error.
         self.assertIsNone(ConsoleCompleter(_Session()).complete("/model x", 99))

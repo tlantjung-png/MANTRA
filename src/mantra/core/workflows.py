@@ -14,12 +14,13 @@ _OVERRIDE_ENV = "MANTRA_WORKFLOWS"
 
 _MAX_STEPS = 50
 _MAX_STEP_CHARS = 4000
-_LOCK_STALE = 5.0
-_LOCK_WAIT = 0.5
+# Inter-process write lock: exclusive create is the arbiter.
+_LOCK_STALE = 5.0  # a lock this old belonged to a dead process
+_LOCK_WAIT = 0.5  # how long to wait for the lock before giving up
 
 
 def workflows_path() -> Path:
-    """Where workflows live. Honours MANTRA_WORKFLOWS for tests."""
+    """Path to the workflows file; MANTRA_WORKFLOWS relocates it for tests."""
     override = os.environ.get(_OVERRIDE_ENV)
     if override and override.strip():
         return Path(override.strip())
@@ -75,6 +76,10 @@ def load_all() -> dict[str, Any]:
 
 
 def _break_stale(lock_path: Path) -> bool:
+    """Remove a lock whose holder is gone. True when removed.
+
+    The mtime is checked twice so a freshly created lock is never deleted.
+    """
     try:
         stat = lock_path.stat()
         age = time.time() - stat.st_mtime
@@ -95,17 +100,18 @@ def _break_stale(lock_path: Path) -> bool:
 
 
 def _save_all(data: dict[str, Any]) -> bool:
+    """Persist the workflows document under an inter-process lock."""
     target = workflows_path()
     # File lock for inter-process safety — atomic exclusive create is arbiter.
     lock_path = target.with_suffix(target.suffix + ".lock")
     if lock_path.exists():
         _break_stale(lock_path)
     acquired = False
-    fd = None
+    lock_fd = None
     start = time.monotonic()
     while time.monotonic() - start < _LOCK_WAIT:
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             acquired = True
             break
         except FileExistsError:
@@ -117,6 +123,10 @@ def _save_all(data: dict[str, Any]) -> bool:
                 pass
         except OSError:
             break
+    if not acquired:
+        # Another process holds the lock: skip the write rather than race
+        # it. The caller reports the failure and can retry.
+        return False
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -124,15 +134,21 @@ def _save_all(data: dict[str, Any]) -> bool:
         except OSError:
             pass
         content = json.dumps(data, ensure_ascii=False, indent=2)
-        tmp = target.with_suffix(target.suffix + ".tmp")
+        # Unique temp name: no fixed path for a planted symlink, no shared
+        # file for two writers to interleave into.
+        import tempfile
+
+        fd_tmp, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+        )
         try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
             try:
-                os.chmod(tmp, 0o600)
+                os.chmod(tmp_name, 0o600)
             except OSError:
                 pass
-            tmp.replace(target)
+            os.replace(tmp_name, target)
         except OSError:
             with open(target, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
@@ -140,12 +156,16 @@ def _save_all(data: dict[str, Any]) -> bool:
                 os.chmod(target, 0o600)
             except OSError:
                 pass
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     except OSError:
         return False
     finally:
-        if acquired and fd is not None:
+        if acquired and lock_fd is not None:
             try:
-                os.close(fd)
+                os.close(lock_fd)
             except OSError:
                 pass
             try:
@@ -167,7 +187,7 @@ def get(name: str) -> dict[str, Any] | None:
 
 
 def list_workflows() -> list[dict[str, Any]]:
-    """Every workflow, alphabetically, with its step count."""
+    """Workflows with steps, alphabetically, with their step counts."""
     out = []
     for key, value in load_all()["workflows"].items():
         if not isinstance(value, dict):

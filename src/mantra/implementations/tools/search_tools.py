@@ -115,7 +115,7 @@ class SearchCodeTool(Tool):
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
                 for lineno, line in enumerate(handle):
                     if query in line:
-                        out.append(f"{rel}:{lineno}: {line.rstrip()[:300]}")
+                        out.append(f"{rel}:{lineno + 1}: {line.rstrip()[:300]}")
                         if len(out) >= _MAX_RESULTS:
                             break
                     # Avoid scanning huge files line-by-line indefinitely
@@ -144,6 +144,7 @@ class FindFileTool(Tool):
             return "ERROR: pattern too long"
         root = getattr(sandbox, "root", None)
         if root is None:
+            # Sandbox without a direct file view: shell find, safely quoted.
             quoted = shlex.quote(f"*{pattern}*")
             result = sandbox.exec(
                 f"find . -name {quoted} -not -path './.git/*'"
@@ -174,11 +175,6 @@ class FindFileTool(Tool):
                         real = os.path.realpath(full)
                         if not (real == real_root or real.startswith(real_root + os.sep)):
                             continue
-                except OSError:
-                    continue
-                try:
-                    if os.path.getsize(full) > _MAX_FILE_BYTES:
-                        continue
                 except OSError:
                     continue
                 scanned += 1

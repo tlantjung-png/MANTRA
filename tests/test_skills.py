@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+# Bootstrap imports so the suite runs from a checkout without installation.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import mantra.core.skills as skills
@@ -91,6 +92,7 @@ class ParseTest(unittest.TestCase):
         self.assertFalse(skills._as_bool("false"))
         self.assertFalse(skills._as_bool("No"))
         self.assertTrue(skills._as_bool("true"))
+        # Unrecognized strings count as true (fail-open fallback).
         self.assertTrue(skills._as_bool("something else"))
 
     def test_a_table_drops_its_separator_row(self):
@@ -242,7 +244,7 @@ class CommandTest(unittest.TestCase):
             workspace=self.tmp,
             style=Style(enabled=False),
             llm=ScriptedLLMClient([]),
-            ask=lambda prompt: "y",
+            ask=lambda prompt: "y",  # every approval auto-answered yes
         )
         self.printed: list[str] = []
         self.session._print = self.printed.append
@@ -494,7 +496,7 @@ class AutoRouteTest(SkillsFixtureTest):
             workspace=self.tmp,
             style=Style(enabled=False),
             llm=ScriptedLLMClient([]),
-            ask=lambda prompt: "y",
+            ask=lambda prompt: "y",  # every approval auto-answered yes
         )
         self.printed: list[str] = []
         self.session._print = self.printed.append
@@ -606,7 +608,7 @@ class AutoCommandTest(SkillsFixtureTest):
             workspace=self.tmp,
             style=Style(enabled=False),
             llm=ScriptedLLMClient([]),
-            ask=lambda prompt: "y",
+            ask=lambda prompt: "y",  # every approval auto-answered yes
         )
         self.printed: list[str] = []
         self.session._print = self.printed.append
@@ -658,6 +660,37 @@ class AutoCommandTest(SkillsFixtureTest):
         self.session.auto_attached = ["debug"]
         _skills(self.session, "auto off")
         self.assertEqual(self.session.active_skills, [])
+
+
+class RootDiscoveryTest(unittest.TestCase):
+    """Which skills directories are indexed, and in what order.
+
+    roots() must ship the repo library first (so the bundled copies are
+    what the console uses), then the personal ~/.mantra/skills tree as a
+    supplement, and an explicit MANTRA_SKILLS override must still win
+    outright (tests rely on it).
+    """
+
+    def setUp(self):
+        self.addCleanup(os.environ.pop, skills._OVERRIDE_ENV, None)
+
+    @mock.patch.object(skills.Path, "home")
+    def test_repo_library_is_indexed_first(self, home_mock):
+        os.environ.pop(skills._OVERRIDE_ENV, None)
+        home = os.path.join(tempfile.mkdtemp(), "home")
+        home_mock.return_value = skills.Path(home)
+        roots = skills.roots()
+        self.assertGreaterEqual(len(roots), 2)
+        # Repository-shipped library is first.
+        repo = skills.Path(__file__).resolve().parents[1] / "skills"
+        self.assertEqual(str(roots[0]), str(repo))
+        # The personal tree comes after it.
+        self.assertEqual(str(roots[1]), os.path.join(home, ".mantra", "skills"))
+
+    def test_override_wins_outright(self):
+        custom = os.path.join(tempfile.mkdtemp(), "custom")
+        os.environ[skills._OVERRIDE_ENV] = custom
+        self.assertEqual([str(r) for r in skills.roots()], [custom])
 
 
 if __name__ == "__main__":

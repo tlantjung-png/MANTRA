@@ -13,8 +13,38 @@ from mantra.core.events import EventBus
 from mantra.core.exceptions import ConfigError
 from mantra.core.knowledge import assemble_system_prompt
 from mantra.registry import build_evaluator, build_llm, build_logger, build_sandbox, build_tools
+from mantra.term import force_utf8_output
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class _HeadlessApprover:
+    """Non-interactive approval policy for unattended runs.
+
+    Nobody is at the terminal to answer a prompt, so each configured
+    mode maps to its closest non-interactive form: plan refuses every
+    mutation, as it does interactively; default and auto allow ordinary
+    mutations but refuse destructive ones (a prompt cannot be answered);
+    yolo allows everything, as it does interactively.
+    """
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+
+    def check(self, tool: str, arguments: dict) -> bool:
+        from mantra.core.approvals import MUTATING_TOOLS, classify
+
+        if self.mode == "yolo":
+            return True
+        if self.mode == "plan" and tool in MUTATING_TOOLS:
+            return False
+        risk, _detail = classify(tool, arguments)
+        if risk == "safe":
+            return True
+        if self.mode in ("default", "auto") and risk == "mutating":
+            return True
+        # destructive under default/auto: nothing can confirm it here
+        return False
 
 
 def _resolve_path(path: str) -> str:
@@ -32,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True, help="Path to config.json / config.yaml")
     parser.add_argument("--task", required=True, help="Path to task JSON file")
     args = parser.parse_args(argv)
+    # UTF-8 streams keep event output and verdicts encodable even when the
+    # run is piped through a narrow console or redirected to a file.
+    force_utf8_output()
 
     try:
         config = load_config(_resolve_path(args.config))
@@ -63,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
     events = EventBus()
     events.subscribe(lambda name, payload: print(f"[{name}] {_brief(payload)}"))
 
+    approval_mode = config.get("approvals", "default")
+    print(f"[approvals] headless policy: {approval_mode} "
+          "(plan refuses mutations; default/auto refuse destructive commands; yolo allows all)")
     loop = AgentLoop(
         llm=llm,
         sandbox=sandbox,
@@ -75,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             known_failures_path=os.path.join(PROJECT_ROOT, "knowledge", "known-failures.md"),
         ),
         max_steps=config.get("max_steps", 30),
+        approver=_HeadlessApprover(approval_mode),
     )
     result = loop.run(task)
 

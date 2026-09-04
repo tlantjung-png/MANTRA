@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,17 +54,34 @@ def _save(data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _restrict_dir(path.parent)
     content = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # A unique, unpredictable temp name in the same directory: a planted
+    # symlink at a fixed path cannot hijack the write, and two writers
+    # never share a temp file.
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(content, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
         _restrict_file(tmp)
-        tmp.replace(path)
+        try:
+            tmp.replace(path)
+        except OSError:
+            # One short retry: transient failures (an antivirus scan, a
+            # briefly held lock) usually clear. There is deliberately no
+            # direct-write fallback: a non-atomic write to the target
+            # path could follow a planted symlink, so a still-failing
+            # replace must surface to the caller instead of silently
+            # weakening the atomic-write guarantee.
+            time.sleep(0.05)
+            tmp.replace(path)
     except OSError:
         try:
-            path.write_text(content, encoding="utf-8")
-            _restrict_file(path)
+            tmp.unlink()
         except OSError:
             pass
+        raise
 
 
 _WARNED_INSECURE = False
@@ -108,13 +128,7 @@ def _restrict_dir(directory: Path) -> None:
 
 
 def _restrict_file(path: Path) -> None:
-    """Best effort at owner-only access.
-
-    Windows honours the read-only bit but not the POSIX mode bits, so
-    this is a meaningful guarantee on POSIX and a hint elsewhere. The
-    file is still a plain JSON document either way. On non-POSIX we emit
-    a warning so the operator understands the threat model.
-    """
+    """Best-effort owner-only access; only a hint where mode bits are ignored."""
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -140,31 +154,89 @@ def stored_keys() -> dict[str, str]:
     return dict(keys) if isinstance(keys, dict) else {}
 
 
+_CRED_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _store_locked():
+    """Serialize credential read-modify-write.
+
+    An in-process lock plus a best-effort advisory lock on a sibling
+    lock file (fcntl/msvcrt). Locking failures degrade to unlocked
+    rather than failing the write: the atomic replace already prevents
+    file corruption, the lock only prevents lost updates from two
+    concurrent writers.
+    """
+    with _CRED_LOCK:
+        lock_path = credentials_path().with_name(credentials_path().name + ".lock")
+        handle = None
+        try:
+            handle = open(lock_path, "a+b")
+            # One byte must exist before msvcrt.locking; seek makes the
+            # lock position well-defined.
+            handle.write(b"\0")
+            handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            handle = None
+        try:
+            yield
+        finally:
+            if handle is not None:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+
 def store(name: str, key: str) -> None:
     """Save a key. Empty or whitespace-only names are refused."""
     name = (name or "").strip()
     if not name:
         raise ValueError("a key needs a name")
-    data = _load()
-    keys = data.get("keys")
-    if not isinstance(keys, dict):
-        keys = {}
-    keys[name] = (key or "").strip()
-    data["keys"] = keys
-    data["version"] = _CREDENTIALS_VERSION
-    _save(data)
+    with _store_locked():
+        data = _load()
+        keys = data.get("keys")
+        if not isinstance(keys, dict):
+            keys = {}
+        keys[name] = (key or "").strip()
+        data["keys"] = keys
+        data["version"] = _CREDENTIALS_VERSION  # schema version marker; not read back
+        _save(data)
 
 
 def remove(name: str) -> bool:
     """Delete a stored key. True when something was actually removed."""
-    data = _load()
-    keys = data.get("keys")
-    if not isinstance(keys, dict) or name not in keys:
-        return False
-    del keys[name]
-    data["keys"] = keys
-    _save(data)
-    return True
+    with _store_locked():
+        data = _load()
+        keys = data.get("keys")
+        if not isinstance(keys, dict) or name not in keys:
+            return False
+        del keys[name]
+        data["keys"] = keys
+        _save(data)
+        return True
 
 
 def resolve(api_key_env: str | None) -> str | None:

@@ -1,5 +1,4 @@
 {
-  "_comment": "Meta endpoint preset. Kept because OPENAI_API_KEY may not be set yet - use: python console.py --config examples/config.meta.json",
   "max_steps": 25,
   "llm": {
     "provider": "openai",

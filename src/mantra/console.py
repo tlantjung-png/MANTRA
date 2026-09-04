@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import glob
 import json
 import os
@@ -17,6 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from mantra import theme
 from mantra.config import REASONING_EFFORTS, load_config
 from mantra.core.agent_loop import DEFAULT_SYSTEM_PROMPT, AgentLoop, RunResult
 from mantra.core.approvals import MODES, ApprovalPolicy
@@ -52,13 +54,23 @@ from mantra.core.knowledge import (
 from mantra.implementations.evaluators.null_evaluator import NullEvaluator
 from mantra.implementations.loggers.jsonl_logger import JsonlLogger
 from mantra.implementations.sandbox.local_sandbox import LocalSandbox
-from mantra.line_editor import Completion, LineEditor
+from mantra.line_editor import (
+    KEY_DOWN,
+    KEY_PAGE_DOWN,
+    KEY_PAGE_UP,
+    KEY_RESIZE,
+    KEY_UP,
+    Completion,
+    LineEditor,
+    MouseEvent,
+)
 import mantra.compact as compact
 from mantra.registry import build_llm, build_tools
 
 # Compact is sole TUI.
+# Serializes spinner-thread and main-thread stdout writes.
 _WRITE_LOCK = threading.Lock()
-from mantra.term import visible_len  # shared wide-aware impl (line_editor/compact/term)
+from mantra.term import cbreak_mode, force_utf8_output, safe_write, selection_in_progress, visible_len  # shared wide-aware impl (line_editor/compact/term)
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -82,6 +94,7 @@ HELP_TEXT = """Commands:
   /reset                reset conversation
   /resume [name]        resume autosaved session
   /goal <text>          set session goal (/goal note, /goal done)
+  /todo                 session checklist — /todo add|done|rm|clear
    /skills <name>        attach skill — /skills + space, Tab filter
   /workflow             run workflow (create|show|launch|remove)
   /paste                multi-line input (end with .)
@@ -116,36 +129,22 @@ class Style:
     def _wrap(self, code: str, text: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.enabled else text
 
-    # Basic colors
+    # SGR primitives still used directly (weight / strikethrough). Every
+    # colour goes through the semantic palette below instead.
     def bold(self, t): return self._wrap("1", t)
     def dim(self, t): return self._wrap("2", t)
-    def red(self, t): return self._wrap("31", t)
-    def green(self, t): return self._wrap("32", t)
-    def yellow(self, t): return self._wrap("33", t)
-    def blue(self, t): return self._wrap("34", t)
-    def magenta(self, t): return self._wrap("35", t)
-    def cyan(self, t): return self._wrap("36", t)
-    # Bright neon variants (80s theme)
-    def bright_red(self, t): return self._wrap("91", t)
-    def bright_green(self, t): return self._wrap("92", t)
-    def bright_yellow(self, t): return self._wrap("93", t)
-    def bright_blue(self, t): return self._wrap("94", t)
-    def bright_magenta(self, t): return self._wrap("95", t)
-    def bright_cyan(self, t): return self._wrap("96", t)
-    def bright_white(self, t): return self._wrap("97", t)
-    # Vampire Library — gothic colorful, aqua ENCHANTER
-    def neon_title(self, t): return self._wrap("1;38;5;51", t)  # aqua bold (ENCHANTER biar keliatan)
-    def neon_label(self, t): return self._wrap("38;5;172", t)    # antique amber (you)
-    def neon_value(self, t): return self._wrap("38;5;230", t)    # ivory bone
-    def neon_accent(self, t): return self._wrap("38;5;29", t)   # deep emerald
-    def neon_border(self, t): return self._wrap("38;5;240", t)   # smoke grey-wine
-    # Gothic palette
-    def grey(self, t): return self._wrap("37", t)         # grey
-    def strike(self, t): return self._wrap("9", t)        # strikethrough
-    # Background helpers
-    def bg_grey(self, t): return self._wrap("47", t)      # light grey background
-    def on_grey(self, t): return self._wrap("97;100", t)   # white on dark grey
-    def on_grey_light(self, t): return self._wrap("97;47", t)  # white on light grey
+    def strike(self, t): return self._wrap("9", t)
+
+    # Blood & Bone semantic palette — monochrome stone base, one muted
+    # crimson accent. Only the wrappers the console actually calls are
+    # kept; everything else goes through _wrap(theme.*) directly.
+    def brand(self, t):    return self._wrap(theme.BLOOD_BOLD, t)  # identity: ENCHANTER, wordmark
+    def selected(self, t): return self._wrap(theme.BLOOD_BOLD, t)  # menu / completion highlight
+    def warn(self, t):     return self._wrap(theme.WARN, t)        # warnings — soft ochre
+    def ember(self, t):    return self._wrap(theme.EMBER, t)       # errors — dusty red
+    def bone(self, t):     return self._wrap(theme.BONE, t)
+    def ash(self, t):      return self._wrap(theme.ASH, t)
+    def hair(self, t):     return self._wrap(theme.HAIR, t)
 
 
 
@@ -164,23 +163,63 @@ def _sanitize_output(text: str) -> str:
     return _ANSI_SANITIZE_RE.sub("", text)
 
 
+def _safe_stdout(text: str) -> None:
+    """Write model-generated text that must not crash on a narrow console.
+
+    Windows consoles default to a single-byte codepage (cp1252), and a
+    model reply can legitimately contain characters it cannot encode
+    (e.g. U+2192). The plain ``sys.stdout.write`` used in the streaming
+    paths raises UnicodeEncodeError on such text and kills the whole
+    console mid-turn, so the fallback re-encodes with ``errors="replace"``
+    exactly like :meth:`ConsoleSession._print` does.
+    """
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "utf-8"
+        sys.stdout.write(
+            text.encode(enc, errors="replace").decode(enc, errors="replace")
+        )
+
+
 class StreamingRenderer:
     """Apply inline markdown formatting to streamed text fragments.
 
     Buffers incoming text until a newline arrives, then processes the
     complete line through the full markdown pipeline.  Code fences are
     tracked across pieces so content inside them stays literal.
+
+    ``report_hook`` is an optional callback the session sets while a turn
+    streams: called with each ``TODO ADD:`` / ``TODO DONE:`` line the
+    agent emits (outside code fences) and expected to return the styled
+    line to show instead of the raw protocol text. Without a hook the
+    renderer behaves exactly as before.
     """
+
+    # A report line is a whole line beginning with the marker, so a
+    # mid-paragraph mention of "TODO ADD" in prose is never misread.
+    _REPORT_RE = re.compile(r"^(TODO (?:ADD|DONE)):\s*(.*)$", re.IGNORECASE)
 
     def __init__(self, style: Style) -> None:
         self.style = style
         self._in_code_fence = False
         self._buf: str = ""
+        self.report_hook = None  # callable(line: str) -> styled replacement
 
     def reset(self) -> None:
         """Reset state for a new response."""
         self._in_code_fence = False
         self._buf = ""
+
+    def _line_out(self, line: str) -> str:
+        """One complete line: TODO reports via the hook, everything else markdown."""
+        if not self._in_code_fence and self.report_hook is not None:
+            m = self._REPORT_RE.match(line.strip())
+            if m:
+                replaced = self.report_hook(line.strip())
+                if replaced:
+                    return replaced
+        return _render_md_line(line, self.style, self)
 
     def render_piece(self, piece: str) -> str:
         """Render a text fragment with inline markdown."""
@@ -195,7 +234,7 @@ class StreamingRenderer:
         out = ""
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            out += _render_md_line(line, self.style, self) + "\n"
+            out += self._line_out(line) + "\n"
         return out
 
     def flush(self) -> str:
@@ -203,7 +242,7 @@ class StreamingRenderer:
         if self._buf:
             leftover = self._buf
             self._buf = ""
-            return _render_md_line(leftover, self.style, self)
+            return self._line_out(leftover)
         return ""
 
 
@@ -213,7 +252,7 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 class Spinner:
     """Background spinner that pauses for real output."""
 
-    def __init__(self, style: Style, label: str = "Channeling", frame: Any = None, layout: Any = None) -> None:
+    def __init__(self, style: Style, label: str = "Channeling", frame: Any = None, layout: Any = None, status: Any = None) -> None:
         self.style = style
         self.label = label
         self.label_thinking = "Channeling"
@@ -223,6 +262,10 @@ class Spinner:
         self._frame = frame
         # Optional TerminalLayout for bottom-fixed prompt mode.
         self._layout = layout
+        # Optional callable returning a styled snippet appended to the
+        # status row each frame (e.g. the live open-todo count). Returned
+        # text is used as-is; an empty string adds nothing.
+        self._status = status
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._paused = False
@@ -235,19 +278,32 @@ class Spinner:
             elapsed_str = f"{elapsed}s"
         else:
             elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
-        # Gantian di tempat sama: Channeling 0-1s, lalu Chanting — biar Chanting tetap nongol walau cepat
+        # Same slot: "Channeling" for the first second, "Chanting" after,
+        # so the working label changes even on fast turns.
         cur_label = self.label_thinking if elapsed < 1 else self.label_working
+        # Label drifts ash-to-bone; the crimson glyph carries the motion.
         pulse = int(time.monotonic() * 4) % 6
         if pulse < 3:
-            label_styled = self.style._wrap("38;5;240", cur_label)
+            label_styled = self.style._wrap(theme.ASH, cur_label)
         else:
-            label_styled = self.style._wrap("38;5;172", cur_label)
-        body = f"{self.style._wrap('38;5;51', frame_char)} {label_styled} {self.style._wrap('38;5;230', elapsed_str)}"
+            label_styled = self.style._wrap(theme.BONE, cur_label)
+        body = f"{self.style._wrap(theme.BLOOD, frame_char)} {label_styled} {self.style._wrap(theme.FAINT, elapsed_str)}"
+        if self._status is not None:
+            try:
+                extra = self._status()
+            except Exception:
+                extra = ""
+            if extra:
+                body += " " + extra
+        # Layout mode: no carriage return (the layout owns the row); the
+        # frame path prefixes \r to overwrite its current row.
         if self._layout is not None and self._layout.active:
             return body
         return "\r" + (self._frame(body) if self._frame else body + " ")
 
     def _spin(self) -> None:
+        # Daemon thread: redraws the frame every 80ms under the write lock
+        # until stopped; paused() suppresses drawing while real output prints.
         i = 0
         while not self._stop.wait(0.08):
             with self._lock:
@@ -263,7 +319,7 @@ class Spinner:
     def start(self):
         if sys.stdout.isatty():
             try:
-                sys.stdout.write("\033[?25l")
+                sys.stdout.write("\033[?25l")  # hide the cursor
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -277,7 +333,7 @@ class Spinner:
         if clear:
             self.clear_line()
         try:
-            sys.stdout.write("\033[?25h")
+            sys.stdout.write("\033[?25h")  # show the cursor again
             sys.stdout.flush()
         except Exception:
             pass
@@ -313,7 +369,9 @@ class Spinner:
 # ------------------------------------------------------------- markdown-lite
 
 def _syntax_highlight(line: str, style: Style) -> str:
-    """Generic syntax highlight for any language — Vampire palette, single-pass to avoid ANSI nesting."""
+    """Generic syntax highlight for any language — Blood & Bone: muted sage
+    strings, bold-bone keywords, stone numerals. Single-pass to avoid ANSI
+    nesting; types stay in the default face."""
     import re as _re
     # Combined pattern with named groups — one pass, no re-highlight of inserted ANSI
     pattern = _re.compile(
@@ -325,16 +383,15 @@ def _syntax_highlight(line: str, style: Style) -> str:
     )
     def _repl(m):
         if m.group('str'):
-            return style._wrap("38;5;82", m.group('str'))
+            return style._wrap(theme.SAGE, m.group('str'))
         if m.group('cmt'):
-            return style._wrap("38;5;240", m.group('cmt'))
+            return style._wrap(theme.FAINT, m.group('cmt'))
         if m.group('num'):
-            return style._wrap("38;5;172", m.group('num'))
+            return style._wrap(theme.ASH, m.group('num'))
         if m.group('kw'):
-            return style._wrap("1;38;5;51", m.group('kw'))
-        if m.group('typ'):
-            txt = m.group('typ')
-            return style._wrap("38;5;230", txt) if len(txt) > 2 else txt
+            return style._wrap(theme.BONE_BOLD, m.group('kw'))
+        # CapWords types stay default: weight plus the tones above already
+        # give code its structure, colouring every type would raise noise.
         return m.group(0)
     return pattern.sub(_repl, line)
 
@@ -351,102 +408,101 @@ def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
         if stripped.startswith("```"):
             if ctx is not None:
                 ctx._in_code_fence = False
-            return style._wrap("38;5;29", "│" + "─" * 4)
+            return style._wrap(theme.HAIR, "│" + "─" * 4)
         return _syntax_highlight(line, style)
     if stripped.startswith("```"):
         if ctx is not None:
             ctx._in_code_fence = True
-        return style._wrap("38;5;29", "│" + "─" * 4)
+        return style._wrap(theme.HAIR, "│" + "─" * 4)
 
-    # ── headings — Vampire: H1 aqua, H2 ivory, H3 amber ──
+    # headings: bone bold; hairline under H1 and H2, ash for H3
     if stripped.startswith("#"):
         level = len(stripped) - len(stripped.lstrip("#"))
         heading = stripped.lstrip("# ").rstrip()
         if level == 1:
-            return style._wrap("1;38;5;51", heading) + chr(10) + style._wrap("38;5;88", chr(0x2500) * 40)
+            return style._wrap(theme.BONE_BOLD, heading) + chr(10) + style._wrap(theme.HAIR, chr(0x2500) * 40)
         if level == 2:
-            return style._wrap("1;38;5;230", heading) + chr(10) + style._wrap("38;5;240", chr(0x2500) * 40)
-        return style._wrap("38;5;172", heading)
+            return style._wrap(theme.BONE_BOLD, heading) + chr(10) + style._wrap(theme.HAIR, chr(0x2500) * 40)
+        return style._wrap(theme.ASH, heading)
 
-    # ── horizontal rule ──────────────────────────────────
+    # horizontal rule: hairline
     if stripped in ("---", "***", "___") and len(stripped) >= 3:
-        return style._wrap("38;5;240", chr(0x2500) * 40)
+        return style._wrap(theme.HAIR, chr(0x2500) * 40)
 
-    # ── blockquote ───────────────────────────────────────
+    # blockquote: hairline bar, ash text
     if stripped.startswith(">"):
         quote = stripped[1:].lstrip()
-        return style._wrap("38;5;240", "│ ") + style._wrap("38;5;240", quote)
+        return style._wrap(theme.HAIR, "│ ") + style._wrap(theme.ASH, quote)
 
-    # ── plain code outside fence — still highlight (import, def, etc. tanpa wrapper)
+    # plain code outside a fence still gets highlighted
     if re.match(r"^\s*(import\s|from\s|def\s|class\s|if\s|for\s|while\s|return\b|const\s|let\s|var\s|export\s|require\(|#include|using\s|public\s|private\s|protected\s)", line):
         return _syntax_highlight(line, style)
 
-    # ── unordered list — emerald ─────────────────────────
+    # unordered list: ash markers
     m_list = re.match(r"^(\s*)[-*+]\s+(.*)", line)
     if m_list:
         indent, rest = m_list.group(1), m_list.group(2)
-        return indent + style._wrap("38;5;29", "* ") + _inline_md(rest, style)
+        return indent + style._wrap(theme.ASH, "* ") + _inline_md(rest, style)
 
-    # ── ordered list — emerald ───────────────────────────
+    # ordered list: ash markers
     m_ord = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
     if m_ord:
         indent, num, rest = m_ord.group(1), m_ord.group(2), m_ord.group(3)
-        return indent + style._wrap("38;5;29", num + ". ") + _inline_md(rest, style)
+        return indent + style._wrap(theme.ASH, num + ". ") + _inline_md(rest, style)
 
-    # ── normal paragraph ─────────────────────────────────
+    # normal paragraph
     return _inline_md(line, style)
 
 
 def render_markdown(text: str, style: Style) -> str:
-    """Render Markdown to styled terminal output — Vampire palette."""
+    """Render Markdown to styled terminal output — Blood & Bone palette."""
     out_lines = []
     in_fence = False
     for line in text.split("\n"):
         stripped = line.strip()
-        # Code fence toggle — emerald border.
+        # Code fence toggle — hairline border.
         if stripped.startswith("```"):
             in_fence = not in_fence
-            out_lines.append(style._wrap("38;5;29", "│" + "─" * 4))
+            out_lines.append(style._wrap(theme.HAIR, "│" + "─" * 4))
             continue
         if in_fence:
             out_lines.append(_syntax_highlight(line, style))
             continue
-        # Headings — Vampire.
+        # Headings — bone bold; hairline under H1, ash for H3.
         if stripped.startswith("#"):
             level = len(stripped) - len(stripped.lstrip("#"))
             heading = stripped.lstrip("# ").rstrip()
             if level == 1:
-                out_lines.append(style._wrap("1;38;5;51", heading))
+                out_lines.append(style._wrap(theme.BONE_BOLD, heading))
             elif level == 2:
-                out_lines.append(style._wrap("1;38;5;230", heading))
+                out_lines.append(style._wrap(theme.BONE_BOLD, heading))
             else:
-                out_lines.append(style._wrap("38;5;172", heading))
+                out_lines.append(style._wrap(theme.ASH, heading))
             if level <= 2:
-                bar = style._wrap("38;5;88", chr(0x2500) * 40) if level == 1 else style._wrap("38;5;240", chr(0x2500) * 40)
-                out_lines.append(bar)
+                out_lines.append(style._wrap(theme.HAIR, chr(0x2500) * 40))
             continue
-        # Horizontal rule.
+        # Horizontal rule — hairline.
         if stripped in ("---", "***", "___") and len(stripped) >= 3:
-            out_lines.append(style._wrap("38;5;240", chr(0x2500) * 40))
+            out_lines.append(style._wrap(theme.HAIR, chr(0x2500) * 40))
             continue
-        # Blockquote.
+        # Blockquote — hairline bar, ash text.
         if stripped.startswith(">"):
             quote = stripped[1:].lstrip()
-            out_lines.append(style._wrap("38;5;240", "│ ") + style._wrap("38;5;240", quote))
+            out_lines.append(style._wrap(theme.HAIR, "│ ") + style._wrap(theme.ASH, quote))
             continue
-        # Unordered list — emerald.
+        # Unordered list — ash markers.
         m_list = re.match(r"^(\s*)[-*+]\s+(.*)", line)
         if m_list:
             indent, rest = m_list.group(1), m_list.group(2)
-            out_lines.append(indent + style._wrap("38;5;29", "* ") + _inline_md(rest, style))
+            out_lines.append(indent + style._wrap(theme.ASH, "* ") + _inline_md(rest, style))
             continue
-        # Ordered list — emerald.
+        # Ordered list — ash markers.
         m_ord = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
         if m_ord:
             indent, num, rest = m_ord.group(1), m_ord.group(2), m_ord.group(3)
-            out_lines.append(indent + style._wrap("38;5;29", num + ". ") + _inline_md(rest, style))
+            out_lines.append(indent + style._wrap(theme.ASH, num + ". ") + _inline_md(rest, style))
             continue
-        # Plain code outside fence — still highlight (file/model tanpa wrapper)
+        # Plain code outside a fence still gets highlighted
         if re.match(r"^\s*(import\s|from\s|def\s|class\s|if\s|for\s|while\s|return\b|const\s|let\s|var\s|export\s|require\(|#include|using\s|public\s|private\s|protected\s)", line):
             out_lines.append(_syntax_highlight(line, style))
             continue
@@ -456,32 +512,34 @@ def render_markdown(text: str, style: Style) -> str:
 
 
 def _inline_md(line: str, style: Style) -> str:
-    """Inline markdown: code, bold, italic, strikethrough, links — Vampire."""
+    """Inline markdown: code, bold, italic, strikethrough, links — Blood & Bone."""
     import re as _re
+    # Sentinel tokens shield escaped backticks and asterisks from the
+    # splitters below, and are restored afterwards.
     _ESC = "\x00ESC_BT\x00"
     line_esc = line.replace("\\`", _ESC)
     parts = line_esc.split("`")
     for i in range(0, len(parts)):
         if i % 2 == 1:
-            # Inline code — lime (file-like) on gothic.
-            parts[i] = style._wrap("38;5;82", parts[i].replace(_ESC, "`"))
+            # Inline code — muted sage (file-like paths).
+            parts[i] = style._wrap(theme.SAGE, parts[i].replace(_ESC, "`"))
         else:
             segment = parts[i].replace(_ESC, "`")
-            # Links — aqua (senada ENCHANTER).
+            # Links — the crimson accent (interactive affordance).
             segment = _re.sub(
                 r'\[([^\]]+)\]\([^)]+\)',
-                lambda m: style._wrap("38;5;51", m.group(1).replace("\\[", "[").replace("\\]", "]")),
+                lambda m: style._wrap(theme.BLOOD, m.group(1).replace("\\[", "[").replace("\\]", "]")),
                 segment,
             )
-            # Bold — ivory.
-            segment = _re.sub(r'\*\*(.+?)\*\*', lambda m: style._wrap("1;38;5;230", m.group(1)), segment)
+            # Bold — strong bone.
+            segment = _re.sub(r'\*\*(.+?)\*\*', lambda m: style._wrap(theme.BONE_BOLD, m.group(1)), segment)
             _ESC_STAR = "\x00ESC_ST\x00"
             segment_esc_star = segment.replace("\\*", _ESC_STAR)
-            # Italic — amber.
-            segment_esc_star = _re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', lambda m: style._wrap("38;5;172", m.group(1)), segment_esc_star)
+            # Italic — ash.
+            segment_esc_star = _re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', lambda m: style._wrap(theme.ASH_ITAL, m.group(1)), segment_esc_star)
             segment = segment_esc_star.replace(_ESC_STAR, "*")
-            # File @mentions — amber (biar file pop, beda dari code).
-            # Handled outside, but keep segment as is.
+            # File @mentions are highlighted when the echoed line is built
+            # (outside this renderer); keep the segment as is.
             segment = _re.sub(r'~~(.+?)~~', lambda m: style.strike(m.group(1)), segment)
             parts[i] = segment
     return "`".join(parts).replace(_ESC, "`")
@@ -511,12 +569,7 @@ def _short(count: int) -> str:
 
 
 def _format_elapsed(seconds: float) -> str:
-    """Format elapsed time for display.
-
-    < 60s: '1.6s'
-    >= 60s: '1m23s'
-    >= 3600s: '1h05m'
-    """
+    """Format elapsed time: '1.6s', 'done in 1m23s', 'done in 1h05m'."""
     if seconds < 60:
         return f"{seconds:.1f}s"
     if seconds < 3600:
@@ -569,6 +622,245 @@ def _transcript(messages: list[dict[str, Any]]) -> str:
 
 
 # ------------------------------------------------------------------- session
+
+# Windows console-input constants used by the turn-scoped reader (key
+# records only - the mouse is deliberately left to the host so native
+# text selection keeps working everywhere, including mid-stream).
+_WIN_KEY_EVENT = 0x0001
+# VK codes the reader maps to scroll keys (PgUp/PgDn/arrows).
+_WIN_VK_KEYS = {0x21: KEY_PAGE_UP, 0x22: KEY_PAGE_DOWN, 0x26: KEY_UP, 0x28: KEY_DOWN}
+
+
+def _win_vk_to_key(vk: int) -> str | None:
+    """Map a Windows virtual-key code to a scroll key token."""
+    return _WIN_VK_KEYS.get(int(vk))
+
+
+def _win_wheel_delta(button_state: int) -> int:
+    """Signed wheel delta from MOUSE_EVENT dwButtonState.
+
+    Positive means the wheel rotated away from the user (scroll up), the
+    same direction the SGR wheel-up event (button 64) means elsewhere.
+    """
+    hi = (button_state >> 16) & 0xFFFF
+    if hi == 0 or hi == 0xFFFF:
+        return 0
+    if hi & 0x8000:
+        return hi - 0x10000
+    return hi
+
+
+def _stdin_is_console() -> bool:
+    """True when stdin is a real Windows console (not a pipe)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        handle = ctypes.windll.kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = wintypes.DWORD()
+        return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+    except Exception:
+        return False
+
+
+class _TurnScrollReader:
+    """While a task streams, translate scroll keys into layout scrolls.
+
+    The mouse is never captured - neither SGR reporting on POSIX nor
+    console mouse/quick-edit modes on Windows - so native text selection
+    over the transcript keeps working the whole time, exactly as in a
+    normal terminal. Scrolling while streaming is therefore keyboard
+    driven:
+
+    - POSIX terminals run under cbreak, so PageUp/PageDown/arrow keys
+      arrive per-character; the wheel stays with the host (native).
+    - Windows consoles deliver every key as a console input record, so
+      when stdin is a real console the reader reads KEY_EVENT records
+      only and, for the duration of the stream, pins the console input
+      mode to quick-edit ON + mouse-input OFF. That makes the host
+      handle click-drag selection natively (no MOUSE_EVENTs are ever
+      queued for the app to consume), while keyboard scrolling still
+      arrives as KEY_EVENT records. The mode is restored on stop.
+
+    Every non-scroll key is buffered into the session's preload list so
+    the next prompt delivers it unmodified; Ctrl+O toggles the tool-output
+    boxes, Ctrl+C aborts. Nothing is written to the terminal on start or
+    stop, so the host's mouse handling is never disturbed.
+    """
+
+    def __init__(self, session, layout) -> None:
+        self._session = session
+        self._layout = layout
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        # A bare editor used purely as a key parser (timeout-bounded reads);
+        # it never draws.
+        self._parser = LineEditor(None)
+
+    def start(self) -> None:
+        # No terminal writes at all: the mouse stays with the host so
+        # native text selection works even while a task streams.
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        if _stdin_is_console():
+            # Windows: real console, so read KEY_EVENT records directly
+            # (msvcrt would also work, but records carry the VK codes for
+            # PgUp/PgDn/arrows and need no console-mode changes).
+            try:
+                self._windows_run()
+            except Exception:
+                pass
+            return
+        while not self._stop.is_set():
+            key = self._parser._read_key(stop=self._stop, timeout=0.1)
+            if key is None:
+                continue
+            self._dispatch(key)
+
+    def _windows_run(self) -> None:
+        """Read Windows console input records; mouse records are skipped."""
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", wintypes.BOOL),
+                ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD),
+                ("wVirtualScanCode", wintypes.WORD),
+                ("uChar", ctypes.c_wchar),
+                ("dwControlKeyState", wintypes.DWORD),
+            ]
+
+        class MOUSE_EVENT_RECORD(ctypes.Structure):
+            # Needed for the union layout even though mouse records are
+            # never consumed: ReadConsoleInputW fills whichever record
+            # type the console produced.
+            _fields_ = [
+                ("dwMousePosition", COORD),
+                ("dwButtonState", wintypes.DWORD),
+                ("dwControlKeyState", wintypes.DWORD),
+                ("dwEventFlags", wintypes.DWORD),
+            ]
+
+        class EVENT_UNION(ctypes.Union):
+            _fields_ = [
+                ("KeyEvent", KEY_EVENT_RECORD),
+                ("MouseEvent", MOUSE_EVENT_RECORD),
+            ]
+
+        class INPUT_RECORD(ctypes.Structure):
+            _fields_ = [("EventType", wintypes.WORD), ("Event", EVENT_UNION)]
+
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        # The host must own the mouse while a task streams: with
+        # ENABLE_QUICK_EDIT_MODE on and ENABLE_MOUSE_INPUT off, conhost /
+        # Windows Terminal handle click-drag selection natively and never
+        # queue MOUSE_EVENT records, so every record this reader pulls is a
+        # key (or resize) record. Earlier attempts that mutated the mode
+        # broke selection because they cleared quick-edit or enabled mouse
+        # input; this combination does the opposite. The mode is restored
+        # on stop(), and keyboard scrolling (PgUp/PgDn/arrows) still
+        # arrives as KEY_EVENT records either way.
+        original_mode = None
+        try:
+            mode = wintypes.DWORD()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                original_mode = mode.value
+                if not (original_mode & 0x0040) or (original_mode & 0x0010):
+                    kernel32.SetConsoleMode(
+                        handle,
+                        (original_mode | 0x0040 | 0x0080) & ~0x0010,
+                    )
+        except Exception:
+            original_mode = None
+        try:
+            while not self._stop.is_set():
+                count = wintypes.DWORD()
+                if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
+                    return
+                if not count.value:
+                    time.sleep(0.02)
+                    continue
+                records = (INPUT_RECORD * min(count.value, 64))()
+                read = wintypes.DWORD()
+                if not kernel32.ReadConsoleInputW(
+                    handle, records, len(records), ctypes.byref(read)
+                ):
+                    return
+                for i in range(read.value):
+                    record = records[i]
+                    # Mouse/window/focus records are left to the host: with
+                    # quick-edit on, native selection is handled entirely by
+                    # the console and no MOUSE_EVENTs are queued at all.
+                    if record.EventType != _WIN_KEY_EVENT:
+                        continue
+                    key_event = record.Event.KeyEvent
+                    if not key_event.bKeyDown:
+                        continue
+                    char = key_event.uChar
+                    if char:
+                        self._dispatch(char)
+                        continue
+                    key = _win_vk_to_key(key_event.wVirtualKeyCode)
+                    if key is not None:
+                        self._dispatch(key)
+        finally:
+            if original_mode is not None:
+                try:
+                    kernel32.SetConsoleMode(handle, original_mode)
+                except Exception:
+                    pass
+
+    def _dispatch(self, key) -> None:
+        if isinstance(key, MouseEvent):
+            if key.pressed and key.button in (64, 65):
+                if key.button == 64:
+                    self._layout.scroll_up(3)
+                else:
+                    self._layout.scroll_down(3)
+            # Clicks/drags during streaming: ignore, do not buffer.
+            return
+        if key in (KEY_PAGE_UP, KEY_UP):
+            self._layout.scroll_up(3)
+        elif key in (KEY_PAGE_DOWN, KEY_DOWN):
+            self._layout.scroll_down(3)
+        elif key == KEY_RESIZE:
+            # Terminal grew/shrunk mid-turn; re-layout the chrome and
+            # re-wrap stored lines rather than feeding a bogus key to the
+            # next prompt.
+            try:
+                self._layout.check_resize()
+            except Exception:
+                pass
+        elif key == "\x03":
+            # Ctrl+C reaching the reader as a byte (cbreak on some
+            # terminals still delivers it); mirror the SIGINT handler.
+            session = self._session
+            if not session._abort.is_set():
+                session._abort.set()
+                session._print(session.style.dim("  (stopping after this step - ctrl+c again to quit)"))
+        elif key == "\x0f":
+            # Ctrl+O: show or hide the tool-output boxes mid-run.
+            try:
+                self._session.toggle_tool_output()
+            except Exception:
+                pass
+        else:
+            self._session._scroll_preload.append(key)
+
 
 class ConsoleSession:
     """One REPL session over one persistent local workspace."""
@@ -642,7 +934,7 @@ class ConsoleSession:
         # Model ids discovered from the endpoint, so `/model <tab>` can
         # complete from what is actually served rather than a guess.
         self.known_models: list[str] = []
-        # Last few tool calls, newest last, for the /dashboard overlay.
+        # Last tool calls; retained for compatibility, not read by the UI.
         self.recent_tools: list[str] = []
         # Per-turn cache metrics for trend analysis.
         self.turn_history: list[dict] = []  # [{turn, tokens_in, tokens_out, cache_hit, cache_rate}]
@@ -670,6 +962,16 @@ class ConsoleSession:
         # /goal note <text>: constraints found along the way, decisions
         # made. Shown with the goal so they are not re-litigated.
         self.goal_notes: list[str] = []
+        # The session todo checklist (/todo). Discrete items the operator
+        # wants done, each kept open or done. Injected into every turn's
+        # system prompt like the goal, so an agent working over many
+        # turns can see what remains rather than losing the thread of a
+        # multi-part request.
+        self.todos: list[dict] = []  # [{"text": str, "done": bool}]
+        # Reports the agent emitted on the turn in flight, already applied
+        # inline as its reply streamed. The end-of-turn pass skips them so
+        # nothing is added, checked, or announced twice.
+        self._turn_todo_reports: list[tuple[str, str]] = []  # [(kind, normalised_text)]
         # Skills attached with /skills use <name>. Their procedures ride
         # along in the system prompt so the agent follows them rather
         # than improvising, which is the whole point of a skill existing.
@@ -703,6 +1005,36 @@ class ConsoleSession:
         self._splash_visible = True
         self._abort = threading.Event()
         self._prev_sigint = None
+        # Keys the turn-scoped scroll reader buffered while a task streamed
+        # (non-scroll input). The prompt editor drains these before touching
+        # the terminal, so typing during a turn is not lost.
+        self._scroll_preload: list[str] = []
+        # Rendered fragments deferred while the terminal host was performing
+        # a native mouse selection (Windows). Flushed once the drag ends so
+        # streaming repaints never disturb the selection.
+        self._deferred_stream: list[str] = []
+        # Pre-edit file snapshots keyed by workspace-relative path, taken
+        # at tool_call time so tool_result can render a real before/after
+        # diff of what the agent changed. None means the file did not
+        # exist yet (a fresh write). Cleared at the end of every turn.
+        self._edit_snapshots: dict[str, str | None] = {}
+        self._last_edit_path: str | None = None
+        # Last read_file path / run_command text, so the observation
+        # boxes that follow each step can title themselves.
+        self._last_read_path: str | None = None
+        self._last_command: str | None = None
+        self._last_shell_task: str | None = None
+        # Ctrl+O during a run toggles whether tool-output boxes print.
+        self._show_tool_output = True
+        # Tool output too big for one screenful is queued here (title,
+        # remaining lines) by the box renderers; an empty Enter at the
+        # prompt pages through it a screenful at a time. Holds reads,
+        # commands, diffs and background-task logs alike.
+        self._pending_pages: list[tuple[str, list[str]]] = []
+        # Parallel to _pending_pages: True when the queued lines are
+        # already fully styled (diff panes) instead of raw text that the
+        # pager must run through _row().
+        self._pending_styled: list[bool] = []
 
     # Compat shims: deprecated, no-op (compact is sole TUI).
 
@@ -722,9 +1054,12 @@ class ConsoleSession:
         )
 
     def prompt_text(self, body: str = "") -> str:
-        """Gold prompt — fixed at bottom when layout active."""
+        """Prompt label — fixed at bottom when layout active."""
         if not body:
-            body = self.style.bright_yellow("\u2502 MANTRA > ") if self.style.enabled else "\u2502 MANTRA > "
+            if self.style.enabled:
+                body = self.style.hair("\u2502 ") + self.style.bone("MANTRA > ")
+            else:
+                body = "\u2502 MANTRA > "
         if self.layout is not None and self.layout.active:
             return self.layout.prompt_text(body)
         return body
@@ -779,40 +1114,489 @@ class ConsoleSession:
         else:
             yield
 
-    def _format_diff(self, diff_text: str, max_lines: int = 60) -> str:
-        """Colour a unified diff — wrapped so it always gets syntax color."""
+    def _format_diff(self, diff_text: str, max_lines: int = 60, title: str = "") -> str:
+        """Colour a unified diff inside a small box, optionally titled."""
         if not diff_text:
             return ""
         lines = diff_text.splitlines()
+        total = len(lines)
         if len(lines) > max_lines:
             lines = lines[:max_lines]
-            lines.append(self.style.dim(f"... ({len(diff_text.splitlines()) - max_lines} more lines)"))
-        out = [self.style._wrap("38;5;29", "┌" + "─" * 38)]
+            lines.append(self.style.dim(f"... ({total - max_lines} more lines)"))
+        if title:
+            top = self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.BONE, title)
+        else:
+            top = self.style._wrap(theme.HAIR, "┌" + "─" * 38)
+        out = [top]
         for line in lines:
             if line.startswith("+"):
-                out.append(self.style._wrap("38;5;82", "│ " + line))
+                out.append(self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.SAGE, line))
             elif line.startswith("-"):
-                out.append(self.style._wrap("38;5;203", "│ " + line))
-            elif line.startswith("@@"):
-                out.append(self.style._wrap("38;5;240", "│ " + line))
+                out.append(self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.EMBER, line))
             else:
-                out.append(self.style._wrap("38;5;240", "│ " + line))
-        out.append(self.style._wrap("38;5;29", "└" + "─" * 38))
+                out.append(self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.FAINT, line))
+        out.append(self.style._wrap(theme.HAIR, "└" + "─" * 38))
         return "\n".join(out)
+
+    def _file_text(self, rel: str) -> str | None:
+        """Full text of a workspace-relative file, or None when unreadable."""
+        if not rel:
+            return None
+        full = os.path.join(self.workspace, rel)
+        try:
+            if not os.path.isfile(full):
+                return None
+            if os.path.getsize(full) > 1_000_000:
+                return None
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except Exception:
+            return None
+
+    def _render_file_change(self, tool: str, result: str) -> str:
+        """Readable result of edit_file / write_file.
+
+        edit_file gets a coloured before/after diff against the snapshot
+        taken when the tool_call arrived; write_file shows a syntax
+        preview of the new file. Falls back to the tool's own message
+        when the file is missing or too large to snapshot, so the
+        operator always sees the file that was just edited, capped and
+        wrapped instead of dumped raw.
+        """
+        path = self._last_edit_path or ""
+        new = self._file_text(path) if path else None
+        if new is None:
+            if isinstance(result, str) and result.strip():
+                return self._format_diff(result.strip(), max_lines=20)
+            return ""
+        old = self._edit_snapshots.get(path)
+        if tool == "write_file" and old is None:
+            # A brand-new file: syntax preview, capped so a long file
+            # stays readable.
+            lines = new.splitlines()
+            total = len(lines)
+            if total > 120:
+                lines = lines[:120]
+            out = [self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.SAGE, "✓ ") + self.style._wrap(theme.BONE, f"wrote {path} ({total} lines)")]
+            for line in lines:
+                out.append(_syntax_highlight(line, self.style))
+            if total > 120:
+                out.append(self.style.dim(f"  ... {total - 120} more lines"))
+            out.append(self.style._wrap(theme.HAIR, "└" + "─" * 38))
+            return "\n".join(out)
+        body = "\n".join(
+            difflib.unified_diff(
+                (old or "").splitlines(),
+                new.splitlines(),
+                fromfile=path + " (before)",
+                tofile=path + " (after)",
+                lineterm="",
+                n=2,
+            )
+        )
+        if body.strip():
+            pane = self._diff_pane_rows(body, max_lines=220)
+            if pane is not None:
+                return self._box(f"✎ edited {path}", pane)
+            return self._format_diff(body, max_lines=220, title=f"✎ edited {path}")
+        if isinstance(result, str) and result.strip():
+            return self._format_diff(result.strip(), max_lines=20)
+        return ""
+
+    # Tool-output boxes are budgeted in *viewport rows*, not raw lines: one
+    # long line can wrap to several screen rows, and a huge read or log dump
+    # must not flood the viewport mid-run. Roughly a screenful is shown and
+    # the rest is noted - never dropped silently. Reads that overflow are
+    # queued and can be paged through with an empty Enter at the prompt.
+    _TOOL_OUTPUT_BUDGET_ROWS = 36
+    _READ_PAGE_ROWS = 24
+    _OUTPUT_COLS_FALLBACK = 80
+
+    def toggle_tool_output(self) -> None:
+        """Flip whether run/read/git boxes print while the agent works."""
+        self._show_tool_output = not self._show_tool_output
+        state = "on" if self._show_tool_output else "off"
+        self._print(self.style.dim(f"  (tool output boxes {state} — ctrl+o to toggle)"))
+
+    def _output_cols(self) -> int:
+        """Current viewport width, or a sane default when not on a TUI."""
+        try:
+            layout = getattr(self, "layout", None)
+            cols = getattr(layout, "_cols", 0)
+            if layout is not None and getattr(layout, "active", False) and cols >= 30:
+                return int(cols)
+        except Exception:
+            pass
+        return self._OUTPUT_COLS_FALLBACK
+
+    def _row_cost(self, line: str) -> int:
+        """Approx wrapped screen rows one line will occupy inside a box."""
+        cols = max(1, self._output_cols())
+        width = visible_len(line) + 2  # '│ ' gutter
+        return max(1, (width + cols - 1) // cols)
+
+    def _rows_of(self, lines: list[str]) -> int:
+        return sum(self._row_cost(ln) for ln in lines)
+
+    def _head_lines(self, lines: list[str], budget: int) -> tuple[list[str], int]:
+        """Take from the start of a stream until the row budget is spent."""
+        shown: list[str] = []
+        used = 0
+        for ln in lines:
+            cost = self._row_cost(ln)
+            if used + cost > budget and shown:
+                break
+            shown.append(ln)
+            used += cost
+        return shown, len(lines) - len(shown)
+
+    def _box(self, title: str, body: list[str]) -> str:
+        """Assemble a titled box with '│ ' gutter rows."""
+        out = [self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.BONE, title)]
+        out.extend(body)
+        out.append(self.style._wrap(theme.HAIR, "└" + "─" * 38))
+        return "\n".join(out)
+
+    def _row(self, ln: str) -> str:
+        """One styled '│ ' gutter row inside a tool-output box."""
+        if ln.startswith("exit_code:"):
+            code = -1
+            try:
+                code = int(ln.split(":", 1)[1].split()[0])
+            except Exception:
+                pass
+            color = theme.SAGE if code == 0 else theme.EMBER
+            return self.style._wrap(color, "│ " + ln)
+        if ln.startswith(("stdout:", "stderr:", "log:", "Note:")):
+            return self.style._wrap(theme.FAINT, "│ " + ln)
+        if ln.startswith("+") and not ln.startswith("+++"):
+            return self.style._wrap(theme.SAGE, "│ " + ln)
+        if ln.startswith("-") and not ln.startswith("---"):
+            return self.style._wrap(theme.EMBER, "│ " + ln)
+        if ln.startswith(("@@", "index ", "diff --git", "--- ", "+++ ")):
+            return self.style._wrap(theme.FAINT, "│ " + ln)
+        return "│ " + ln
+
+    # ---- before/after diff panes ---------------------------------------
+    #
+    # Structured unified diffs (agent edits, /diff, git-diff boxes) render
+    # as two stacked panes per hunk instead of a +/- line stream: first
+    # the before-state with removed lines in a soft dusty red, then the
+    # after-state with added lines in a soft sage green - text colour
+    # only, no backgrounds. A context line exists on both sides, so it is
+    # shown only once - in the pane whose change sits nearest - which
+    # keeps each pane anchored without doubling the code.
+
+    def _pane_row(self, body: str, code: str | None) -> str:
+        """One '│ ' gutter row; *code* colours the changed text softly."""
+        gutter = self.style._wrap(theme.HAIR, "│ ")
+        if not code:
+            return gutter + body
+        return gutter + self.style._wrap(code, body)
+
+    def _pane_chip(self, label: str) -> str:
+        """A small 'old' / 'new' marker row that opens a pane."""
+        return self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.ASH, label)
+
+    def _diff_pane_rows(self, diff_text: str, max_lines: int = 60) -> list[str] | None:
+        """Styled old/new pane rows for a unified diff.
+
+        Returns None when *diff_text* is not a parseable unified diff (no
+        hunks, or foreign content before the first hunk), so callers can
+        fall back to the plain diff renderer.
+        """
+        groups: list[tuple[str | None, str | None, list[list[str]]]] = []
+        cur: tuple[str | None, str | None, list[list[str]]] | None = None
+        hunk: list[str] | None = None
+        seen_hunk = False
+        for ln in diff_text.splitlines():
+            if ln.startswith("--- "):
+                cur = [ln[4:].strip(), None, []]
+                groups.append(cur)
+                hunk = None
+            elif ln.startswith("+++ "):
+                if cur is None:
+                    cur = [None, None, []]
+                    groups.append(cur)
+                cur[1] = ln[4:].strip()
+            elif ln.startswith("@@"):
+                if cur is None:
+                    cur = [None, None, []]
+                    groups.append(cur)
+                hunk = []
+                cur[2].append(hunk)
+                seen_hunk = True
+            elif hunk is not None and ln[:1] in (" ", "-", "+"):
+                hunk.append(ln)
+            elif not seen_hunk and ln and not ln.startswith(
+                ("diff ", "index ", "new file", "deleted file", "old mode", "new mode", "similarity ", "rename ", "Binary ")
+            ):
+                # Foreign content before any hunk (command output, notes):
+                # this is not a diff we should pane-ify.
+                return None
+        if not any(hs for _, _, hs in groups):
+            return None
+
+        def _file_base(label: str | None) -> str | None:
+            """'a/src/x.py' -> 'src/x.py'; 'x.py (after)' -> 'x.py'."""
+            if not label:
+                return None
+            base = label.replace("\\", "/")
+            if base.startswith(("a/", "b/")):
+                base = base[2:]
+            for suffix in (" (before)", " (after)"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+            return base or None
+
+        rows: list[str] = []
+        for old_lbl, new_lbl, hunks in groups:
+            # A per-file chip before a group's first hunk. Agent-edit diffs
+            # already name the file in their box title (labels end in
+            # "(before)"), so only git-style output gets the chip.
+            file_base = _file_base(old_lbl or new_lbl)
+            git_style = not ((old_lbl or "").endswith(" (before)") and (new_lbl or "").endswith(" (after)"))
+            if file_base and git_style:
+                rows.append(self._pane_chip(file_base))
+            for hunk_lines in hunks:
+                seq: list[tuple[str, str]] = []
+                for ln in hunk_lines:
+                    seq.append((ln[0], ln[1:]))
+                minus_idx = [i for i, (kind, _) in enumerate(seq) if kind == "-"]
+                plus_idx = [i for i, (kind, _) in enumerate(seq) if kind == "+"]
+                old: list[tuple[str, bool]] = []
+                new: list[tuple[str, bool]] = []
+                for i, (kind, body) in enumerate(seq):
+                    if kind == "-":
+                        old.append((body, True))
+                    elif kind == "+":
+                        new.append((body, True))
+                    else:
+                        # Context is identical on both sides: show it once,
+                        # in whichever pane holds the change nearest it.
+                        d_old = min((abs(i - j) for j in minus_idx), default=10**9)
+                        d_new = min((abs(i - j) for j in plus_idx), default=10**9)
+                        if d_old <= d_new:
+                            old.append((body, False))
+                        else:
+                            new.append((body, False))
+                if old:
+                    rows.append(self._pane_chip("old"))
+                    rows.extend(self._pane_row(b, theme.DIFF_REMOVE if changed else None) for b, changed in old)
+                if new:
+                    rows.append(self._pane_chip("new"))
+                    rows.extend(self._pane_row(b, theme.DIFF_ADD if changed else None) for b, changed in new)
+        total = len(rows)
+        if total > max_lines:
+            rows = rows[:max_lines]
+            rows.append(
+                self.style._wrap(theme.HAIR, "│ ")
+                + self.style._wrap(theme.FAINT, f"… {total - max_lines} more diff lines")
+            )
+        return rows
+
+    def _render_diff_pages(self, title: str, rows: list[str], lead: list[str] | None = None) -> str:
+        """Box for pre-styled diff-pane rows, paged like other tool boxes."""
+        lead_rows = [self._row(ln) for ln in (lead or [])]
+        if self._rows_of(lead_rows) + self._rows_of(rows) <= self._TOOL_OUTPUT_BUDGET_ROWS:
+            return self._box(title, lead_rows + rows)
+        preview, _ = self._head_lines(rows, self._READ_PAGE_ROWS)
+        remaining = rows[len(preview):]
+        if remaining:
+            self._pending_pages.append((title, remaining))
+            self._pending_styled.append(True)
+        shown = lead_rows + preview
+        shown.append(
+            self.style.dim(
+                f"│ … {len(remaining)} more rows — press Enter (empty prompt) to page through the diff"
+            )
+        )
+        return self._box(title, shown)
+
+    def _render_paged_box(self, title: str, content: list[str], lead: list[str] | None = None) -> str:
+        """Box for any tool output that may exceed a screenful.
+
+        Fits the budget → shown whole. Overflows → a compact first page
+        and the remainder queued (title + lines) for the empty-Enter
+        pager, so nothing is lost and the viewport is never flooded
+        mid-run - reads, commands, diffs and background logs alike.
+        """
+        lead_rows = lead or []
+        if self._rows_of(lead_rows) + self._rows_of(content) <= self._TOOL_OUTPUT_BUDGET_ROWS:
+            rows = [self._row(ln) for ln in lead_rows] + [self._row(ln) for ln in content]
+            return self._box(title, rows)
+        preview, _ = self._head_lines(content, self._READ_PAGE_ROWS)
+        remaining = content[len(preview):]
+        if remaining:
+            self._pending_pages.append((title, remaining))
+            self._pending_styled.append(False)
+        rows = [self._row(ln) for ln in lead_rows] + [self._row(ln) for ln in preview]
+        rows.append(
+            self.style.dim(
+                f"│ … {len(remaining)} more lines — press Enter (empty prompt) to page through the output"
+            )
+        )
+        return self._box(title, rows)
+
+    def _on_tool_observation(self, tool: str, observation: str, step: int) -> None:
+        """Show what a tool returned while the agent works.
+
+        Event payloads and the run log deliberately avoid carrying file
+        contents or command output, so the agent loop hands display-worthy
+        observations straight to the console: the operator sees the command
+        output, diffs and file contents the agent sees, not just the tool
+        name. Ctrl+O (typed mid-run) hides or restores these boxes.
+        """
+        if not self._show_tool_output:
+            return
+        if not isinstance(observation, str) or not observation.strip():
+            return
+        try:
+            if tool in ("run_command", "git_diff", "git_reset"):
+                kind = {"run_command": "run_command", "git_diff": "git diff", "git_reset": "git reset"}[tool]
+                shown = self._render_command_result(observation, kind=kind)
+            elif tool == "shell_output":
+                shown = self._render_shell_output(observation)
+            elif tool == "read_file":
+                shown = self._render_read_result(observation)
+            else:
+                return
+        except Exception:
+            return
+        if shown:
+            self._print(shown)
+
+    def _render_command_result(self, observation: str, kind: str = "run_command") -> str:
+        """Boxed transcript view of a run_command / git_diff observation."""
+        raw = _sanitize_output(observation).replace("\r", "").splitlines()
+        lines = [ln for ln in raw if ln.strip() not in ("<<<UNTRUSTED_TASK_OUTPUT", ">>>")]
+        if not lines:
+            return ""
+        # Exit line and any notes ride above the first output section.
+        split = len(lines)
+        for i, ln in enumerate(lines):
+            if ln.startswith(("stdout:", "stderr:", "log:")):
+                split = i
+                break
+        header = lines[:split]
+        body = lines[split:]
+        if split == len(lines):
+            # No stdout:/stderr: sections: the whole observation is
+            # content (e.g. a raw git diff). Color it like a diff.
+            header = []
+            body = lines
+        command = (getattr(self, "_last_command", None) or "").replace("\r", "").replace("\n", " ")
+        if kind == "run_command" and command:
+            title = f"$ {command}"
+        else:
+            title = kind
+        # git diff / git reset observations that are real unified diffs
+        # render as old/new panes; anything else keeps the generic box.
+        if kind in ("git diff", "git reset") and body:
+            pane = self._diff_pane_rows("\n".join(body), max_lines=4000)
+            if pane is not None:
+                return self._render_diff_pages(title, pane, lead=header or None)
+        return self._render_paged_box(title, body, lead=header or None)
+
+    def _render_shell_output(self, observation: str) -> str:
+        """Boxed view of a background-task log read (shell_output)."""
+        raw = _sanitize_output(observation).replace("\r", "").splitlines()
+        lines = [ln for ln in raw if ln.strip() not in ("<<<UNTRUSTED_TASK_OUTPUT", ">>>")]
+        if not lines:
+            return ""
+        task = getattr(self, "_last_shell_task", None)
+        title = f"shell_output {task}" if task else "shell_output"
+        return self._render_paged_box(title, lines)
+
+    def _render_read_result(self, observation: str) -> str:
+        """Boxed transcript view of a read_file observation."""
+        raw = _sanitize_output(observation).replace("\r", "").splitlines()
+        notes = [ln for ln in raw if ln.startswith("Note:")]
+        content = [ln for ln in raw if not ln.startswith("Note:")]
+        path = getattr(self, "_last_read_path", None) or "?"
+        return self._render_paged_box(f"read {path}", content, lead=notes or None)
+
+    def _pending_pages_snapshot(self) -> list[list]:
+        """JSON-safe copy of the pager queue (title + remaining lines).
+
+        Persisted so an interrupted paging session can resume where it
+        left off. Content is raw observation text or pre-styled diff
+        rows - either way it is the same data already carried in the
+        session's tool messages, so no new content is written to disk.
+        """
+        return [[title, list(lines)] for title, lines in self._pending_pages]
+
+    def _restore_pending_pages(self, data: dict) -> int:
+        """Rebuild the pager queue from a session payload.
+
+        Returns the number of boxes restored so the caller can surface a
+        hint. Garbage entries are dropped defensively; old session files
+        without the field simply leave the queue empty. Pre-styled rows
+        (diff panes, detected by their ANSI escapes) restore as styled so
+        the pager prints them verbatim instead of re-colouring them.
+        """
+        raw = data.get("pending_pages")
+        restored: list[tuple[str, list[str]]] = []
+        styled_flags: list[bool] = []
+        if isinstance(raw, list):
+            for entry in raw[:100]:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    continue
+                title, lines = entry
+                if not isinstance(title, str) or not isinstance(lines, list):
+                    continue
+                content = [ln for ln in lines if isinstance(ln, str)]
+                if content:
+                    restored.append((title, content))
+                    styled_flags.append(any(ln.startswith("\x1b") for ln in content))
+        self._pending_pages = restored
+        self._pending_styled = styled_flags
+        return len(restored)
+
+    def page_next(self) -> bool:
+        """Print the next screenful of a queued capped box.
+
+        Called by the REPL when Enter is pressed with an empty prompt. The
+        queue holds any tool output - reads, commands, diffs, background
+        logs - that overflowed a screenful during the run. Returns True
+        while more pages remain.
+        """
+        if not self._pending_pages:
+            return False
+        title, content = self._pending_pages[0]
+        styled = bool(self._pending_styled[0]) if self._pending_styled else False
+        if not content:
+            self._pending_pages.pop(0)
+            if self._pending_styled:
+                self._pending_styled.pop(0)
+            if not self._pending_pages:
+                self._print(self.style.dim(f"  (end of {title})"))
+            return bool(self._pending_pages)
+        chunk, _ = self._head_lines(content, self._READ_PAGE_ROWS)
+        del content[: len(chunk)]
+        # Diff panes are queued fully styled; raw boxes run through _row.
+        rows = list(chunk) if styled else [self._row(ln) for ln in chunk]
+        if content:
+            rows.append(
+                self.style.dim(
+                    f"│ … {len(content)} more lines — Enter (empty prompt) for the next page"
+                )
+            )
+        self._print(self._box(f"{title} (continued)", rows))
+        if not content:
+            # Last page of this box consumed: drop it and surface the end.
+            self._pending_pages.pop(0)
+            if self._pending_styled:
+                self._pending_styled.pop(0)
+            if not self._pending_pages:
+                self._print(self.style.dim(f"  (end of {title})"))
+        return bool(self._pending_pages)
 
     def _note(self, text: str) -> None:
         self._print(f"  {self.style.dim(text)}")
 
     def fresh_line(self) -> None:
-        """End the row the operator is on and start a clean one.
-
-        The prompt and the secret reader own their own line, so a frame
-        row is left open underneath the caret when they finish. Anything
-        the app draws next - the dashboard, a menu, a new reply - has to
-        start below that line, not beside it. Starting on the open row
-        would glue a ``│`` onto the prompt and push every later row a
-        column past the border.
-        """
+        """End the current row and start a clean one below it."""
         out = sys.stdout
         out.write("\n")
         out.flush()
@@ -830,12 +1614,27 @@ class ConsoleSession:
                 path = args.get("path") or args.get("directory") or ""
                 if path:
                     detail = f" {self.style.dim('>')} {self.style.dim(path.upper())}"
+                    if tool in ("write_file", "edit_file"):
+                        # Snapshot the file before the edit lands so the
+                        # tool_result can paint a real before/after diff.
+                        self._last_edit_path = path
+                        self._edit_snapshots[path] = self._file_text(path)
+                    elif tool == "read_file":
+                        # Remembered so the read_file result box can name
+                        # the file when the observation arrives.
+                        self._last_read_path = path
             elif tool == "run_command":
                 cmd = args.get("command") or ""
+                self._last_command = cmd
                 if cmd:
                     detail = f" {self.style.dim('>')} {self.style.dim(cmd[:60].upper())}{'...' if len(cmd) > 60 else ''}"
-            # Keep Chanting visible during tool steps — write without pausing spinner, keep cursor at prompt
-            msg = f"  {self.style.dim(f'* STEP {step}')} {self.style._wrap('38;5;51', tool.upper())}{detail}"
+            elif tool == "shell_output":
+                task_id = args.get("task_id") or ""
+                if task_id:
+                    self._last_shell_task = str(task_id)
+                    detail = f" {self.style.dim('>')} {self.style.dim(str(task_id).upper())}"
+            # Show the tool step line while the spinner keeps running.
+            msg = f"  {self.style.dim(f'* STEP {step}')} {self.style._wrap(theme.BONE_BOLD, tool.upper())}{detail}"
             if self.layout is not None and self.layout.active:
                 try:
                     self.layout.write(msg + "\n")
@@ -843,10 +1642,9 @@ class ConsoleSession:
                         self.layout.draw_prompt("")
                     except Exception:
                         pass
-                    # Redraw Chanting/Channeling border so it doesn't disappear
+                    # Nudge the spinner to repaint its border immediately.
                     if getattr(self, "_spinner", None) is not None and getattr(self._spinner, "_layout", None) is not None:
                         try:
-                            # Force spinner border redraw
                             self._spinner._last_render = 0
                         except Exception:
                             pass
@@ -855,45 +1653,23 @@ class ConsoleSession:
             else:
                 self._print(msg)
         elif name == "tool_denied":
-            self._print(f"  {self.style.red('✗ DENIED')} {self.style.dim(payload.get('tool','').upper())}")
+            self._print(f"  {self.style._wrap(theme.EMBER, '✗ DENIED')} {self.style.dim(payload.get('tool','').upper())}")
         elif name == "run_error":
-            self._print(f"  {self.style.red('!! ' + str(payload.get('error')))}")
+            self._print(f"  {self.style._wrap(theme.EMBER, '!! ' + str(payload.get('error')))}")
         elif name == "tool_result":
             tool = payload.get("tool")
             result = payload.get("result")
             ok = payload.get("ok")
             seconds = payload.get("seconds")
-            # Show code for file-edit tools — must be visible in conversation with wrapper
+            # Show what changed on disk for file-edit tools: a coloured
+            # before/after diff for edits, a syntax preview for newly
+            # written files — the operator sees the file being edited as
+            # the agent works instead of a bare OK line.
             if tool in ("edit_file", "write_file"):
-                if ok and isinstance(result, str) and result.strip().startswith("OK"):
-                    # Parse path from OK message and show file content with highlight
-                    try:
-                        m = __import__("re").search(r"to\s+(\S+)", result) if "wrote" in result else __import__("re").search(r"edited\s+(\S+)", result)
-                        path = m.group(1).strip().strip("'\"") if m else ""
-                        if path:
-                            try:
-                                full = __import__("os").path.join(self.workspace, path)
-                                if __import__("os").path.isfile(full):
-                                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                                        body = fh.read(8000)
-                                    # Wrap in code fence so syntax highlight applies
-                                    ext = __import__("os").path.splitext(path)[1].lstrip(".") or "txt"
-                                    self._print(self.style._wrap("38;5;29", f"┌ {path} ──"))
-                                    for line in body.splitlines()[:60]:
-                                        self._print(_syntax_highlight(line, self.style))
-                                    self._print(self.style._wrap("38;5;29", "└" + "─" * 38))
-                                    if len(body.splitlines()) > 60:
-                                        self._print(self.style.dim(f"... {len(body.splitlines())-60} more lines"))
-                                else:
-                                    self._print(self._format_diff(result.strip()))
-                            except Exception:
-                                self._print(self._format_diff(result.strip()))
-                        else:
-                            self._print(self._format_diff(result.strip()))
-                    except Exception:
-                        self._print(self._format_diff(result.strip()))
-                elif isinstance(result, str) and result.strip():
-                    self._print(self._format_diff(result.strip()))
+                if ok and isinstance(result, str) and result.strip():
+                    shown = self._render_file_change(tool, result)
+                    if shown:
+                        self._print(shown)
                 elif self.verbose:
                     detail = self.style.dim("OK" if ok else "FAILED")
                     self._print(f"    {detail} {seconds}s")
@@ -916,21 +1692,41 @@ class ConsoleSession:
         self._stream_tokens += max(1, len(piece) // 4)
         rendered = self._stream_renderer.render_piece(piece)
         if self.layout is not None and self.layout.active:
-            if not self._stream_header_done:
-                self.layout.write(f"{self.style.neon_title('ENCHANTER')} ")
-                self._stream_header_done = True
-            self.layout.write(rendered)
-            # Ensure partial line is eventually flushed even if throttled
-            # The compact viewport throttles short fragments; schedule a
-            # flush via the layout's flush method on next counter update
-            # or via explicit flush at handle() tail.
+            # The terminal host owns the mouse during streaming: while a
+            # native click-drag selection is in progress (Windows), every
+            # repaint would disturb the drag, so defer the fragment and
+            # flush everything once the selection completes.
+            if selection_in_progress():
+                self._deferred_stream.append(rendered)
+                return
+            self._flush_deferred_stream()
+            self._stream_write(rendered)
+            # Live token counter; the throttled fragment is flushed at
+            # the handle() tail.
             self._update_live_counter()
         else:
             if not self._stream_header_done:
-                sys.stdout.write(f"{self.style.neon_title('ENCHANTER')} ")
+                sys.stdout.write(f"{self.style.brand('ENCHANTER')} ")
                 self._stream_header_done = True
-            sys.stdout.write(rendered)
+            _safe_stdout(rendered)
             sys.stdout.flush()
+        self._streamed_this_run = True
+
+    def _stream_write(self, text: str) -> None:
+        """Route one rendered fragment into the compact viewport."""
+        if not self._stream_header_done:
+            self.layout.write(f"{self.style.brand('ENCHANTER')} ")
+            self._stream_header_done = True
+        self.layout.write(text)
+
+    def _flush_deferred_stream(self) -> None:
+        """Flush fragments buffered while a native selection was active."""
+        if not self._deferred_stream:
+            return
+        buffered = self._deferred_stream
+        self._deferred_stream = []
+        for text in buffered:
+            self._stream_write(text)
         self._streamed_this_run = True
 
     def _update_live_counter(self) -> None:
@@ -942,26 +1738,25 @@ class ConsoleSession:
         if now - self._last_counter_update < 0.1:
             return
         self._last_counter_update = now
-        # Use short form (1.2k) and caps for visual consistency with top bar; prompt stays gold, counter is bright cyan for visibility
+        # Short form (1.2k); the label stays bone while the live counter sits faint to its right.
         tok_str = _short(self._stream_tokens)
-        counter = self.style.bright_cyan(f" {tok_str} TOK ↓ ")
         if self.style.enabled:
-            body = self.style.bright_yellow("\u2502 MANTRA >") + counter
+            counter = self.style._wrap(theme.FAINT, f" {tok_str} tok ↓")
+            body = self.style.hair("\u2502 ") + self.style.bone("MANTRA >") + counter
         else:
-            body = "\u2502 MANTRA >" + counter
+            body = "\u2502 MANTRA >" + f" {tok_str} tok ↓"
         self.layout.draw_prompt(body=body)
 
     # ---- approvals -------------------------------------------------------
 
     def _ask(self, prompt: str) -> str:
         """Terminal prompt for the approval policy. Returns y / n / a."""
-        # Retire the spinner for the rest of the run: it would otherwise keep
-        # redrawing its frame on top of the prompt while we wait for an answer.
+        # Retire the spinner while the operator answers the prompt.
         if self._spinner:
             self._spinner.stop(clear=True)
             self._spinner = None
         self._print("")
-        self._print(f"  {self.style.yellow('allow?')} {prompt}")
+        self._print(f"  {self.style.bold('allow?')} {prompt}")
         self._print(self.style.dim("  [y]es   [n]o   [a]lways for this session"))
         try:
             if self.frame is not None:
@@ -1005,7 +1800,9 @@ class ConsoleSession:
 
         # Normalize: a root given with forward slashes compares unequal to
         # normpath output on Windows, which made every mention "no match".
-        root = os.path.abspath(self.sandbox.root)
+        # Realpath (not just abspath) so the containment checks below and
+        # in _resolve_mention measure against the same canonical root.
+        root = os.path.realpath(os.path.abspath(self.sandbox.root))
         blocks: list[str] = []
         attached: list[str] = []
         total = 0
@@ -1048,10 +1845,18 @@ class ConsoleSession:
                     self._note("attachment budget reached - remaining mentions skipped")
                     break
                 full = os.path.join(root, rel)
+                # Re-validate at read time: the path could have been
+                # swapped for a symlink since the mention was resolved.
+                # Resolve again so the containment check sits as close
+                # to the open as possible, then render the canonical
+                # path itself.
+                real = os.path.realpath(full)
+                if real != root and not real.startswith(root + os.sep):
+                    continue
                 block = (
-                    self._render_listing(rel, full)
-                    if os.path.isdir(full)
-                    else self._render_file(rel, full)
+                    self._render_listing(rel, real)
+                    if os.path.isdir(real)
+                    else self._render_file(rel, real)
                 )
                 if not block:
                     continue
@@ -1067,11 +1872,10 @@ class ConsoleSession:
         """Resolve one mention to workspace-relative paths. Escapes refused."""
         root = os.path.realpath(os.path.abspath(root))
         # Robust trimming: quotes and trailing punctuation, and leading ./
-        orig = token
         token = token.strip().strip("'\"`").rstrip(_MENTION_TRIM).strip("'\"`")
         if not token:
             return []
-        # Try case-insensitive existence check on Windows by probing both forms
+        # Normalize separators to the host's convention before probing.
         candidate = token.replace("/", os.sep).replace("\\", os.sep)
         if "*" in token:
             # Normalize pattern for glob: use forward slashes for root_dir glob
@@ -1163,38 +1967,70 @@ class ConsoleSession:
             )
             if skill.resources:
                 prompt += "\n\nBundled with this skill: " + ", ".join(skill.resources)
-        if not self.goal:
+        if not self.goal and not self.todos:
             # Re-apply cap even when only skills were added
             TOTAL_CAP = 20000
             if len(prompt) > TOTAL_CAP:
                 prompt = prompt[:TOTAL_CAP] + "\n... [truncated — system prompt exceeded cap]"
             return prompt
-        lines = [
-            "",
-            "## Standing goal",
-            "The operator set this goal for the session. It outlives any",
-            "single message: work toward it on every turn, and treat the",
-            "current request as a step within it rather than a replacement.",
-            "",
-            f"Goal: {self.goal}",
-        ]
-        if self.goal_notes:
+        lines: list[str] = []
+        if self.goal:
+            lines += [
+                "",
+                "## Standing goal",
+                "The operator set this goal for the session. It outlives any",
+                "single message: work toward it on every turn, and treat the",
+                "current request as a step within it rather than a replacement.",
+                "",
+                f"Goal: {self.goal}",
+            ]
+            if self.goal_notes:
+                lines.append("")
+                lines.append("Notes recorded while working toward it:")
+                for note in self.goal_notes:
+                    lines.append(f"- {note}")
             lines.append("")
-            lines.append("Notes recorded while working toward it:")
-            for note in self.goal_notes:
-                lines.append(f"- {note}")
-        lines.append("")
-        lines.append(
-            "When the goal is fully met, say so plainly in your final "
-            "message and start it with GOAL COMPLETE so the operator can "
-            "clear it without checking by hand. Do not claim it is "
-            "complete until it actually is."
-        )
+            lines.append(
+                "When the goal is fully met, say so plainly in your final "
+                "message and start it with GOAL COMPLETE so the operator can "
+                "clear it without checking by hand. Do not claim it is "
+                "complete until it actually is."
+            )
+        if self.todos:
+            lines += self._todos_prompt_lines()
         prompt = prompt + "\n" + "\n".join(lines)
         TOTAL_CAP = 20000
         if len(prompt) > TOTAL_CAP:
-            prompt = prompt[:TOTAL_CAP] + "\n... [truncated — prompt exceeded cap after skill/goal injection]"
+            prompt = prompt[:TOTAL_CAP] + "\n... [truncated — prompt exceeded cap after goal/todo injection]"
         return prompt
+
+    def _todos_prompt_lines(self) -> list[str]:
+        """The session checklist as prompt lines - every item, with its state.
+
+        Completed items stay listed (struck through) rather than being
+        pruned, because the checklist is the shared record: an agent that
+        has seen an item all session should not suddenly find it gone.
+        """
+        open_count = sum(1 for t in self.todos if not t["done"])
+        state = "all done" if not open_count else f"{open_count} open"
+        lines = ["", "## Session todo list", f"The operator keeps a checklist of {state} item{'s' if open_count != 1 else ''} for this session:"]
+        for item in self.todos:
+            mark = " " if not item["done"] else "x"
+            lines.append(f"- [{mark}] {item['text']}")
+        lines += [
+            "",
+            "Work through the open items; they outlive any single request.",
+            "Keep the list current as you work: when a task turns up real",
+            "follow-up work, add it yourself by putting a line in your",
+            "final message reading TODO ADD: <the follow-up, stated as a",
+            "concrete task>. Only add work that genuinely remains - not",
+            "steps you are about to do anyway, and not busywork.",
+            "When you finish an item, report it on its own line as",
+            "TODO DONE: <the item's exact text> so it is checked off.",
+            "Never claim an item is done until it actually is, and never",
+            "remove or edit items - the operator owns the list.",
+        ]
+        return lines
 
     def set_goal(self, text: str) -> None:
         self.goal = text.strip()
@@ -1244,6 +2080,218 @@ class ConsoleSession:
         self._print(
             self.style.dim("  the agent reports the goal is met - /goal done to clear it")
         )
+
+    # ---- todos ----------------------------------------------------------
+
+    def _normalise_todo(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip()).casefold()
+
+    def _find_todo(self, query: str, open_only: bool = True) -> int | None:
+        """Resolve a numbered item (1-based) or a text match to an index.
+
+        Text must match an item's whole text (after normalising
+        whitespace and case), never a fragment: a phrase that merely
+        sits inside a longer item would check the wrong thing off. To
+        pick among similar items or reach a done one, use the number
+        shown by /todo. With ``open_only`` (the default) done items are
+        never auto-selected - the operator explicitly re-numbers an item
+        to reopen it. Removal passes ``open_only=False`` because a done
+        item still needs to be findable to drop.
+        """
+        query = query.strip()
+        if query.isdigit():
+            index = int(query) - 1
+            return index if 0 <= index < len(self.todos) else None
+        target = self._normalise_todo(query)
+        for index, item in enumerate(self.todos):
+            if (not open_only or not item["done"]) and self._normalise_todo(item["text"]) == target:
+                return index
+        return None
+
+    def add_todo(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            self._print(self.style.dim("  usage: /todo add <what needs doing>"))
+            return
+        self.todos.append({"text": text, "done": False})
+        self._print(f"  {self.style.brand(str(len(self.todos)) + '.')} {text}")
+        self._print(self.style.dim("  /todo to see the list · /todo done <n> when it's done"))
+
+    def show_todos(self) -> None:
+        if not self.todos:
+            self._print(self.style.dim("  no todos - /todo add <what needs doing>"))
+            return
+        for index, item in enumerate(self.todos, 1):
+            marker = self.style.brand("\u2610") if not item["done"] else self.style.hair("\u2611")
+            body = item["text"] if not item["done"] else self.style.strike(item["text"])
+            self._print(f"  {index:>2} {marker} {body}")
+        open_count = sum(1 for t in self.todos if not t["done"])
+        if open_count:
+            self._print("")
+            self._print(self.style.dim(f"  {open_count} open · /todo done <n> to check one off · /todo rm <n> to drop one"))
+
+    def mark_todo_done(self, query: str) -> bool:
+        """Mark an item done by 1-based number or text match. Returns True when found."""
+        index = self._find_todo(query, open_only=True)
+        if index is None:
+            # Distinguish "not in the list at all" from "already done".
+            existing = self._find_todo(query, open_only=False)
+            if existing is not None:
+                self._print(self.style.dim(f"  already done: {self.todos[existing]['text']}"))
+                return False
+            self._print(self.style.dim("  no open todo matches - /todo lists them"))
+            return False
+        item = self.todos[index]
+        if item["done"]:
+            self._print(self.style.dim(f"  already done: {item['text']}"))
+            return False
+        item["done"] = True
+        self._print(self.style.dim(f"  done: {item['text']}"))
+        remaining = sum(1 for t in self.todos if not t["done"])
+        if not remaining:
+            self._print(self.style.dim("  all todos done - /todo clear to drop the list"))
+        return True
+
+    def rm_todo(self, query: str) -> bool:
+        """Drop an item by 1-based number or text match. Returns True when found."""
+        index = self._find_todo(query, open_only=False)
+        if index is None:
+            self._print(self.style.dim("  no todo matches - /todo lists them"))
+            return False
+        removed = self.todos.pop(index)["text"]
+        self._print(self.style.dim(f"  removed: {removed}"))
+        return True
+
+    def clear_todos(self) -> None:
+        if not self.todos:
+            self._print(self.style.dim("  no todos to clear"))
+            return
+        count = len(self.todos)
+        self.todos = []
+        self._print(self.style.dim(f"  cleared {count} todos"))
+
+    def _todo_status_snippet(self) -> str:
+        """Styled open-item count for the border row while a turn runs.
+
+        Empty string when nothing is open, so the spinner row only gains
+        the ``☐ N open`` readout when the checklist actually has work
+        left - and it drains live as the agent checks items off.
+        """
+        open_count = sum(1 for t in self.todos if not t["done"])
+        if not open_count:
+            return ""
+        plural = "" if open_count == 1 else "s"
+        return self.style.dim(self.style.brand("\u2610") + f" {open_count} open item{plural}")
+
+    def _check_todo_completion(self, result: "RunResult | None") -> None:
+        """Apply the agent's TODO reports from its final message.
+
+        Two reports, each on its own line:
+
+        - ``TODO DONE: <text>`` checks an open item off. Matching is
+          exact after normalising whitespace, so the agent echoing an
+          item's text is the only thing that checks it off; a paraphrase
+          does nothing and the operator can mark it with /todo done <n>.
+        - ``TODO ADD: <text>`` appends a new item the agent discovered
+          along the way (follow-up work a task turned up). Deduplicated
+          against the list verbatim so repeated reports do not stack.
+
+        The agent can add and complete items, but never remove or edit
+        them - the operator owns the list.
+
+        Reports already applied inline by the streaming hook are skipped
+        here: their state change happened as the reply streamed and their
+        note is already on screen, so the end-of-turn pass only handles
+        what the stream never saw (non-streamed replies, reports whose
+        line fell outside the stream path).
+        """
+        if result is None or not result.final_message:
+            return
+        # Two passes, adds first: an item added and completed in the same
+        # message must check off regardless of which line came first.
+        reports = []
+        for line in result.final_message.splitlines():
+            head, _, rest = line.partition(":")
+            head = head.strip().upper()
+            reported = self._normalise_todo(rest)
+            if not reported:
+                continue
+            if head in ("TODO DONE", "TODO ADD"):
+                reports.append((head, rest.strip(), reported))
+        # Adds first, then completions; reports already applied inline
+        # by the streaming hook are skipped inside _apply_todo_report.
+        for head, text, reported in reports:
+            if head != "TODO ADD":
+                continue
+            if self._apply_todo_report(head, text, reported):
+                self._print(self.style.dim(f"  todo added ({len(self.todos)}): {text}"))
+        for head, text, reported in reports:
+            if head != "TODO DONE":
+                continue
+            if self._apply_todo_report(head, text, reported):
+                self._print(self.style.dim(f"  checked off: {text}"))
+
+    def _handle_stream_todo_report(self, line: str) -> str:
+        """Stream hook: apply a TODO report the moment its line arrives.
+
+        The raw ``TODO ADD: …`` protocol text never reaches the screen.
+        Instead the change is applied to the live list and a quiet note is
+        returned in its place, so the operator watches the checklist grow
+        and drain inside the streamed reply rather than reading a marker
+        line or waiting for the turn to end.
+        """
+        head, _, text = line.partition(":")
+        reported = self._normalise_todo(text)
+        if not reported:
+            return ""
+        applied = self._apply_todo_report(head.strip(), text.strip(), reported)
+        if not applied:
+            # Already applied inline earlier in this stream (or a done
+            # item re-reported): nothing to show, swallow the line.
+            return ""
+        # Palette checkboxes, dimmed: an open item carries the crimson ☐
+        # (the same mark /todo shows), a finished one the hairline ☑ with
+        # the text struck through - so a note reads exactly like a row of
+        # the checklist, only quieter than the reply around it.
+        if head.strip().upper() == "TODO DONE":
+            return self.style.dim(
+                self.style.hair("\u2611") + " " + self.style.strike(text.strip())
+            )
+        open_count = sum(1 for t in self.todos if not t["done"])
+        plural = "" if open_count == 1 else "s"
+        return self.style.dim(
+            self.style.brand("\u2610") + " " + text.strip()
+            + f" ({open_count} open item{plural})"
+        )
+
+
+    def _apply_todo_report(self, head: str, text: str, reported: str) -> bool:
+        """Apply one TODO ADD / TODO DONE report. Shared by both paths.
+
+        Returns True when a change was applied (an item added or checked
+        off). Callers decide how to announce it - the stream path returns
+        a styled note inline, the end-of-turn path prints after the turn.
+        Either way the state change happens once: reports already applied
+        inline are recorded in ``_turn_todo_reports`` so the end-of-turn
+        pass never re-adds, re-checks, or re-announces them.
+        """
+        if (head, reported) in self._turn_todo_reports:
+            return False  # already applied inline while the reply streamed
+        if head == "TODO ADD":
+            if any(self._normalise_todo(t["text"]) == reported for t in self.todos):
+                return False  # already tracked - do not stack duplicates
+            self.todos.append({"text": text, "done": False})
+            self._turn_todo_reports.append(("TODO ADD", reported))
+            return True
+        if head == "TODO DONE":
+            for item in self.todos:
+                if item["done"]:
+                    continue
+                if self._normalise_todo(item["text"]) == reported:
+                    item["done"] = True
+                    self._turn_todo_reports.append(("TODO DONE", reported))
+                    return True
+        return False
 
     def auto_route(self, text: str) -> str | None:
         """Attach the skill this request is asking for, without being asked.
@@ -1341,31 +2389,65 @@ class ConsoleSession:
             context=self.context,
             abort=self._abort,
             approver=self.approvals,
+            on_tool_result=self._on_tool_observation,
         )
         self._streamed_this_run = False
         self._stream_header_done = False
         self._stream_tokens = 0
         self._last_counter_update = 0.0
         self._stream_renderer.reset()
+        # Reports the agent emits this turn are applied and announced as
+        # its reply streams; the list is cleared so the end-of-turn pass
+        # knows what it still has to handle.
+        self._turn_todo_reports = []
+        self._stream_renderer.report_hook = self._handle_stream_todo_report
 
         self._turn_started = time.monotonic()
         self._spinner = Spinner(
             self.style,
             frame=self.frame.frame if self.frame else None,
             layout=self.layout,
+            status=self._todo_status_snippet,
         ).start() if sys.stdout.isatty() else None
         result = None
         self._install_sigint()
         self._start_dashboard_refresh()
+        # While the turn streams, a background reader lets the operator
+        # scroll the viewport with the wheel or the scroll keys without
+        # stealing anything typed for the next prompt. On POSIX the
+        # terminal must leave canonical (line-buffered) mode first,
+        # otherwise single keys and wheel sequences sit in the tty line
+        # buffer until Enter and never reach the reader. cbreak keeps
+        # SIGINT working (raw mode would turn Ctrl+C into a byte we would
+        # have to re-implement by hand).
+        scroll_reader = None
+        cbreak = None
+        if (
+            self.layout is not None
+            and self.layout.active
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+        ):
+            if os.name != "nt":
+                cbreak = cbreak_mode()
+                next(cbreak)
+            scroll_reader = _TurnScrollReader(self, self.layout)
+            scroll_reader.start()
         try:
             result = loop.run(task)
         except (KeyboardInterrupt, AbortError):
             self._abort.set()
-            self._print(self.style.red("  interrupted"))
+            self._print(self.style.ember("  interrupted"))
         except HarnessError as exc:
-            self._print(self.style.red(f"  !! {exc}"))
+            self._print(self.style.ember(f"  !! {exc}"))
         else:
             # Flush any remaining buffered text from the streaming renderer.
+            # Fragments deferred while a native selection was active must
+            # land before the renderer tail or they would be lost.
+            try:
+                self._flush_deferred_stream()
+            except Exception:
+                pass
             if self._streamed_this_run:
                 tail = self._stream_renderer.flush()
                 if tail:
@@ -1380,7 +2462,7 @@ class ConsoleSession:
                         self.frame.write(tail)
                         self.frame.flush()
                     else:
-                        sys.stdout.write(tail)
+                        _safe_stdout(tail)
                         sys.stdout.flush()
                 # Streamed in full, so the reply is already on screen - do
                 # not print it again. A second copy would sit below the
@@ -1409,19 +2491,27 @@ class ConsoleSession:
                 if self.frame is not None:
                     self.frame.row(body)
                 else:
-                    self._print(f"{self.style.neon_title('ENCHANTER')} {body}")
+                    self._print(f"{self.style.brand('ENCHANTER')} {body}")
             elif result is not None and not result.final_message and not self._streamed_this_run:
-                # Empty final without streaming — agnostic, don't hardcode language
+                # Empty final without streaming: nothing to render.
                 pass
             if result is not None:
                 self._record_usage(result)
                 self._record_memory(task, result)
                 self._report_changes()
                 self._check_goal_completion(result)
+                self._check_todo_completion(result)
                 # After the turn is fully reported, so a session saved
                 # mid-turn cannot be missing the assistant's last answer.
                 self.autosave()
         finally:
+            if scroll_reader is not None:
+                scroll_reader.stop()
+            if cbreak is not None:
+                try:
+                    cbreak.close()
+                except Exception:
+                    pass
             self._stop_dashboard_refresh()
             self._restore_sigint()
             if self._spinner:
@@ -1432,17 +2522,28 @@ class ConsoleSession:
             # Last, so the skill the router chose is in force for the whole
             # turn - including the divider row - and not a moment less.
             self._detach_auto()
+            # If the operator scrolled up mid-turn to read earlier output,
+            # bring the viewport back to the newest content so the final
+            # reply and the footer are on screen, not hidden above the fold.
+            if self.layout is not None and self.layout.active:
+                try:
+                    self.layout.scroll_to_bottom()
+                except Exception:
+                    pass
+            self._edit_snapshots.clear()
+            self._last_edit_path = None
+            self._last_read_path = None
+            self._last_command = None
+            self._last_shell_task = None
+            # Tell the operator capped output can be paged through with an
+            # empty Enter (the queue survives until the next turn).
+            if self._pending_pages:
+                self._print(self.style.dim("  (capped output above — press Enter with an empty prompt to page through it)"))
             self._end_turn(result)
         return result
 
     def _end_turn(self, result: "RunResult | None") -> None:
-        """Mark where a turn stopped.
-
-        Inside the frame this is a divider row rather than a bottom
-        border: the session goes on, so the box does not close. The
-        verdict and the usage line ride on it, which is also the
-        narrowest place in the frame - hence the short form.
-        """
+        """Print the usage footer for the turn that just ended."""
         # Clear the live token counter so the next prompt is clean.
         self._stream_tokens = 0
         if self.frame is not None:
@@ -1455,7 +2556,7 @@ class ConsoleSession:
             self._print(f"  {self.style.dim(self._usage_line(result))}")
 
     def _footer(self, result: "RunResult | None") -> str:
-        """One compact line for the bottom border."""
+        """One compact line describing how the turn ended."""
         if result is None:
             return "no result"
         tin = int(result.metrics.get("tokens_in", 0))
@@ -1490,7 +2591,7 @@ class ConsoleSession:
         # endpoint does not return usage (e.g. after stream_options downgrade).
         if tin == 0 and tout == 0:
             est_in = self.context.tokens
-            est_out = max(1, len(result.final_message or "") // 4) if result.final_message else 0
+            est_out = max(1, len(result.final_message) // 4) if result.final_message else 0
             # If cache was reported but prompt was 0, use cache as at least part of input
             if cache > 0 and est_in == 0:
                 est_in = cache
@@ -1587,7 +2688,7 @@ class ConsoleSession:
                 [{"role": "user", "content": request}], tools=None, on_delta=None
             )
         except HarnessError as exc:
-            self._print(self.style.red(f"  compaction failed: {exc}"))
+            self._print(self.style.ember(f"  compaction failed: {exc}"))
             return False
         summary = (response.content or "").strip()
         if not summary:
@@ -1611,12 +2712,12 @@ class ConsoleSession:
     def save_session(self, path: str) -> bool:
         # Validate path is inside allowed directories to prevent arbitrary write
         if not _is_safe_session_path(path, self.workspace):
-            self._print(self.style.yellow(f"  refusing to save outside allowed dirs: {path}"))
+            self._print(self.style.warn(f"  refusing to save outside allowed dirs: {path}"))
             self._print(self.style.dim(f"  allowed: workspace, {sessions.sessions_dir()}, temp"))
             return False
         # Enforce size cap on file path length and payload
         if len(path) > 500:
-            self._print(self.style.red("  save failed: path too long"))
+            self._print(self.style.ember("  save failed: path too long"))
             return False
         payload = {
             "version": 1,
@@ -1625,15 +2726,21 @@ class ConsoleSession:
             "model": self.config.get("llm", {}).get("model", "?"),
             "totals": self.totals,
             "messages": self.context.messages,
+            "show_tool_output": self._show_tool_output,
+            "pending_pages": self._pending_pages_snapshot(),
         }
-        # Cap file size via payload size check
+        # Cap file size via payload size check. A failure here (e.g. the
+        # payload contains something json can't serialize) means the write
+        # below will fail the same way, so surface it now instead of
+        # silently skipping the check and hitting an uncaught error later.
         try:
             data = json.dumps(payload, ensure_ascii=False)
-            if len(data) > 10_000_000:
-                self._print(self.style.red("  save failed: session too large"))
-                return False
-        except Exception:
-            pass
+        except (TypeError, ValueError) as exc:
+            self._print(self.style.ember(f"  save failed: {exc}"))
+            return False
+        if len(data) > 10_000_000:
+            self._print(self.style.ember("  save failed: session too large"))
+            return False
         try:
             # Ensure parent dir exists with restricted perms
             parent = os.path.dirname(os.path.abspath(path))
@@ -1645,44 +2752,55 @@ class ConsoleSession:
                 os.chmod(path, 0o600)
             except OSError:
                 pass
-        except OSError as exc:
-            self._print(self.style.red(f"  save failed: {exc}"))
+        except (OSError, TypeError, ValueError) as exc:
+            self._print(self.style.ember(f"  save failed: {exc}"))
             return False
         self._print(self.style.dim(f"  saved {len(self.context.messages)} messages to {path}"))
         return True
 
     def load_session(self, path: str) -> bool:
         if not _is_safe_session_path(path, self.workspace):
-            self._print(self.style.yellow(f"  refusing to load outside allowed dirs: {path}"))
+            self._print(self.style.warn(f"  refusing to load outside allowed dirs: {path}"))
             return False
         try:
             # Size check before load
             try:
                 if os.path.getsize(path) > 10_000_000:
-                    self._print(self.style.red("  load failed: file too large"))
+                    self._print(self.style.ember("  load failed: file too large"))
                     return False
             except OSError:
                 pass
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
-            self._print(self.style.red(f"  load failed: {exc}"))
+            self._print(self.style.ember(f"  load failed: {exc}"))
             return False
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
-            self._print(self.style.red("  load failed: no messages in file"))
+            self._print(self.style.ember("  load failed: no messages in file"))
             return False
         if len(messages) > 500:
-            self._print(self.style.yellow(f"  warning: large session {len(messages)} messages, truncating"))
+            # Cap restored sessions so a huge transcript cannot blow the budget.
+            self._print(self.style.warn(f"  warning: large session {len(messages)} messages, truncating"))
             messages = messages[-500:]
         self.context.messages = list(messages)
-        self.context.resync()
+        self.context.enforce_budget()
         totals = payload.get("totals")
         if isinstance(totals, dict):
             self.totals.update({k: int(v) for k, v in totals.items() if k in self.totals})
+        output_pref = payload.get("show_tool_output")
+        if isinstance(output_pref, bool):
+            self._show_tool_output = output_pref
+        remaining_pages = self._restore_pending_pages(payload)
         self._print(
             self.style.dim(f"  restored {len(messages)} messages (~{self.context.tokens} tokens)")
         )
+        if remaining_pages:
+            self._print(
+                self.style.dim(
+                    "  (capped outputs from the saved run remain — press Enter with an empty prompt to page through them)"
+                )
+            )
         return True
 
     # ---- resumable sessions ----------------------------------------------
@@ -1690,13 +2808,9 @@ class ConsoleSession:
     def autosave(self) -> None:
         """Keep the session resumable without being asked.
 
-        Called after every turn. It is silent on purpose: a "saved"
-        line after each reply would be noise, and the only time the
-        operator learns the file exists is when /resume lists it.
-
-        Nothing is written until there is a real conversation - saving
-        after "hello" would fill the store with sessions not worth
-        resuming and push the real ones out of the listing.
+        Silent by design: the only time the operator learns the file
+        exists is when /resume lists it. Nothing is written until there
+        is a real conversation.
         """
         if len(self.context.messages) < 2:
             return
@@ -1711,7 +2825,10 @@ class ConsoleSession:
                 "totals": self.totals,
                 "goal": self.goal,
                 "goal_notes": self.goal_notes,
+                "todos": self.todos,
                 "messages": self.context.messages,
+                "show_tool_output": self._show_tool_output,
+                "pending_pages": self._pending_pages_snapshot(),
             },
         )
 
@@ -1735,21 +2852,22 @@ class ConsoleSession:
             if not known:
                 self._print(self.style.dim("  no saved sessions yet"))
                 return False
-            self._print(self.style.red(f"  no session named '{name}'"))
+            self._print(self.style.ember(f"  no session named '{name}'"))
             self._print(self.style.dim("  /resume lists them"))
             return False
-        # Workspace guard — don't load k-chat session in k-studio workspace
+        # Workspace guard: a session saved in one workspace is not
+        # resumed in another.
         saved_ws = data.get("workspace") or ""
         if saved_ws and not self._is_same_workspace(saved_ws):
-            self._print(self.style.yellow(f"  session '{name}' belongs to workspace {saved_ws}"))
+            self._print(self.style.warn(f"  session '{name}' belongs to workspace {saved_ws}"))
             self._print(self.style.dim(f"  current workspace is {self.workspace} — switch workspace or use /resume list to see this workspace's sessions"))
             return False
         messages = data.get("messages")
         if not isinstance(messages, list) or not messages:
-            self._print(self.style.red(f"  session '{name}' has no conversation"))
+            self._print(self.style.ember(f"  session '{name}' has no conversation"))
             return False
         self.context.messages = list(messages)
-        self.context.resync()
+        self.context.enforce_budget()
         totals = data.get("totals")
         if isinstance(totals, dict):
             self.totals.update({k: int(v) for k, v in totals.items() if k in self.totals})
@@ -1762,9 +2880,28 @@ class ConsoleSession:
         self.goal = str(data.get("goal") or "")
         notes = data.get("goal_notes")
         self.goal_notes = [str(n) for n in notes] if isinstance(notes, list) else []
+        # The todo checklist travels with the conversation too: resuming
+        # a session to finish a multi-part task and finding its list
+        # wiped would scatter the remaining work.
+        saved_todos = data.get("todos")
+        self.todos = []
+        if isinstance(saved_todos, list):
+            for entry in saved_todos:
+                if isinstance(entry, dict) and "text" in entry:
+                    self.todos.append({"text": str(entry["text"]), "done": bool(entry.get("done"))})
         # Adopt the name, so the next autosave continues this session
         # rather than starting a second file beside it.
         self.session_name = name
+        # The operator's display preference travels with the session, so
+        # resuming one where the tool-output boxes were hidden stays that
+        # way (Ctrl+O flips it back live).
+        output_pref = data.get("show_tool_output")
+        if isinstance(output_pref, bool):
+            self._show_tool_output = output_pref
+        # An interrupted paging session resumes where it left off: any
+        # capped tool output not yet paged through comes back with the
+        # conversation, ready for the empty-Enter pager.
+        remaining_pages = self._restore_pending_pages(data)
         # Hide splash so full history is visible immediately — splash otherwise
         # covers viewport until next resize/handle hides it.
         if self.layout is not None and getattr(self.layout, "_splash_visible", False):
@@ -1773,12 +2910,20 @@ class ConsoleSession:
             except Exception:
                 pass
             self._splash_visible = False
+        if not self._show_tool_output:
+            self._print(self.style.dim("  (tool output boxes are hidden in this session — ctrl+o to show)"))
         self._print(
             self.style.dim(
                 f"  resumed '{name}' - {len(messages)} messages "
                 f"(~{self.context.tokens} tokens)"
             )
         )
+        if remaining_pages:
+            self._print(
+                self.style.dim(
+                    "  (capped outputs from the interrupted run remain — press Enter with an empty prompt to page through them)"
+                )
+            )
         # Replay conversation history in the viewport.
         for msg in messages:
             if not isinstance(msg, dict):
@@ -1794,24 +2939,25 @@ class ConsoleSession:
             if role == "user":
                 text = content if isinstance(content, str) else str(content or "")
                 if text.strip():
-                    self._print(f"{self.style.neon_label('you')} {text}")
+                    self._print(f"{self.style.ash('you')} {text}")
                 else:
-                    self._print(f"{self.style.neon_label('you')} (empty)")
+                    self._print(f"{self.style.ash('you')} (empty)")
             elif role == "assistant":
                 # Assistant may have content null + tool_calls — render markdown for body so colors show
                 if isinstance(content, str) and content.strip():
-                    self._print(f"{self.style.neon_title('ENCHANTER')}")
+                    self._print(f"{self.style.brand('ENCHANTER')}")
                     self._print(render_markdown(content, self.style))
                 elif msg.get("tool_calls"):
                     calls = ", ".join((c.get("function") or {}).get("name","?") for c in msg.get("tool_calls") or [])
-                    self._print(f"{self.style.neon_title('ENCHANTER')} [called {calls}]")
+                    self._print(f"{self.style.brand('ENCHANTER')} [called {calls}]")
                     if isinstance(content, str) and content.strip():
                         self._print(render_markdown(content, self.style))
                 elif isinstance(content, str):
-                    self._print(f"{self.style.neon_title('ENCHANTER')} {content}")
+                    self._print(f"{self.style.brand('ENCHANTER')} {content}")
             elif role == "tool":
                 text = content if isinstance(content, str) else str(content or "")
                 if text.strip():
+                    # Keep the replay compact: 300 chars per tool result.
                     self._print(f"{self.style.dim('tool')} {self.style.dim(text[:300])}")
                 else:
                     self._print(f"{self.style.dim('tool')} (no output)")
@@ -1857,7 +3003,10 @@ class ConsoleSession:
             if item["name"] == self.session_name:
                 head += self.style.dim(" (current)")
             self._print(head)
-            self._print(self.style.dim(f"      {when} · {label} · {item['model'] or '?'}"))
+            extra = ""
+            if item.get("show_tool_output") is False:
+                extra = " · output boxes hidden"
+            self._print(self.style.dim(f"      {when} · {label} · {item['model'] or '?'}{extra}"))
             if item["summary"]:
                 self._print(self.style.dim(f"      {item['summary']}"))
         self._print("")
@@ -1876,13 +3025,10 @@ class ConsoleSession:
         options = []
         for item in known:
             summary = item["summary"] or "no summary"
-            options.append(
-                Option(
-                    item["name"],
-                    item["name"],
-                    f"{item['saved_at']} · {item['turns']} turns · {summary}",
-                )
-            )
+            detail = f"{item['saved_at']} · {item['turns']} turns · {summary}"
+            if item.get("show_tool_output") is False:
+                detail += " · output boxes hidden"
+            options.append(Option(item["name"], item["name"], detail))
         chosen = _menu(
             self,
             "Resume a session",
@@ -1922,7 +3068,7 @@ class ConsoleSession:
         try:
             entries = sorted(os.listdir(root))[:50] if os.path.isdir(root) else []
         except OSError as exc:
-            self._print(self.style.red(f"  cannot list workspace: {exc}"))
+            self._print(self.style.ember(f"  cannot list workspace: {exc}"))
             return
         for entry in entries:
             try:
@@ -1945,8 +3091,15 @@ class ConsoleSession:
             self._print(stat.rstrip())
         diff = self._git("diff")
         if diff:
+            # Same before/after panes as the live edit previews and the
+            # agent's git-diff boxes: removed lines on tomato, added on
+            # lime, with a file chip per group.
+            rows = self._diff_pane_rows(diff, max_lines=400)
+            if rows is not None:
+                self._print(self._box("git diff", rows))
+                return
             lines = diff.splitlines()
-            cap = 400
+            cap = 400  # plain-text fallback: same cap as the boxed panes
             self._print("\n".join(lines[:cap]))
             if len(lines) > cap:
                 self._print(f"... ({len(lines) - cap} more lines)")
@@ -2048,7 +3201,7 @@ class ConsoleSession:
         try:
             self.llm = build_llm(self.config["llm"])
         except HarnessError as exc:
-            self._print(self.style.red(f"  could not switch model: {exc}"))
+            self._print(self.style.ember(f"  could not switch model: {exc}"))
             return
         if not quiet:
             self._print(self.style.dim(f"  model is now {name}"))
@@ -2072,7 +3225,7 @@ class ConsoleSession:
             wanted = None
         elif wanted not in REASONING_EFFORTS:
             self._print(
-                self.style.yellow(f"  reasoning must be one of {', '.join(REASONING_EFFORTS)} or off")
+                self.style.warn(f"  reasoning must be one of {', '.join(REASONING_EFFORTS)} or off")
             )
             return
         llm = self.config.setdefault("llm", {})
@@ -2080,7 +3233,7 @@ class ConsoleSession:
         try:
             self.llm = build_llm(llm)
         except HarnessError as exc:
-            self._print(self.style.red(f"  could not set reasoning: {exc}"))
+            self._print(self.style.ember(f"  could not set reasoning: {exc}"))
             return
         if not quiet:
             self._print(
@@ -2117,7 +3270,7 @@ class ConsoleSession:
         """Point the agent at a saved endpoint. True on success."""
         entry = known_endpoints().get(name.lower())
         if entry is None:
-            self._print(self.style.yellow(f"  no endpoint named '{name}'"))
+            self._print(self.style.warn(f"  no endpoint named '{name}'"))
             self._print(self.style.dim("  add one with /connect, or list them: /connect"))
             return False
         llm = self.config.setdefault("llm", {})
@@ -2129,7 +3282,7 @@ class ConsoleSession:
         try:
             self.llm = build_llm(llm)
         except HarnessError as exc:
-            self._print(self.style.red(f"  could not switch endpoint: {exc}"))
+            self._print(self.style.ember(f"  could not switch endpoint: {exc}"))
             return False
         set_active(endpoint=name.lower(), model=llm.get("model", ""))
         self._print(self.style.dim(f"  endpoint is now {entry['base_url']}"))
@@ -2153,7 +3306,7 @@ class ConsoleSession:
             return
         if os.environ.get(key_env) or has_stored(key_env):
             return
-        self._print(self.style.yellow(f"  warning: no key for ${key_env}"))
+        self._print(self.style.warn(f"  warning: no key for ${key_env}"))
         self._print(
             self.style.dim(
                 f"  store one with /connect, or edit {settings_path()}"
@@ -2203,7 +3356,7 @@ class ConsoleSession:
             "╚══════════════════════════════╝",
         ]
         for line in art:
-            self._print(s.cyan(line))
+            self._print(s.brand(line))
         llm_cfg = self.config.get("llm", {})
         self._print(f"model      {s.bold(llm_cfg.get('model', '?'))}")
         self._print(f"endpoint   {s.dim(llm_cfg.get('base_url', '?'))}")
@@ -2261,6 +3414,7 @@ SLASH_COMMANDS = [
     ("/reset", "reset chat"),
     ("/resume", "resume session"),
     ("/goal", "set goal"),
+    ("/todo", "session checklist"),
     ("/workflow", "run workflow"),
     ("/skills", "attach skill"),
     ("/skill", "alias /skills"),
@@ -2327,6 +3481,8 @@ class ConsoleCompleter:
         # rather than trusting every caller to pass a sane position.
         cursor = max(0, min(cursor, len(buffer)))
         start = cursor
+        # Invisible characters (BOM, zero-width, NBSP, ideographic space)
+        # never start a token; strip them while scanning for the boundary.
         _ZW = "\ufeff\u200b\u200c\u200d\u00a0\u3000"
         while start > 0 and not buffer[start - 1].isspace() and buffer[start - 1] not in _ZW:
             start -= 1
@@ -2576,14 +3732,14 @@ def _is_safe_session_path(path: str, workspace: str) -> bool:
 def _mask_line(line: str) -> str:
     """Mask secrets in a line before echoing (e.g. /connect key)."""
     stripped = line.strip()
-    # Mask /connect <url> <key> -> hide key
+    # Mask /connect <url> <key> [<model>] -> hide the key, which is the
+    # token after the URL, not the last token (the last may be a model).
     if stripped.lower().startswith("/connect"):
         parts = stripped.split()
         if len(parts) >= 3 and parts[1] not in ("list", "remove", "key", "keys", "show", "forget", "delete"):
-            # Assume last part is key
-            parts[-1] = "***"
+            parts[2] = "***"
             return " ".join(parts)
-        # Also mask key in "key" subcommand
+        # /connect key <name> <key> — the key is the last token.
         if len(parts) >= 3 and parts[1] in ("key",):
             parts[-1] = "***"
             return " ".join(parts)
@@ -2614,12 +3770,9 @@ def _read_multiline(session: "ConsoleSession") -> str:
 def _read_choice(session: "ConsoleSession", prompt_text: str) -> str:
     """Read a line from the operator; empty when there is no terminal.
 
-    Goes through the line editor rather than ``input()`` so that, inside
-    the frame, the row the answer is typed on is closed properly instead
-    of being abandoned with its right border missing.
-
-    Every caller must tolerate an empty answer, because a piped run has
-    nobody to answer and must not block or eat the next line.
+    Uses the line editor rather than input() so the row the answer is
+    typed on is closed properly. Every caller must tolerate an empty
+    answer, because a piped run has nobody to answer.
     """
     if not sys.stdin.isatty():
         return ""
@@ -2750,7 +3903,7 @@ def _skills_show(session: "ConsoleSession", name: str) -> None:
     found = skills.get(name)
     if found is None:
         cands = skills.find(name, limit=5)
-        session._print(session.style.red(f"  no skill named '{name}'"))
+        session._print(session.style.ember(f"  no skill named '{name}'"))
         if cands:
             session._print(session.style.dim("  did you mean: " + ", ".join(c.name for c in cands)))
         return
@@ -2784,7 +3937,7 @@ def _skills_use(session: "ConsoleSession", name: str) -> None:
     found = skills.get(name)
     if found is None:
         cands = skills.find(name, limit=5)
-        session._print(session.style.red(f"  no skill named '{name}'"))
+        session._print(session.style.ember(f"  no skill named '{name}'"))
         if cands:
             session._print(session.style.dim("  did you mean: " + ", ".join(c.name for c in cands)))
         return
@@ -2848,12 +4001,12 @@ def _skills_launch(session: "ConsoleSession", name: str) -> RunResult | None:
             choice = _menu(session, f"Bundle '{name}' not found", [Option(value=n, label=n, hint=" > ".join(v[:2])) for n, v in sorted(bundles.items())])
             if choice:
                 return _skills_launch(session, choice)
-        session._print(session.style.red(f"  no bundle named '{name}'"))
+        session._print(session.style.ember(f"  no bundle named '{name}'"))
         return None
     known = skills.load_all()
     missing = [s for s in steps if s.lower() not in known]
     if missing:
-        session._print(session.style.yellow(f"  bundle names skills that are not installed: {', '.join(missing)}"))
+        session._print(session.style.warn(f"  bundle names skills that are not installed: {', '.join(missing)}"))
         return None
     count = len(steps)
     label = f"{count} step" if count == 1 else f"{count} steps"
@@ -2877,10 +4030,10 @@ def _skills_launch(session: "ConsoleSession", name: str) -> RunResult | None:
                     f"Apply the {skill.name} skill to the current work."
                 )
             except KeyboardInterrupt:
-                session._print(session.style.yellow("  bundle stopped"))
+                session._print(session.style.warn("  bundle stopped"))
                 return last
             if result is None:
-                session._print(session.style.yellow("  bundle stopped: the step did not complete"))
+                session._print(session.style.warn("  bundle stopped: the step did not complete"))
                 return last
             last = result
     finally:
@@ -2930,7 +4083,7 @@ def _skills_auto(session: "ConsoleSession", argument: str) -> None:
         session._print(session.style.dim(f"  bundle auto-launch {'on' if bundles else 'off'}"))
         if bundles:
             session._print(
-                session.style.yellow(
+                session.style.warn(
                     "  a bundle runs several turns - it will start on its own when one fits"
                 )
             )
@@ -2996,6 +4149,64 @@ def _goal(session: "ConsoleSession", argument: str) -> None:
         session.set_goal(argument)
 
 
+def _todo(session: "ConsoleSession", argument: str) -> None:
+    """/todo: the session checklist the agent works through.
+
+    Bare /todo shows the list. Subcommands: add <text>, done <n|text>
+    (number, or text matching an item), rm <n|text>, clear. done and rm
+    accept a space- or comma-separated list. A bare /todo done opens a
+    picker over the open items; bare /todo rm removes the done ones.
+    """
+    argument = argument.strip()
+    if not argument:
+        session.show_todos()
+        return
+    head, _, rest = argument.partition(" ")
+    head = head.lower()
+    rest = rest.strip()
+    if head in ("add", "new"):
+        session.add_todo(rest)
+    elif head in ("done", "check", "rm", "remove", "delete", "drop"):
+        mark = head in ("done", "check")
+        # Bare /todo done opens a picker over the open items; bare
+        # /todo rm drops the done ones. Both are friendlier than a
+        # usage line and make the command discoverable.
+        if not rest:
+            if mark:
+                picks = [Option(value=str(i + 1), label=item["text"]) for i, item in enumerate(session.todos) if not item["done"]]
+                if not picks:
+                    session._print(session.style.dim("  nothing open to check - /todo add <what needs doing>"))
+                    return
+                chosen = _menu(session, "Check off", picks)
+                if chosen:
+                    session.mark_todo_done(chosen)
+            else:
+                done = [item["text"] for item in session.todos if item["done"]]
+                if not done:
+                    session._print(session.style.dim("  no done items to remove - /todo lists them"))
+                    return
+                session.todos = [item for item in session.todos if not item["done"]]
+                session._print(session.style.dim(f"  removed {len(done)} done todo(s)"))
+            return
+        # Resolve each target: a phrase that matches an item whole wins
+        # (so "fix the header" is one item, not four tokens), otherwise
+        # each space/comma-separated token is its own item number.
+        targets = [rest]
+        if session._find_todo(rest, open_only=mark) is None:
+            targets = [t for t in re.split(r"[,\s]+", rest) if t]
+        for target in targets:
+            if mark:
+                session.mark_todo_done(target)
+            else:
+                session.rm_todo(target)
+    elif head in ("clear", "reset"):
+        session.clear_todos()
+    elif head in ("show", "list", "status"):
+        session.show_todos()
+    else:
+        session._print(session.style.dim("  usage: /todo add <text> · done <n> · rm <n> · clear"))
+
+
 def _workflow(session: "ConsoleSession", argument: str) -> None:
     """/workflow create | show | launch | remove."""
     parts = argument.split() if argument else []
@@ -3024,7 +4235,7 @@ def _workflow_show(session: "ConsoleSession", name: str) -> None:
                 if choice:
                     _workflow_show(session, choice)
                     return
-            session._print(session.style.red(f"  no workflow named '{workflows.slug(name)}'"))
+            session._print(session.style.ember(f"  no workflow named '{workflows.slug(name)}'"))
             return
         steps = found["steps"]
         session._print(f"  {session.style.bold(found['name'])}")
@@ -3061,7 +4272,7 @@ def _workflow_create(session: "ConsoleSession", name: str) -> None:
     raw = _read_multiline(session)
     steps = [line.strip() for line in raw.split("\n") if line.strip()]
     ok, message = workflows.create(name, steps)
-    colour = session.style.dim if ok else session.style.red
+    colour = session.style.dim if ok else session.style.ember
     session._print(f"  {colour(message)}")
 
 
@@ -3085,7 +4296,7 @@ def _workflow_launch(session: "ConsoleSession", name: str) -> None:
             if choice:
                 _workflow_launch(session, choice)
                 return
-        session._print(session.style.red(f"  no workflow named '{workflows.slug(name)}'"))
+        session._print(session.style.ember(f"  no workflow named '{workflows.slug(name)}'"))
         return
     steps = found["steps"]
     label = f"{len(steps)} step" if len(steps) == 1 else f"{len(steps)} steps"
@@ -3096,10 +4307,10 @@ def _workflow_launch(session: "ConsoleSession", name: str) -> None:
         try:
             result = session.handle(step)
         except KeyboardInterrupt:
-            session._print(session.style.yellow("  workflow stopped"))
+            session._print(session.style.warn("  workflow stopped"))
             return
         if result is None:
-            session._print(session.style.yellow("  workflow stopped: the step did not complete"))
+            session._print(session.style.warn("  workflow stopped: the step did not complete"))
             return
     session._print("")
     session._print(session.style.dim(f"  workflow '{found['name']}' finished"))
@@ -3125,7 +4336,7 @@ def _workflow_remove(session: "ConsoleSession", name: str) -> None:
             if choice:
                 _workflow_remove(session, choice)
                 return
-        session._print(session.style.red(f"  no workflow named '{workflows.slug(name)}'"))
+        session._print(session.style.ember(f"  no workflow named '{workflows.slug(name)}'"))
 
 
 def _menu(
@@ -3202,10 +4413,8 @@ def _effort_options(current: str | None) -> list[Option]:
 def _pick_effort(session: "ConsoleSession", model: str) -> str | None:
     """Offer a thinking level for the model just chosen.
 
-    Always offered, for every model. Effort is a property of the model
-    in the operator's head, so gating the question on whether the name
-    looks like a reasoning model just made it disappear for most of
-    them - and the guess was wrong often enough to be worse than asking.
+    Always offered: gating on the model name was wrong often enough to
+    be worse than asking.
     """
     current = session.config.get("llm", {}).get("reasoning_effort") or "off"
     options = _effort_options(current)
@@ -3279,9 +4488,8 @@ def _is_auth_failure(error: Exception | None) -> bool:
 def _rescue_catalogue(session: "ConsoleSession", error: Exception | None) -> bool:
     """Offer a way forward when no model list can be had.
 
-    An empty catalogue used to end in "edit the settings file", which
-    is the one answer that does not help: the common cause is a key
-    that was mistyped, and that is fixable right here.
+    An empty catalogue is usually a mistyped key, which is fixable here
+    rather than by hand-editing the settings file.
     """
     s = session.style
     llm = session.config.get("llm", {})
@@ -3297,7 +4505,7 @@ def _rescue_catalogue(session: "ConsoleSession", error: Exception | None) -> boo
         options.append(Option(value=RE_ENTER_KEY, hint="most likely if the key was mistyped"))
     options.append(Option(value=TYPE_A_MODEL, hint="if the endpoint hides its list"))
     options.append(Option(value=SWITCH_ENDPOINT, hint=""))
-    session._print(s.yellow("  no models to choose from yet"))
+    session._print(s.warn("  no models to choose from yet"))
     choice = _menu(session, "how do you want to fix it?", options, allow_filter=False)
     if choice == RE_ENTER_KEY:
         if not _replace_key(session):
@@ -3329,9 +4537,8 @@ def _type_a_model(session: "ConsoleSession") -> bool:
 def _choose_model(session: "ConsoleSession") -> bool:
     """Open the model menu; effort follows as part of the same choice.
 
-    Now shows *all* providers' stored models together so the operator
-    can pick any model without switching endpoint first. The endpoint
-    is auto-switched to the provider that owns the chosen model.
+    All stored endpoints' models are shown together, and picking one
+    switches to its owning endpoint automatically.
     """
     llm = session.config.get("llm", {})
     base_url = llm.get("base_url", "")
@@ -3354,7 +4561,7 @@ def _choose_model(session: "ConsoleSession") -> bool:
     elif not all_by_model:
         # No stored models anywhere and fetch failed
         if not base_url:
-            session._print(session.style.yellow("  no endpoint configured - /connect first"))
+            session._print(session.style.warn("  no endpoint configured - /connect first"))
             return False
         return _rescue_catalogue(session, error)
     else:
@@ -3406,7 +4613,7 @@ NEW_ENDPOINT = "+ add a new endpoint"
 
 
 def _endpoint_options(session: "ConsoleSession") -> list[Option]:
-    """Saved endpoints, newest first, with an entry to add another."""
+    """Saved endpoints, alphabetically, with an entry to add another."""
     known = known_endpoints()
     current = session.endpoint_name
     options = []
@@ -3431,6 +4638,9 @@ def _connect_choose_endpoint(session: "ConsoleSession") -> str | None:
         removed = remove_endpoint(name.lower())
         if removed:
             # Also remove stored key if only this endpoint used it
+            key_removed = False
+            key_removal_failed = False
+            still_used = False
             if key_env:
                 still_used = any(
                     e.get("api_key_env") == key_env
@@ -3442,9 +4652,18 @@ def _connect_choose_endpoint(session: "ConsoleSession") -> str | None:
                         from mantra.core.keys import remove as remove_key
 
                         remove_key(key_env)
+                        key_removed = True
                     except Exception:
-                        pass
-            session._print(session.style.dim(f"  removed '{name}' (+ key {key_env})"))
+                        key_removal_failed = True
+            if key_removed:
+                session._print(session.style.dim(f"  removed '{name}' (+ key {key_env})"))
+            elif key_removal_failed:
+                session._print(session.style.dim(f"  removed '{name}'"))
+                session._print(session.style.warn(f"  warning: could not remove stored key {key_env}"))
+            elif key_env and still_used:
+                session._print(session.style.dim(f"  removed '{name}' (kept key {key_env} — still used by another endpoint)"))
+            else:
+                session._print(session.style.dim(f"  removed '{name}'"))
 
     return _menu(
         session,
@@ -3456,13 +4675,22 @@ def _connect_choose_endpoint(session: "ConsoleSession") -> str | None:
     )
 
 
+def _store_key(session: "ConsoleSession", key_env: str, key: str) -> bool:
+    """Persist a key; a failed write surfaces as an error line, not a crash."""
+    try:
+        store_key(key_env, key)
+        return True
+    except OSError as exc:
+        session._print(session.style.ember(f"  could not save the key: {exc}"))
+        return False
+
+
 def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     """Store a key over whatever is already there.
 
-    Always prompts, even when a key is stored - which is the whole
-    point. A key that was mistyped on the way in used to be permanent:
-    discovery would 401, and running /connect again skipped the prompt
-    because something was already in the store.
+    Always prompts, even when a key is stored: a mistyped key used to
+    be permanent because /connect skipped the prompt once the store
+    held any value at all.
     """
     s = session.style
     llm = session.config.get("llm", {})
@@ -3474,7 +4702,7 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     else:
         base_url = llm.get("base_url", "")
         if not base_url:
-            session._print(s.yellow("  no endpoint to set a key for - /connect first"))
+            session._print(s.warn("  no endpoint to set a key for - /connect first"))
             return False
         name = _derive_name(base_url)
         key_env = _derive_key_env(name)
@@ -3486,7 +4714,7 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
         # The environment wins over the store, so a file key cannot
         # rescue a bad value that came from a variable. Say so rather
         # than accepting a key that will never be used.
-        session._print(s.yellow(f"  ${key_env} is set in this shell and wins over stored keys"))
+        session._print(s.warn(f"  ${key_env} is set in this shell and wins over stored keys"))
         session._print(s.dim(f"  clear it with: set {key_env}=   then re-run /connect key"))
 
     stored = stored_keys().get(key_env, "")
@@ -3504,7 +4732,8 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     if not key:
         session._print(s.dim("  cancelled"))
         return False
-    store_key(key_env, key)
+    if not _store_key(session, key_env, key):
+        return False
     session._print(s.dim(f"  key stored ({mask(key)})"))
     return True
 
@@ -3529,17 +4758,18 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
     url = url.rstrip("/")
     problem = validate_endpoint({"base_url": url})
     if problem:
-        session._print(s.red(f"  {problem}"))
+        session._print(s.ember(f"  {problem}"))
         return False
     if not urlparse(url).hostname:
-        session._print(s.red("  that does not look like a hostname"))
+        session._print(s.ember("  that does not look like a hostname"))
         return False
 
     name = _derive_name(url)
     key_env = _derive_key_env(name)
 
     if key:
-        store_key(key_env, key)
+        if not _store_key(session, key_env, key):
+            return False
         session._print(s.dim(f"  key stored ({mask(key)})"))
     elif provider_needs_key(url, key_env):
         # Always prompt for key in interactive add (visible), show existing
@@ -3548,13 +4778,14 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
             session._print(s.dim(f"  current key {mask(existing)} ({key_env}) — press enter to keep, or paste new"))
         key = _read_choice(session, f"  api key for {name}> ").strip()
         if key:
-            store_key(key_env, key)
+            if not _store_key(session, key_env, key):
+                return False
             # Also clear env if it was wrong and now stored wins after restart; advise
             if os.environ.get(key_env) and os.environ.get(key_env) != key:
-                session._print(s.yellow(f"  note: ${key_env} env still set and wins until you restart shell"))
+                session._print(s.warn(f"  note: ${key_env} env still set and wins until you restart shell"))
             session._print(s.dim(f"  key stored ({mask(key)})"))
         elif not existing:
-            session._print(s.yellow("  no key given - skipping the fetch"))
+            session._print(s.warn("  no key given - skipping the fetch"))
             session._print(s.dim("  store one later with /connect key, or add one to"))
             session._print(s.dim(f"  {settings_path()}"))
             return False
@@ -3563,7 +4794,7 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
     try:
         add_endpoint(name, url, key_env, note=f"added {time.strftime('%Y-%m-%d')}")
     except ValueError as exc:
-        session._print(s.red(f"  {exc}"))
+        session._print(s.ember(f"  {exc}"))
         return False
     session._print(s.dim(f"  saved '{name}' > {url}"))
     if not session.use_endpoint(name):
@@ -3586,9 +4817,8 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
 def _connect(session: "ConsoleSession", args: list[str]) -> bool:
     """Add or switch endpoints, then pick a model from the menu.
 
-    Two values are enough from the operator - a base URL and a key. The
-    catalogue comes from the endpoint itself, so no model name has to be
-    typed or remembered.
+    Only a base URL and a key are needed; the catalogue comes from the
+    endpoint itself.
     """
     if args and args[0].lower() in ("help", "-h", "--help", "?", "h"):
         s = session.style
@@ -3622,8 +4852,14 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
         return True
     if args and args[0].lower() in ("key", "keys"):
         if len(args) >= 3:
-            # /connect key <name> <key> — direct replace no prompt
-            store_key(_derive_key_env(args[1].lower()), args[2])
+            # /connect key <name> <key> — direct replace no prompt.
+            # The endpoint may carry a custom api_key_env; deriving the
+            # env name from the short name would store an orphan key
+            # under the wrong variable that the resolver never reads.
+            entry = known_endpoints().get(args[1].lower())
+            key_env = (entry or {}).get("api_key_env") or _derive_key_env(args[1].lower())
+            if not _store_key(session, key_env, args[2]):
+                return False
             session._print(session.style.dim(f"  key stored for {args[1].lower()} ({args[2][:4]}…{args[2][-4:]})"))
             return True
         if len(args) == 2:
@@ -3665,7 +4901,7 @@ def _connect_remove(session: "ConsoleSession", name: str) -> None:
     if remove_endpoint(name.lower()):
         session._print(session.style.dim(f"  removed '{name}'"))
     else:
-        session._print(session.style.yellow(f"  no endpoint named '{name}'"))
+        session._print(session.style.warn(f"  no endpoint named '{name}'"))
 
 
 def show_keys(session: "ConsoleSession") -> None:
@@ -3695,18 +4931,17 @@ def _read_secret(
 ) -> str:
     """Read a key without echoing it, and own the newline it ends with.
 
-    ``getpass`` is deliberately not used: it writes to a stream of its
-    own choosing and decides for itself whether to end the line, which
-    leaves the frame unable to close the row the key was typed on. That
-    matters more than it sounds - this is the prompt someone reaches
-    for when a key was rejected, so it has to look right.
+    getpass is deliberately not used: it writes to a stream of its own
+    choosing and decides for itself whether to end the line, which
+    leaves the frame unable to close the row the key was typed on.
 
-    Returns "" when there is no terminal to read from, so a piped run
-    answers nothing and moves on instead of blocking.
+    Returns "" when there is no terminal to read from.
     """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return ""
-    sys.stdout.write(prompt_text)
+    # The prompt can carry a user-supplied endpoint name; on a narrow
+    # locale that must degrade, not crash the secret reader.
+    safe_write(prompt_text)
     sys.stdout.flush()
     chars: list[str] = []
     try:
@@ -3751,9 +4986,8 @@ def _derive_name(url: str) -> str:
     """A short handle for an endpoint, e.g. ``https://api.openai.com/v1``.
 
     Strips the ``api.`` and ``www.`` prefixes and the port, then keeps
-    the first label: ``api.openai.com`` -> ``openai``. Used both as the
-    saved provider name and as the seed for the env var name.
-    Suffix from path avoids collision (e.g. /v1 vs /go/v1).
+    the first label: ``api.openai.com`` -> ``openai``. A path-derived
+    suffix avoids collisions between endpoints on one host.
     """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -3780,6 +5014,24 @@ def _derive_name(url: str) -> str:
 def _derive_key_env(name: str) -> str:
     """``openai`` -> ``OPENAI_API_KEY``."""
     return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") + "_API_KEY"
+
+
+def _apply_endpoint_override(config: dict, url: str) -> None:
+    """Point the llm section at ``url`` and pick the matching key env.
+
+    The key env must follow the URL, not inherit the config default:
+    the default is always truthy, so chaining a derivation onto it
+    would never fire. Prefer the saved endpoint entry for this URL,
+    then fall back to deriving from the hostname.
+    """
+    llm = config.setdefault("llm", {})
+    llm["base_url"] = url.rstrip("/")
+    ep_name = endpoint_name_for_url(url)
+    if ep_name:
+        entry = known_endpoints().get(ep_name) or {}
+        llm["api_key_env"] = entry.get("api_key_env") or _derive_key_env(ep_name)
+    else:
+        llm["api_key_env"] = _derive_key_env(_derive_name(url))
 
 
 
@@ -3828,6 +5080,13 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     argument = argument.strip("'\"`")
 
     if command in ("/exit", "/quit"):
+        # Persist the pager state at exit time: content paged through
+        # since the last autosave is dropped, what remains survives an
+        # interrupted resume. Silent when there is nothing to save yet.
+        try:
+            session.autosave()
+        except Exception:
+            pass
         session._print("bye")
         raise SystemExit(0)
     if command in ("/help", "/"):
@@ -3841,7 +5100,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             session._print("(empty)")
         else:
             try:
-                # Cap memory display (file capped at 8000, but be safe)
+                # Cap the memory display even though the file itself is capped.
                 if os.path.getsize(mem) > 20000:
                     with open(mem, encoding="utf-8", errors="replace") as h:
                         data = h.read(8000) + "\n... [truncated]"
@@ -3850,7 +5109,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
                         data = h.read()
                 session._print(data or "(empty)")
             except OSError as exc:
-                session._print(session.style.red(f"  cannot read memory: {exc}"))
+                session._print(session.style.ember(f"  cannot read memory: {exc}"))
     elif command == "/diff":
         session.show_diff()
     elif command == "/undo":
@@ -3963,9 +5222,11 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             session._print("nothing to compact")
     elif command == "/clear":
         session.context.replace_body([])
+        session.approvals.reset_session()
         session.reported_changes.clear()
         session.goal = ""
         session.goal_notes = []
+        session.todos = []
         session.active_skills = []
         session.auto_attached = []
         if session.layout is not None and session.layout.active:
@@ -3977,6 +5238,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         session.reported_changes.clear()
         session.goal = ""
         session.goal_notes = []
+        session.todos = []
         session.active_skills = []
         session.auto_attached = []
         session.approvals.reset_session()
@@ -3993,6 +5255,8 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             session.resume_session(parts[0])
     elif command == "/goal":
         _goal(session, argument)
+    elif command == "/todo":
+        _todo(session, argument)
     elif command == "/workflow":
         _workflow(session, argument)
     elif command in ("/skills", "/skill"):
@@ -4008,7 +5272,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
                 if val < 1:
                     val = 1
                 elif val > 100:
-                    session._print(session.style.yellow("  step limit capped at 100"))
+                    session._print(session.style.warn("  step limit capped at 100"))
                     val = 100
                 session.max_steps = val
                 session._print(f"step limit is now {session.max_steps}")
@@ -4039,9 +5303,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compact", action="store_true", help="Compact TUI (now default, flag kept for compat)")
     args = parser.parse_args(argv)
 
+    # Windows consoles start on cp1252; switching both the console codepage
+    # and the Python streams to UTF-8 is what lets arrows and box-drawing
+    # characters render instead of raising or degrading to "?".
+    force_utf8_output()
+
     config = load_config(args.config)
     # Apply the user's saved active pick so the startup check and header
     # reflect the chosen endpoint instead of the example default.
+    # Failures here are non-fatal: defaults and explicit flags still apply.
     try:
         act = get_active()
         ep_name = (act.get("endpoint") or "").strip()
@@ -4062,9 +5332,7 @@ def main(argv: list[str] | None = None) -> int:
         url = args.endpoint.rstrip("/")
         if not url.startswith(("http://", "https://")):
             parser.error("--endpoint must start with http:// or https://")
-        llm = config.setdefault("llm", {})
-        llm["base_url"] = url
-        llm["api_key_env"] = llm.get("api_key_env") or _derive_key_env(_derive_name(url))
+        _apply_endpoint_override(config, url)
     if args.model:
         config.setdefault("llm", {})["model"] = args.model
     if args.reasoning:
@@ -4089,16 +5357,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.once is not None:
         session._warn_if_key_missing()
-        session.handle(args.once)
+        result = session.handle(args.once)
+        if result is not None and result.stopped_reason in ("error", "aborted"):
+            return 1
         return 0
 
     if needs_setup:
         # Nothing usable is configured, so a dashboard would greet the
-        # operator with an endpoint that cannot answer. Set up first -
-        # and set up *before* the shell opens, because setup is what
-        # decides the endpoint and model the header names. A header is
-        # the one row an append-only terminal cannot go back and fix
-        # once it has scrolled, so it has to be right the first time.
+        # operator with an endpoint that cannot answer. Set up first,
+        # before the shell opens: the header names the endpoint and
+        # model, and a header row cannot be redrawn once scrolled.
         try:
             session._print(style.dim("no endpoint configured yet - let's connect one."))
             _connect(session, [])
@@ -4135,7 +5403,6 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
     fixed_bottom = session.layout is not None and session.layout.active
 
     if reader is None:
-        is_compact = bool(getattr(session, "_compact", False))
 
         def _ctrl_g_handler() -> None:
             if fixed_bottom and session.layout is not None:
@@ -4164,7 +5431,10 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
             on_page_up=_page_up if fixed_bottom else None,
             on_page_down=_page_down if fixed_bottom else None,
         )
-        # Viewport getter for selection auto-copy anywhere
+        # Keys buffered by the turn-scoped scroll reader while a task
+        # streamed are delivered here first, before touching the terminal.
+        editor.preload = session._scroll_preload
+        # Viewport source for selection auto-copy.
         try:
             editor.viewport_getter = lambda: list(session.layout.lines) if session.layout and getattr(session.layout, "active", False) else []
             editor.layout_ref = session.layout
@@ -4174,15 +5444,28 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
         if fixed_bottom and session.layout is not None:
             editor.on_before_draw = lambda count=0: session.layout.restore_popup_rows(count)
 
+            def _sync_prompt_geometry() -> None:
+                # The layout owns geometry; the editor only mirrors it.
+                # Called both from the editor's own resize path and from
+                # layout.check_resize() (via prompt_sync), so the two can
+                # never disagree about where the prompt row is.
+                if session.layout is None:
+                    return
+                editor.fixed_row = session.layout.prompt_row
+                content_height = session.layout.content_bottom - session.layout.content_top + 1
+                editor.max_popup = max(1, min(24, content_height))
+
+            # Registered on the layout so a resize repaint syncs the
+            # editor's rows in the same locked step as the recalc.
+            session.layout.prompt_sync = _sync_prompt_geometry
+
             def _resize_prompt() -> str | None:
                 if session.layout is None:
                     return None
                 with session._pause_spinner():
                     changed = session.layout.check_resize()
                     if changed:
-                        content_height = session.layout.content_bottom - session.layout.content_top + 1
-                        editor.max_popup = max(1, min(24, content_height))
-                        editor.fixed_row = session.layout.prompt_row
+                        _sync_prompt_geometry()
                         return session.prompt_text()
                 return None
 
@@ -4207,6 +5490,8 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                         session.layout.stop_prompt_pulse()
                     except Exception:
                         pass
+                # Strip invisible leading characters from input (same
+                # strip applies in the other two branches below).
                 line = reader(session.prompt_text(), skip_newline=True).strip("﻿​  \t\r\n")
                 # Resume pulse after input, clear prompt so typed text doesn't linger during Chanting/Channeling
                 if session.layout is not None and session.layout.active:
@@ -4223,6 +5508,11 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
         except (KeyboardInterrupt, EOFError):
             return
         if not line:
+            # An empty Enter pages through any output that was capped to a
+            # screenful during the last run - one screenful per press -
+            # instead of being a no-op.
+            if getattr(session, "_pending_pages", None):
+                session.page_next()
             continue
         session._prompt_sent_at = time.time()
         try:
@@ -4230,7 +5520,7 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                 session.layout.move_to_content()
             ts = time.strftime("%H:%M", time.localtime(session._prompt_sent_at))
             display = _mask_line(line)
-            session._print(f"{session.style.on_grey(' ' + ts + ' ')} {session.style.bold(display)}")
+            session._print(f"{session.style._wrap(theme.FAINT, ts)}  {display}")
             if not dispatch(session, line):
                 session.handle(line)
             # The next reader() call draws the fixed prompt.

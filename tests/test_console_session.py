@@ -38,7 +38,7 @@ def make_config(workspace: str, **overrides) -> dict:
     config = merge_defaults({})
     config["logging"] = {"type": "jsonl", "path": os.path.join(workspace, "session.jsonl")}
     config["approvals"] = "auto"
-    config["auto_compact_tokens"] = 0
+    config["auto_compact_tokens"] = 0  # disable mid-turn compaction here
     config.update(overrides)
     return config
 
@@ -56,7 +56,7 @@ def make_session(workspace: str, script: list, **overrides) -> ConsoleSession:
         workspace=workspace,
         style=Style(enabled=False),
         llm=llm,
-        ask=lambda prompt: "y",
+        ask=lambda prompt: "y",  # every approval auto-answered yes
     )
 
 
@@ -138,6 +138,8 @@ class TurnAwareTruncationTest(unittest.TestCase):
     """Dropping messages must never orphan a tool result."""
 
     def _assert_no_orphans(self, messages):
+        # Every tool message must trace back to a preceding assistant
+        # message that actually made the tool call.
         for index, message in enumerate(messages):
             if message.get("role") != "tool":
                 continue
@@ -238,6 +240,52 @@ class ApprovalPolicyTest(unittest.TestCase):
 
     def test_flags_named_format_are_not_destructive(self):
         self.assertNotEqual(classify_command("git log --format=%H"), "destructive")
+
+    def test_compound_command_after_echo_keeps_its_risk(self):
+        # A mutation hidden after "echo ... &&" must not be downgraded to
+        # safe by the echo's read-only early return: the compound splitter
+        # has to see through the quoted echo first.
+        self.assertEqual(classify_command('echo "a" && rm -f x'), "mutating")
+        self.assertEqual(classify_command('echo "a" && rm -rf x'), "destructive")
+        self.assertEqual(classify_command('echo "a" && git reset --hard'), "destructive")
+        self.assertEqual(classify_command('echo "a b" && find . -delete'), "destructive")
+        # Pure echo of data (even destructive-looking data) stays safe.
+        self.assertEqual(classify_command('echo "rm -rf /"'), "safe")
+        self.assertEqual(classify_command('echo "a && b"'), "safe")
+
+    def test_find_exec_rm_is_destructive(self):
+        self.assertEqual(classify_command("find . -exec rm {} +"), "destructive")
+        self.assertEqual(classify_command("find . -execdir rm {} ;"), "destructive")
+        self.assertEqual(classify_command('find . -name "*.py" -exec echo {} ;'), "mutating")
+
+
+class ConsoleEncodingTest(unittest.TestCase):
+    """Model output must not crash the console on a narrow Windows codepage."""
+
+    def test_safe_stdout_survives_non_encodable_characters(self):
+        from mantra.console import _safe_stdout
+
+        result = {"status": "pending"}
+
+        class Narrow:
+            """A stdout whose write() raises UnicodeEncodeError for U+2192."""
+
+            encoding = "cp1252"
+
+            def write(self, text):
+                text.encode("cp1252")  # raises exactly like the real console
+                return len(text)
+
+        real = sys.stdout
+        sys.stdout = Narrow()
+        try:
+            _safe_stdout("ok \u2192 done")
+            result["status"] = "no crash"
+        except Exception as exc:
+            result["status"] = f"crash: {type(exc).__name__}: {exc}"
+        finally:
+            sys.stdout = real
+        self.assertEqual(result["status"], "no crash")
 
     def test_modes(self):
         denied = ApprovalPolicy(mode="plan", ask=lambda p: "y")

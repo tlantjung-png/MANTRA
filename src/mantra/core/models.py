@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -12,6 +13,10 @@ from mantra.core.exceptions import LLMError
 from mantra.core.keys import resolve as resolve_key
 
 DEFAULT_TIMEOUT = 20.0
+
+# Same response cap the chat client applies: a hostile endpoint must not
+# be able to exhaust memory through the catalogue endpoint.
+_MAX_RESPONSE_BYTES = 5_000_000
 
 # Substrings that mark a model as one that thinks before it answers.
 # This is a hint used to offer an effort choice, not a gate: a wrong
@@ -93,7 +98,15 @@ def fetch_models(
     request = urllib.request.Request(f"{base}/models", headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
+            except TypeError:
+                # Some response objects (and test doubles) expose an
+                # argument-less read.
+                raw_bytes = response.read()
+            if len(raw_bytes) > _MAX_RESPONSE_BYTES:
+                raise LLMError("model catalogue response exceeds size cap")
+            raw = raw_bytes.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -111,7 +124,10 @@ def fetch_models(
                 "name by hand: /model <name>"
             ) from exc
         raise LLMError(f"could not list models (HTTP {exc.code}): {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        # IncompleteRead (a truncated body) is an HTTPException, not an
+        # OSError, so it is named explicitly rather than left to escape as
+        # a raw traceback into the /model menu.
         raise LLMError(f"could not reach {base}: {exc}") from exc
 
     try:

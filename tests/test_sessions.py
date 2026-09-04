@@ -32,6 +32,15 @@ class StoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # Restore whatever the harness had set (e.g. the conftest's
+        # redirect) rather than popping: deleting the variable would
+        # silently send later tests back to the real store. Pop first
+        # (LIFO), then put the prior value back when there was one.
+        prior = os.environ.get(sessions._OVERRIDE_ENV)
+        if prior is not None:
+            # addCleanup is LIFO: this runs after the pop below, restoring
+            # whatever the harness had set.
+            self.addCleanup(os.environ.setdefault, sessions._OVERRIDE_ENV, prior)
         self.addCleanup(os.environ.pop, sessions._OVERRIDE_ENV, None)
         os.environ[sessions._OVERRIDE_ENV] = self.tmp
 
@@ -113,6 +122,7 @@ class DeriveNameTest(unittest.TestCase):
     def test_two_sessions_in_one_directory_do_not_collide(self):
         first = sessions.derive_name("C:\\work\\proj")
         sessions.save(first, {"messages": _messages()})
+        # Same-second names must still diverge via the collision suffix.
         with mock.patch.object(sessions.time, "strftime", return_value="20260101-000000"):
             second = sessions.derive_name("C:\\work\\proj")
             sessions.save(second, {"messages": _messages()})
@@ -124,6 +134,11 @@ class SessionTestBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(os.environ.pop, "MANTRA_SETTINGS", None)
+        prior = os.environ.get(sessions._OVERRIDE_ENV)
+        if prior is not None:
+            # addCleanup is LIFO: this runs after the pop below, restoring
+            # whatever the harness had set.
+            self.addCleanup(os.environ.setdefault, sessions._OVERRIDE_ENV, prior)
         self.addCleanup(os.environ.pop, sessions._OVERRIDE_ENV, None)
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
         os.environ[sessions._OVERRIDE_ENV] = os.path.join(self.tmp, "sessions")
@@ -140,7 +155,7 @@ class SessionTestBase(unittest.TestCase):
             llm=ScriptedLLMClient([]),
             ask=lambda prompt: "y",
         )
-        session.context = ContextManager(max_messages=50, max_chars=100000)
+        session.context = ContextManager(max_messages=50, max_chars=100000)  # room for multi-turn tests
         return session
 
 

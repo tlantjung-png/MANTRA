@@ -57,6 +57,7 @@ def _read(path: Path | None) -> str:
 
 
 def _resources(directory: Path) -> list[str]:
+    """Support files beside SKILL.md, as sorted posix-relative paths."""
     out = []
     try:
         for file in sorted(directory.rglob("*")):
@@ -80,7 +81,13 @@ def roots() -> list[Path]:
                 found.append(Path(part))
         return found
     home = Path.home()
-    return [home / candidate for candidate in _CANDIDATE_ROOTS]
+    # The repo-shipped library comes first; the personal tree supplements it.
+    repo = Path(__file__).resolve().parents[3] / "skills"
+    out = []
+    if repo.is_dir():
+        out.append(repo)
+    out.extend(home / candidate for candidate in _CANDIDATE_ROOTS)
+    return out
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -138,6 +145,7 @@ def load_skill(directory: Path) -> Skill | None:
     )
 
 
+# Index caches share one TTL: skills, bundles, and the routing table.
 _CACHE_TTL = 1.5
 _cache_all: dict[str, Skill] | None = None
 _cache_all_ts: float = 0.0
@@ -159,7 +167,7 @@ def load_all() -> dict[str, Skill]:
     current_roots = tuple(str(r) for r in roots())
     now = time.monotonic()
     if _cache_all is not None and _cache_all_roots == current_roots and (now - _cache_all_ts) < _CACHE_TTL:
-        return dict(_cache_all)
+        return dict(_cache_all)  # Defensive copy: callers must not corrupt the cache.
     found: dict[str, Skill] = {}
     for root in roots():
         if not root.is_dir():
@@ -183,13 +191,7 @@ def load_all() -> dict[str, Skill]:
 
 
 def invalidate_cache() -> None:
-    """Forget everything indexed so far.
-
-    Skill directories are files on disk, but the index is held for a
-    moment to avoid rescanning on every turn. After an edit, that moment
-    is exactly when the operator wants to see the change, so the console
-    exposes a way to drop it.
-    """
+    """Drop all index caches so on-disk edits take effect immediately."""
     global _cache_all, _cache_all_ts, _cache_all_roots, _cache_bundles, _cache_bundles_ts, _cache_bundles_roots, _cache_routing, _cache_routing_ts, _cache_routing_roots
     _cache_all = None
     _cache_all_ts = 0.0
@@ -384,14 +386,7 @@ def _search_text(skill: Skill, index: dict[str, dict[str, str]]) -> str:
 
 
 def _idf(known: list[Skill], index: dict[str, dict[str, str]]) -> dict[str, float]:
-    """Rarity weight per stem, inversely proportional to how many skills use it.
-
-    "test" appears in half the catalog and says almost nothing about which
-    skill was meant; "reproduce" appears in two and says nearly everything.
-    Scoring every matched word the same let whichever skill had the longest
-    description win on incidental overlap, which put "analytics" above
-    "debug" for the request "reproduce a failing test".
-    """
+    """Rarity weight per stem: the fewer skills use a word, the more it signals."""
     counts: dict[str, int] = {}
     for skill in known:
         for token in _stems(_search_text(skill, index)) | _stems(skill.name):
@@ -433,7 +428,7 @@ def route(query: str, limit: int = 5) -> list[tuple[Skill, float]]:
         score = sum(weights.get(token, 1.0) for token in hits)
         score += 2 * sum(weights.get(token, 1.0) for token in _hits(wanted, names))
         scored.append((skill, score))
-    scored.sort(key=lambda pair: (-pair[1], pair[0].name))
+    scored.sort(key=lambda pair: (-pair[1], pair[0].name))  # score desc, then name
     return scored[:limit]
 
 
@@ -446,19 +441,10 @@ _MARGIN = 1.25
 
 
 def match_bundle(query: str) -> str | None:
-    """The bundle whose name the request speaks, if any.
+    """The bundle whose exact name the request speaks, if any.
 
-    Name only, deliberately. Matching on the members was tried first and
-    is hopeless: a bundle holds five or six skills which between them
-    mention work, read, write, test and create, so almost every request
-    scored a full match against something - asking for one small file to
-    be created offered the entire ship-feature sequence. Weighting by
-    rarity did not rescue it either, because two common words ("write a
-    test") cover 100% of a short request while four rare ones cover only
-    40% of a genuinely matching one.
-
-    The name is the only part the operator actually says, so it is the
-    only part worth trusting.
+    Name only, deliberately: bundles share so many member words that
+    member matching matched almost every request.
     """
     wanted = _stems(query)
     if not wanted:
@@ -478,6 +464,7 @@ def match_bundle(query: str) -> str | None:
     return best_name
 
 
+# Words marking a vague workspace query; these never auto-attach a skill.
 _GENERIC_NO_AUTO = frozenset({"explain", "project", "workspace", "codebase", "repo", "overview", "summarise", "summarize", "what", "does", "about", "code", "this"})
 
 
@@ -492,7 +479,7 @@ def recommend(query: str) -> tuple[Skill | None, str | None]:
     wanted = _stems(query)
     if wanted and wanted.issubset(_GENERIC_NO_AUTO | {"thi", "what"}):
         return None, match_bundle(query)
-    # Don't hijack "explain this project" / "what this project does" with help skill
+    # Don't auto-attach the help skill to generic workspace queries.
     if wanted and "project" in wanted and len(wanted) <= 3:
         return None, match_bundle(query)
     ranked = route(query, limit=6)

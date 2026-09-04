@@ -103,6 +103,15 @@ class ContextManager:
         """Recompute sizes after in-place edits."""
         self._recount()
 
+    def enforce_budget(self) -> None:
+        """Apply the budget to the current list, whatever put it there.
+
+        Loading a saved session replaces the message list wholesale, so
+        the budget must be re-applied explicitly afterwards.
+        """
+        self._recount()
+        self._truncate()
+
     @property
     def tokens(self) -> int:
         return estimate_tokens(self.messages)

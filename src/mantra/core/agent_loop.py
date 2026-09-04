@@ -10,6 +10,7 @@ from typing import Any
 
 from mantra.core.context import ContextManager
 from mantra.core.events import EventBus
+from mantra.core.approvals import _redact_sensitive
 from mantra.core.exceptions import AbortError, LLMError, SandboxError, ToolError
 from mantra.core.tool_repairs import repair_arguments, validate_arguments
 from mantra.interfaces.evaluator import EvaluationResult, Evaluator
@@ -58,6 +59,7 @@ class AgentLoop:
         context: ContextManager | None = None,
         abort: threading.Event | None = None,
         approver: Any = None,
+        on_tool_result: Any = None,
     ) -> None:
         self.llm = llm
         self.sandbox = sandbox
@@ -71,6 +73,11 @@ class AgentLoop:
         self.context = context
         self.abort = abort
         self.approver = approver
+        # Receives (tool_name, observation, step) right after each tool
+        # executes, so a UI can show what the agent actually saw (command
+        # output, file contents) without putting that content into event
+        # payloads or the run log.
+        self.on_tool_result = on_tool_result
 
     @property
     def aborted(self) -> bool:
@@ -97,6 +104,21 @@ class AgentLoop:
         aborted = False
         metrics: dict[str, float] = {"tool_errors": 0, "denied": 0}
         recent_calls: dict[str, int] = {}
+        # A single empty final is often transient — a reasoning model can
+        # spend its whole output budget on reasoning and emit nothing, or a
+        # provider can drop a completion. Nudging once or twice usually
+        # recovers it. Bounded retries keep the anti-burn guarantee: a
+        # model that is *persistently* empty still fails fast instead of
+        # exhausting max_steps with identical context.
+        empty_finals = 0
+        max_empty_finals = 2
+        # A response cut off mid-tool-call (the output budget ran out while
+        # the model was still writing a tool call's JSON, so the stream ends
+        # with an unparseable half) raises from the client. Like an empty
+        # final it is usually transient, so nudge and retry a bounded number
+        # of times; only give up with actionable advice.
+        truncated_calls = 0
+        max_truncated_calls = 2
 
         try:
             self.sandbox.setup(task)
@@ -106,9 +128,44 @@ class AgentLoop:
                     break
                 steps += 1
 
-                response = self.llm.chat(
-                    context.messages, tools=tool_schemas, on_delta=self.on_delta
-                )
+                try:
+                    response = self.llm.chat(
+                        context.messages, tools=tool_schemas, on_delta=self.on_delta
+                    )
+                except LLMError as exc:
+                    message = str(exc)
+                    if "ended mid-tool-call" not in message:
+                        raise
+                    truncated_calls += 1
+                    if truncated_calls > max_truncated_calls:
+                        # Surface the tool name, not the raw JSON decode
+                        # error - the operator needs the cause (budget),
+                        # not the truncated fragment.
+                        tool = ""
+                        try:
+                            tool = message.split("mid-tool-call (", 1)[1].split(")", 1)[0]
+                        except Exception:
+                            tool = ""
+                        raise LLMError(
+                            "the model response was cut off mid-tool-call"
+                            + (f" ({tool})" if tool else "")
+                            + " three times: the output budget was exhausted while "
+                            "writing the tool call. Raise max_tokens or lower "
+                            "reasoning_effort in the llm config, then retry."
+                        ) from exc
+                    # Transient: nudge once and let the model re-issue the
+                    # call. Retrying with identical context would reproduce
+                    # the same cut, so the nudge is what makes it recover.
+                    context.append(
+                        {
+                            "role": "user",
+                            "content": "(Your previous response was cut off mid-tool-call - "
+                            "the output budget probably ran out while writing the tool call. "
+                            "Re-issue the tool call in full now, or answer directly if the "
+                            "previous tool results already suffice.)",
+                        }
+                    )
+                    continue
                 # Response must be LLMResponse-like.
                 if response is None or not hasattr(response, "is_final"):
                     raise LLMError(f"LLM returned invalid response: {type(response).__name__}")
@@ -118,12 +175,23 @@ class AgentLoop:
                     raw = response.content
                     content_str = raw if isinstance(raw, str) else (str(raw) if raw is not None else "")
                     if not content_str.strip() and not (getattr(response, "tool_calls", None) or []):
-                        # Empty final — treat as error if model repeatedly empty
-                        if steps >= self.max_steps:
-                            stopped_reason = "error"
-                            final_message = "mantra error: model returned empty final"
-                            break
-                        continue
+                        # Empty final with nothing to say. Retrying with the
+                        # identical context would reproduce the same empty
+                        # reply, so change the context (a nudge) and retry a
+                        # bounded number of times before giving up.
+                        empty_finals += 1
+                        if empty_finals <= max_empty_finals:
+                            context.append(
+                                {
+                                    "role": "user",
+                                    "content": "(Your previous response was empty. "
+                                    "Please provide your final answer now, even if brief.)",
+                                }
+                            )
+                            continue
+                        stopped_reason = "error"
+                        final_message = "mantra error: model returned empty final"
+                        break
                     stopped_reason = "final"
                     # Normalize final_message to string for downstream consumers
                     final_message = content_str if isinstance(raw, str) else (str(raw) if raw is not None else "")
@@ -183,38 +251,40 @@ class AgentLoop:
                                 }
                             )
                         break
-                    # Intent-normalized loop breaker (12hex SHA256 of tool|primary)
-                    # Uses full primary argument plus length to avoid collisions
-                    # from truncation. Bounded registry prunes oldest entries.
+                    # Intent-normalized loop breaker. The key is the tool
+                    # plus a canonical form of its arguments, so a windowed
+                    # re-read (different offset/limit) is never mistaken
+                    # for a repeat; a successful write/edit clears the
+                    # read counters for that path so a verification
+                    # re-read after a change is allowed.
+                    import hashlib
+
+                    written_path = ""
                     try:
                         args = call.arguments if isinstance(call.arguments, dict) else {}
-                        primary = ""
-                        if call.name in ("read_file", "write_file", "edit_file", "list_dir"):
-                            primary = str(args.get("path", ""))
-                        elif call.name == "run_command":
-                            primary = str(args.get("command", ""))
-                        elif call.name == "search_code":
-                            primary = str(args.get("query", ""))
-                        elif call.name == "find_file":
-                            primary = str(args.get("pattern", ""))
-                        elif call.name == "web_fetch":
-                            primary = str(args.get("url", ""))
-                        elif call.name == "shell_output":
-                            primary = str(args.get("task_id", ""))
-                        elif call.name == "kill_shell":
-                            primary = str(args.get("task_id") or args.get("pid") or args.get("port") or "")
+                        if call.name == "run_command":
+                            key = f"run_command|{str(args.get('command', '')).strip()}"
+                        elif call.name in ("read_file", "list_dir"):
+                            rest = {k: v for k, v in args.items() if k != "path"}
+                            rest_json = json.dumps(rest, sort_keys=True, ensure_ascii=False, default=str)
+                            key = (
+                                f"{call.name}|{args.get('path', '')}|"
+                                f"{hashlib.sha256(rest_json.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                            )
+                        elif call.name in ("write_file", "edit_file"):
+                            payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+                            key = (
+                                f"{call.name}|{args.get('path', '')}|"
+                                f"{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                            )
+                            written_path = str(args.get("path", ""))
                         else:
-                            primary = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
-                        import hashlib
-
-                        # Include length so same-prefix different-length args differ
-                        intent_input = f"{call.name}|{len(primary)}|{primary}"
-                        intent_sig = hashlib.sha256(intent_input.encode("utf-8")).hexdigest()[:12]
-                        exact_sig = hashlib.sha256(json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", errors="replace")).hexdigest()[:12] if call.arguments else "noargs"
-                        key = f"{call.name}|{intent_sig}"
+                            payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+                            key = f"{call.name}|{payload}" if len(payload) < 300 else (
+                                f"{call.name}|{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                            )
                         cnt = recent_calls.get(key, 0) + 1
                         recent_calls[key] = cnt
-                        recent_calls[f"{key}|exact:{exact_sig}"] = recent_calls.get(f"{key}|exact:{exact_sig}", 0) + 1
                         # Bound registry to prevent unbounded growth
                         if len(recent_calls) > 500:
                             # Remove oldest 100 entries (dict preserves insertion order)
@@ -229,13 +299,29 @@ class AgentLoop:
                         cnt = recent_calls.get(key, 0) + 1
                         recent_calls[key] = cnt
                     if cnt >= 3:
-                        observation = f"STOP RETRYING: you already called {call.name} with same intent {cnt} times (intent {intent_sig}). Use the previous result. If you need a different result, change the primary argument (path/query/command) not the same one."
+                        observation = f"STOP RETRYING: you already called {call.name} with the same arguments {cnt} times. Use the previous result. If you need a different result, change the arguments (a different path, offset, or command)."
                         metrics["tool_errors"] += 1
                     elif cnt == 2:
                         observation = f"ERROR: you already called {call.name} {call.arguments} — result is already in history above. Do not repeat. Use it or try a different file (e.g. README.md, pyproject.toml)."
                         metrics["tool_errors"] += 1
                     else:
                         observation = self._dispatch_tool(task_id, steps, call, metrics)
+                        if (
+                            written_path
+                            and isinstance(observation, str)
+                            and observation.startswith("OK")
+                        ):
+                            # A successful write/edit invalidates earlier
+                            # reads of that path: allow re-reading it.
+                            norm = written_path.replace("\\", "/")
+                            for done_key in [
+                                k for k in recent_calls
+                                if k.startswith(f"read_file|{written_path}|")
+                                or k.startswith(f"read_file|{norm}|")
+                                or k.startswith(f"list_dir|{written_path}|")
+                                or k.startswith(f"list_dir|{norm}|")
+                            ]:
+                                recent_calls.pop(done_key, None)
                     context.append(
                         {
                             "role": "tool",
@@ -295,7 +381,14 @@ class AgentLoop:
             elapsed_seconds=elapsed,
         )
         self._emit("run_end", _result_payload(result))
-        self.logger.log("run_result", _result_payload(result))
+        # The work is done and the result exists; a logger failure (disk
+        # full, permissions, an implementation bug) must not turn a
+        # completed run into an exception for the caller. Same contract
+        # as _emit: log best-effort, never break run().
+        try:
+            self.logger.log("run_result", _result_payload(result))
+        except Exception:
+            pass
         return result
 
     def _dispatch_tool(
@@ -322,7 +415,16 @@ class AgentLoop:
         self, task_id: str, step: int, call, metrics: dict[str, float]
     ) -> str:
         """Dispatch one tool call; every failure becomes an observation."""
-        tool = self.tools.get(call.name)
+        # Registry aliases (e.g. webfetch -> web_fetch) are normalised at
+        # build time, so look up the canonical form here or an aliased call
+        # would be reported as an unknown tool.
+        name = call.name
+        tool = self.tools.get(name)
+        if tool is None:
+            canonical = str(name or "").strip().lower().replace("-", "_")
+            if canonical == "webfetch":
+                canonical = "web_fetch"
+            tool = self.tools.get(canonical)
         if tool is None:
             metrics["tool_errors"] += 1
             return f"ERROR: unknown tool '{call.name}'"
@@ -350,9 +452,19 @@ class AgentLoop:
                     f"Expected {schema.get('properties', {}) if schema else 'valid args'}. "
                     f"Fix and retry the same tool call."
                 )
+        # Event/log payloads must not carry raw secrets: file contents and
+        # command text can embed credentials, so arguments are redacted and
+        # truncated exactly like the pre-tool-use audit log.
+        redacted: dict[str, Any] = {}
+        for key_, value in args.items():
+            if isinstance(value, str):
+                value = _redact_sensitive(value)
+                if len(value) > 300:
+                    value = value[:297] + "..."
+            redacted[key_] = value
         self._emit(
             "tool_call",
-            {"task_id": task_id, "step": step, "tool": call.name, "args": args},
+            {"task_id": task_id, "step": step, "tool": call.name, "args": redacted},
         )
         started = time.monotonic()
         try:
@@ -375,15 +487,33 @@ class AgentLoop:
         }
         if call.name in ("edit_file", "write_file"):
             result_payload["result"] = observation
+        # Give the UI the raw observation for display-only tools (command
+        # output, file reads). Kept off the event payload and the run log
+        # so output size and any embedded secrets stay between the agent
+        # and the operator's screen.
+        if self.on_tool_result is not None:
+            try:
+                self.on_tool_result(call.name, observation, step)
+            except Exception:
+                pass
         self._emit("tool_result", result_payload)
         return observation
 
     def _seed_context(self, context: ContextManager, task: dict[str, Any]) -> None:
-        """Seed first turn or append to existing history, respecting budget."""
+        """Seed first turn or refresh the pinned prompt for an ongoing one.
+
+        The system prompt is rebuilt every turn (goals, attached skills,
+        environment facts and memory change mid-session, and a resumed
+        session carries a stale one), so when history already exists the
+        pinned first message is replaced in place instead of ignored.
+        """
         rendered = self._render_task(task)
         if not context.messages:
             context.seed(self.system_prompt, rendered)
         else:
+            if context.messages[0].get("role") == "system":
+                context.messages[0] = {"role": "system", "content": self.system_prompt}
+                context.resync()
             # Check budget before append to avoid immediate truncation
             if len(rendered) > context.max_chars:
                 rendered = rendered[: max(1000, int(context.max_chars * 0.8))] + "\n... [truncated — task too large]"

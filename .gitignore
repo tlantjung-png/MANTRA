@@ -26,3 +26,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Harness state (any level)
+.mantra/
+.grok/

@@ -27,6 +27,7 @@ class ScriptedLLMClient(LLMClient):
 
 def tool_call_response(name: str, arguments: dict) -> LLMResponse:
     """Helper to build a one-tool-call response."""
+    # Module-global counter keeps tool-call ids unique across calls and tests.
     global _call_counter
     _call_counter += 1
     return LLMResponse(
@@ -48,10 +49,14 @@ def final_response(content: str, stream: bool = False) -> LLMResponse:
 
     def chat(self, messages, tools=None, on_delta=None):
         if on_delta:
+            # Word-split with a trailing space per word, so the delta
+            # stream round-trips word boundaries.
             for word in content.split(" "):
                 on_delta(word + " ")
         return response
 
     client = ScriptedLLMClient([response])
+    # Replace the instance method so the streaming variant emits deltas
+    # instead of replaying the queued script.
     client.chat = types.MethodType(chat, client)
     return client

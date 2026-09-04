@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 
 
 def content_hash(content: str) -> str:
@@ -44,12 +45,18 @@ class EditLedger:
 
     @staticmethod
     def _key(path: str) -> str:
-        """Normalize path to one key per file; preserve .env distinction."""
+        """Normalize path to one key per file; preserve .env distinction.
+
+        Case is folded only where the platform's filesystem is
+        case-insensitive, matching how the read tool keys its own
+        per-file state.
+        """
         import posixpath
 
         normalized = path.replace("\\", "/")
-        # posixpath.normpath collapses redundant separators and ./ but
-        # also strips trailing slash — re-add for directory markers handled above
+        # Collapses redundant separators and ./; trailing slashes are
+        # stripped and stay stripped, so a dir and same-named file share
+        # one key.
         normalized = posixpath.normpath(normalized)
         # normpath turns "" into ".", restore empty
         if normalized == ".":
@@ -57,4 +64,6 @@ class EditLedger:
         # Remove leading ./ that normpath may leave as "./a"
         if normalized.startswith("./"):
             normalized = normalized[2:]
+        if os.name == "nt":
+            normalized = normalized.lower()
         return normalized

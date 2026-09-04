@@ -30,44 +30,9 @@ _LINE_WINDOW = 2000
 _BYTE_BUDGET = 128 * 1024  # 128KB
 _PER_LINE_CLAMP = 2000
 
-# File ledger for dedup persistence (harness read-ledger-*.json)
-_LEDGER_DIR = os.path.join(os.path.expanduser("~"), ".mantra", "state")
-_LEDGER_FILE = os.path.join(_LEDGER_DIR, "read-ledger.json")
-
-def _get_file_sha256(full_path: str) -> str:
-    import hashlib
-    try:
-        h = hashlib.sha256()
-        with open(full_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return ""
-
-def _load_ledger() -> dict[str, Any]:
-    try:
-        if os.path.exists(_LEDGER_FILE):
-            import json
-            with open(_LEDGER_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-    except Exception:
-        pass
-    return {}
-
-def _save_ledger(ledger: dict[str, Any]) -> None:
-    try:
-        os.makedirs(_LEDGER_DIR, exist_ok=True)
-        tmp = _LEDGER_FILE + f".{os.getpid()}.tmp"
-        import json
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(ledger, f, indent=2)
-        # Atomic move
-        os.replace(tmp, _LEDGER_FILE)
-    except Exception:
-        pass
+# Cached read results are kept only below this size so the dedup cache
+# stays bounded (~100 entries x 100KB worst case).
+_DEDUP_CACHE_MAX_CHARS = 100_000
 
 def _is_strict_positive_int(s: str, allow_zero: bool = False) -> bool:
     """harness Convert-StrictPositiveInt: regex ^(0|[1-9][0-9]*)$, no 2abc, no 1.5"""
@@ -202,8 +167,7 @@ class ReadFileTool(Tool):
             path = str(path)
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
-        # harness strict int validation (read-safe.ps1:19) — reject "2abc", "1.5"
-        # Use string check before int conversion for strictness
+        # Strict integer validation: reject "2abc" and "1.5".
         if isinstance(offset, str):
             if not _is_strict_positive_int(offset, allow_zero=True):
                 return f"ERROR: offset must be a non-negative integer, got {offset!r}"
@@ -244,11 +208,19 @@ class ReadFileTool(Tool):
             if _is_blocked_path_harness(path) or _is_blocked_device(path):
                 return f"ERROR: refusing to read pattern {path!r}: blocked"
             return self._execute_bulk(sandbox, path, offset, limit)
-        # Comma-separated list heuristic — handle both / and \ separators
-        if "," in path and "/" not in path.split(",")[0] and "\\" not in path.split(",")[0]:
-            # Heuristic: comma-separated list of files
+        # Comma-separated list heuristic — every segment must be a plain
+        # separator-free name, and the whole path must not itself exist:
+        # a genuine filename that contains a comma wins over the list form.
+        if "," in path:
             parts = [p.strip() for p in path.split(",") if p.strip()]
-            if len(parts) > 1:
+            whole_exists = False
+            root_ = getattr(sandbox, "root", None)
+            if root_ is not None:
+                try:
+                    whole_exists = os.path.isfile(os.path.join(root_, path))
+                except OSError:
+                    whole_exists = False
+            if len(parts) > 1 and not whole_exists and all(("/" not in p and "\\" not in p) for p in parts):
                 # Validate each part before bulk
                 for p in parts:
                     if _is_blocked_path_harness(p) or _is_blocked_device(p):
@@ -321,34 +293,20 @@ class ReadFileTool(Tool):
         return f"READ {len(out_parts)}/{len(paths)} files\n" + "\n".join(out_parts)
 
     def _execute_single(self, sandbox: Sandbox, path: str, offset: int, limit: int) -> str:
-        # Dedup check: same window of unchanged file (in-memory + file ledger)
+        # Dedup check: an unchanged window of an unchanged file returns the
+        # cached result itself, so the model gets the content instead of a
+        # note that forces a second read.
         root = getattr(sandbox, "root", None)
         dedup_key = (path, offset, limit)
         try:
             if root is not None:
                 full_check = os.path.join(root, path)
                 st = os.stat(full_check)
-                mtime, size = st.st_mtime, st.st_size
-                # File ledger check (persistent) — use case-sensitive key on
-                # POSIX and case-insensitive only on Windows.
-                try:
-                    ledger = _load_ledger()
-                    real = os.path.realpath(full_check)
-                    key = real.lower() if os.name == "nt" else real
-                    entry = ledger.get(key)
-                    if entry and entry.get("sha256") == _get_file_sha256(full_check) and entry.get("fullView"):
-                        # Only dedup if current request is also for full view
-                        prev_limit = entry.get("limit", _LINE_WINDOW)
-                        if offset == 0 and limit >= _LINE_WINDOW and limit >= prev_limit:
-                            _save_ledger({k: v for k, v in ledger.items() if k != key})
-                            return f'Note: unchanged read for {path!r} offset={offset} limit={limit} — already in history (file ledger), reuse previous result.'
-                except Exception:
-                    pass
                 cached = self._dedup.get(dedup_key)
-                if cached and cached[0] == mtime and cached[1] == size:
+                if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
                     # Self-expiring: consume record
                     del self._dedup[dedup_key]
-                    return f'Note: unchanged read for {path!r} offset={offset} limit={limit} — already in history, reuse previous result.'
+                    return cached[2]
         except Exception:
             pass
 
@@ -403,14 +361,16 @@ class ReadFileTool(Tool):
         elif len(content) > 8192:
             _sample += content[-4096:]
         if "\x00" in _sample:
-            # Try mime
+            # Detected binary content is never displayed; the extension
+            # only decides the advisory note. SVG is XML, so it stays
+            # readable despite occasionally carrying null-free markers.
             ext = os.path.splitext(path)[1].lower()
             if ext == ".svg":
-                pass  # svg is xml, allow
-            elif ext in (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".tar", ".gz"):
-                mime = ext.lstrip(".")
-                if ext == ".pdf":
-                    return f"Note: {path!r} is a PDF ({len(content)} bytes). Use pdftotext or read specific pages."
+                pass
+            elif ext == ".pdf":
+                return f"Note: {path!r} is a PDF ({len(content)} bytes). Use pdftotext or read specific pages."
+            else:
+                mime = ext.lstrip(".") or "unknown"
                 return f"Note: {path!r} is binary ({mime}, {len(content)} bytes) — not displayed."
 
         # Empty file
@@ -446,6 +406,8 @@ class ReadFileTool(Tool):
         if len(text.encode("utf-8", errors="replace")) > _BYTE_BUDGET:
             raw = "\n".join(window).encode("utf-8", errors="replace")
             cut = min(_BYTE_BUDGET, len(raw) - 1)
+            # Walk back over UTF-8 continuation bytes so the cut never
+            # splits a multi-byte character.
             while cut > 0 and cut < len(raw) and (raw[cut] & 0xC0) == 0x80:
                 cut -= 1
             text = raw[:cut].decode("utf-8", errors="replace")
@@ -478,34 +440,13 @@ class ReadFileTool(Tool):
             except Exception:
                 pass
 
-        # Dedup: store for future unchanged check (in-memory + file ledger)
+        # Dedup: store the full previous result for the unchanged check
+        # (bounded: only results under the cache ceiling are kept).
         try:
-            if root is not None:
+            if root is not None and len(result) <= _DEDUP_CACHE_MAX_CHARS:
                 full = os.path.join(root, path)
                 st = os.stat(full)
-                self._dedup[dedup_key] = (st.st_mtime, st.st_size, content[:1000])
-                # File ledger persistence
-                try:
-                    ledger = _load_ledger()
-                    real_full = os.path.realpath(full)
-                    key = real_full.lower() if os.name == "nt" else real_full
-                    ledger[key] = {
-                        "path": full,
-                        "sha256": _get_file_sha256(full),
-                        "mtime": st.st_mtime,
-                        "size": st.st_size,
-                        "fullView": not (len(window) < total_lines or truncated_by_bytes),
-                        "offset": offset,
-                        "limit": limit,
-                    }
-                    # Prune file ledger to 200 entries
-                    if len(ledger) > 200:
-                        # Remove oldest by mtime
-                        oldest = min(ledger.items(), key=lambda x: x[1].get("mtime", 0))[0]
-                        ledger.pop(oldest, None)
-                    _save_ledger(ledger)
-                except Exception:
-                    pass
+                self._dedup[dedup_key] = (st.st_mtime, st.st_size, result)
                 # Prune cache
                 if len(self._dedup) > 100:
                     # remove oldest
@@ -534,7 +475,7 @@ class WriteFileTool(Tool):
 
     ledger = None  # EditLedger, injected by the registry
 
-    def execute(self, sandbox: Sandbox, content: str, path: str) -> str:
+    def execute(self, sandbox: Sandbox, path: str, content: str) -> str:
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
         blocked = _is_blocked_path_harness(path)
@@ -586,9 +527,21 @@ class EditFileTool(Tool):
             content = sandbox.read_file(path)
         except Exception as exc:  # noqa: BLE001
             return f"ERROR: cannot read {path}: {exc}"
+        if content.endswith("\n... [truncated]"):
+            # The sandbox itself had to cut the read: editing would write
+            # the truncated form back and destroy the file's tail.
+            return (
+                f"ERROR: {path} is too large to read in one pass, so it cannot "
+                "be edited with edit_file (an edit would write back a truncated "
+                "file). Use read_file windows plus run_command, or rewrite the "
+                "file in sections."
+            )
         if len(content) > _BYTE_BUDGET:
-            # For large files, require write_file with complete content
-            return f"ERROR: {path} is too large to edit with edit_file ({len(content)} bytes > {_BYTE_BUDGET}); use write_file with complete content"
+            # Large but fully readable: the edit itself is safe, but the
+            # model has only seen part of the file through the read tool's
+            # display budget, so a full-view read is required first. The
+            # partial-view check below enforces that.
+            pass
         if self.ledger is not None:
             if not self.ledger.has_seen(path):
                 return (

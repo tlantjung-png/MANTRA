@@ -74,7 +74,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
                 except AbortError:
                     raise
                 except Exception:
-                    pass
+                    pass  # observer errors never fail the stream
         for call in delta.get("tool_calls") or []:
             try:
                 idx = int(call.get("index", 0))
@@ -99,7 +99,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
                     arg_part = str(arg_part)
                 slot["args"] += arg_part
 
-    # Stream ended without sentinel and no data is truncated.
+    # No sentinel, no content, no calls, no usage: the stream was empty.
     if not seen_done and not content_parts and not tool_acc and usage is None:
         raise LLMError("stream ended without DONE and no data")
     tool_calls = []
@@ -164,6 +164,10 @@ class OpenAICompatClient(LLMClient):
         self._token_budget = max_tokens
         self.last_usage: dict | None = None
         self._lock = threading.Lock()
+        # Set once the alternate endpoint is known to be missing, so later
+        # requests skip the probe and surface the original error (which the
+        # retry loop can then treat as transient).
+        self._responses_unavailable = False
 
     def chat(
         self,
@@ -183,6 +187,15 @@ class OpenAICompatClient(LLMClient):
             )
 
         use_stream = self.stream and on_delta is not None
+        # Once a fragment has reached the callback, retrying would replay
+        # already-rendered text into the UI. A mid-stream drop then fails
+        # the turn instead of duplicating output.
+        emitted = {"delta": False}
+        stream_cb = on_delta
+        if use_stream and on_delta is not None:
+            def stream_cb(piece: str) -> None:
+                emitted["delta"] = True
+                on_delta(piece)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -203,7 +216,7 @@ class OpenAICompatClient(LLMClient):
             body = json.dumps(payload).encode("utf-8")
             try:
                 if use_stream:
-                    response = self._request_stream(body, on_delta)
+                    response = self._request_stream(body, stream_cb)
                 else:
                     response = self._request(body)
                 if response.usage:
@@ -215,10 +228,8 @@ class OpenAICompatClient(LLMClient):
                     detail = exc.read().decode(errors="replace")[:300]
                 except OSError:
                     pass
-                # Each downgrade has to be for the field the server
-                # actually complained about. Dropping reasoning_effort
-                # because max_tokens was rejected would quietly turn off
-                # reasoning on precisely the models that need it.
+                # Downgrade only the field the server complained about;
+                # dropping an unrelated field would silently disable it.
                 if exc.code == 400 and payload.get("stream_options") \
                         and self._blamed(detail, "stream_options"):
                     with self._lock:
@@ -252,9 +263,8 @@ class OpenAICompatClient(LLMClient):
                         f"(HTTP {exc.code}) at {self.base_url}: {detail}"
                     ) from exc
                 if exc.code == 400:
-                    # We asked for something the server does not
-                    # understand. Sending it again unchanged cannot
-                    # succeed, and each attempt costs a round trip.
+                    # A 400 means the payload is wrong; retrying it
+                    # unchanged cannot succeed.
                     raise LLMError(
                         f"the server rejected the request (HTTP 400) at "
                         f"{self.base_url}: {detail or 'no detail given'}"
@@ -263,6 +273,18 @@ class OpenAICompatClient(LLMClient):
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
             except (urllib.error.URLError, TimeoutError, OSError, IncompleteRead) as exc:
+                if use_stream and emitted["delta"]:
+                    # Fragments already streamed: a retry would duplicate
+                    # them on screen, so fail the turn instead.
+                    raise LLMError(f"stream interrupted after partial output: {exc}") from exc
+                last_error = str(exc)
+                if attempt < self.max_retries:
+                    time.sleep(min(2**attempt, 8))
+            except LLMError as exc:
+                # Empty stream before any output: retrying cannot
+                # duplicate UI content, so treat it as transient.
+                if not (str(exc).startswith("stream ended without DONE") and not emitted["delta"]):
+                    raise
                 last_error = str(exc)
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
@@ -304,6 +326,8 @@ class OpenAICompatClient(LLMClient):
                 try:
                     raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
                 except TypeError:
+                    # File-like responses (and test doubles) may expose a
+                    # size-less read(); fall back to an unbounded read.
                     raw_bytes = response.read()
                 if len(raw_bytes) > _MAX_RESPONSE_BYTES:
                     raise LLMError("LLM response exceeds size cap")
@@ -329,17 +353,26 @@ class OpenAICompatClient(LLMClient):
             _orig_exc = exc
             _orig_detail = detail
             if exc.code in (400, 500):
+                if self._responses_unavailable:
+                    # The alternate endpoint was already probed and missing:
+                    # surface the original error so the retry loop in chat()
+                    # can treat a transient 5xx as retryable.
+                    raise
                 try:
                     # Probe: does {base}/responses exist? Try it before surfacing 400/500
                     resp = self._request_via_responses(body)
-                    # Log that fallback was used (visible via logger if attached)
                     return resp
                 except Exception as _fb_exc:
-                    # Fallback failed — chain original error for diagnostics
-                    raise LLMError(
-                        f"chat completions failed (HTTP {exc.code}): {_orig_detail[:300] or 'no detail'}; "
-                        f"fallback to responses also failed: {_fb_exc}"
-                    ) from _orig_exc
+                    self._responses_unavailable = True
+                    if exc.code == 400:
+                        # A 400 will not improve on retry — chain the errors.
+                        raise LLMError(
+                            f"chat completions failed (HTTP {exc.code}): {_orig_detail[:300] or 'no detail'}; "
+                            f"fallback to responses also failed: {_fb_exc}"
+                        ) from _orig_exc
+                    # 5xx is often transient: re-raise the original error so
+                    # the caller's retry loop can try the chat endpoint again.
+                    raise _orig_exc
             raise
         try:
             data = json.loads(raw)
@@ -355,6 +388,8 @@ class OpenAICompatClient(LLMClient):
                 f"{self.base_url}/chat/completions returned no choices"
             )
 
+        # Re-check as a list: the guard above covers falsy values, this
+        # one covers a choices key of the wrong type.
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise LLMError(f"{self.base_url}/chat/completions returned no choices")
@@ -428,14 +463,14 @@ class OpenAICompatClient(LLMClient):
                 else:
                     parts.append(f"Assistant: {content}")
             elif role == "tool":
-                parts.append(f"Tool {m.get('name','')} result: {content[:2000]}")
+                parts.append(f"Tool {m.get('name','')} result: {content[:2000]}")  # cap: history is flattened into one prompt
         prompt = "\n\n".join(parts) if parts else (payload.get("input") or "")
         # Build responses payload
         resp_payload: dict[str, Any] = {
             "model": payload.get("model", self.model),
             "input": prompt,
         }
-        # Translate chat tools -> responses tools (agnostic, not zen-specific)
+        # Map chat tool schema onto the responses tool schema.
         chat_tools = payload.get("tools") or []
         if chat_tools:
             resp_tools = []
@@ -479,11 +514,9 @@ class OpenAICompatClient(LLMClient):
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise LLMError(f"{self.base_url}/responses did not return JSON: {exc}") from exc
-        # If called from stream path, we need to feed deltas to the UI
-        # (stream fallback is non-streaming, so emit whole text as one delta)
-        # Caller passes on_delta via _request_stream fallback — handled there
-        # Responses shape: {"output": [{"type":"message","content":[{"text":"..."}]}]}
-        # or reasoning + message. Extract text.
+        # Responses output differs from chat: extract plain text from
+        # message items. The stream fallback is non-streaming, so the
+        # whole text is emitted as one delta by the caller.
         text = ""
         for item in data.get("output") or []:
             if item.get("type") == "message":
@@ -495,18 +528,35 @@ class OpenAICompatClient(LLMClient):
         # Tool calls in responses: output items type function_call
         tool_calls = []
         for item in data.get("output") or []:
-            if item.get("type") == "function_call":
-                tool_calls.append(
-                    ToolCall(
-                        id=item.get("call_id") or item.get("id") or "",
-                        name=item.get("name") or "",
-                        arguments=json.loads(item.get("arguments") or "{}") if isinstance(item.get("arguments"), str) else item.get("arguments") or {},
-                    )
+            if item.get("type") != "function_call":
+                continue
+            name = item.get("name") or ""
+            args_value = item.get("arguments")
+            if isinstance(args_value, str):
+                try:
+                    arguments = json.loads(args_value or "{}")
+                except json.JSONDecodeError:
+                    # A malformed arguments string must not take down the
+                    # fallback path (and with it the whole turn): surface
+                    # an empty object and let the agent retry.
+                    arguments = {}
+            elif isinstance(args_value, dict):
+                arguments = args_value
+            else:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            tool_calls.append(
+                ToolCall(
+                    id=item.get("call_id") or item.get("id") or "",
+                    name=name,
+                    arguments=arguments,
                 )
+            )
         return LLMResponse(content=text or None, tool_calls=tool_calls, usage=data.get("usage"))
 
     def _request_stream(self, body: bytes, on_delta: DeltaCallback) -> LLMResponse:
-        # No hardcode — chat is tried first, responses fallback below on error
+        # Try chat first; the responses fallback applies on HTTP errors below.
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=body,
@@ -560,11 +610,18 @@ class OpenAICompatClient(LLMClient):
             _orig = exc
             _orig_detail2 = detail
             if exc.code in (400, 500):
+                if self._responses_unavailable:
+                    raise
                 try:
                     return self._request_via_responses(body)
                 except Exception as _fb2:
-                    raise LLMError(
-                        f"streaming chat failed (HTTP {exc.code}): {_orig_detail2[:300] or 'no detail'}; "
-                        f"fallback also failed: {_fb2}"
-                    ) from _orig
+                    self._responses_unavailable = True
+                    if exc.code == 400:
+                        raise LLMError(
+                            f"streaming chat failed (HTTP {exc.code}): {_orig_detail2[:300] or 'no detail'}; "
+                            f"fallback also failed: {_fb2}"
+                        ) from _orig
+                    # Transient 5xx: re-raise the original error so the
+                    # caller's retry loop can try the chat endpoint again.
+                    raise _orig
             raise

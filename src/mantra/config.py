@@ -78,6 +78,11 @@ def load_config(path: str) -> dict:
         data = _load_yaml(raw)
     else:
         data = _load_json(raw)
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"config must be an object mapping keys to sections, got "
+            f"{type(data).__name__}"
+        )
     return merge_defaults(data)
 
 
@@ -91,12 +96,65 @@ def _deep_merge(base: dict, incoming: dict) -> dict:
     return out
 
 
+# Sections whose keys are validated here (the rest are forwarded to the
+# registry, which already rejects unknown constructor keys).
+_SECTION_KEYS = {
+    "context": {"max_messages", "max_chars"},
+    "skills": {"auto", "auto_bundle"},
+}
+
+# The key inside each component section that names the concrete class. When
+# an operator switches component type (e.g. evaluator "command" -> "none"
+# or llm provider "openai" -> "scripted"), the section must not inherit the
+# previous type's default keys: the registry rejects unknown constructor
+# keys, so a leftover default "test_cmd" would break the switch.
+_DISCRIMINATOR_KEYS = {
+    "llm": "provider",
+    "sandbox": "provider",
+    "evaluator": "type",
+    "logging": "type",
+}
+
+
 def merge_defaults(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"config must be an object mapping keys to sections, got "
+            f"{type(data).__name__}"
+        )
+    # Unknown keys are rejected rather than silently ignored: a misspelled
+    # section would otherwise leave the default value in force with no
+    # diagnostic at all.
+    unknown_top = [k for k in data if k not in DEFAULTS]
+    if unknown_top:
+        raise ConfigError(
+            f"unknown config keys {sorted(unknown_top)} (known: {sorted(DEFAULTS)})"
+        )
+    for section, allowed in _SECTION_KEYS.items():
+        incoming = data.get(section)
+        if isinstance(incoming, dict):
+            unknown = [k for k in incoming if k not in allowed]
+            if unknown:
+                raise ConfigError(
+                    f"unknown config keys in '{section}': {sorted(unknown)} "
+                    f"(known: {sorted(allowed)})"
+                )
     # Deep copy prevents mutation of shared DEFAULTS.
     merged = copy.deepcopy(DEFAULTS)
     for key, value in (data or {}).items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
+            discriminator = _DISCRIMINATOR_KEYS.get(key)
+            if (
+                discriminator is not None
+                and discriminator in value
+                and value.get(discriminator) != merged[key].get(discriminator)
+            ):
+                # Different component type: start from the operator's own
+                # section rather than the default's, so the previous type's
+                # keys cannot leak into the new type's constructor.
+                merged[key] = copy.deepcopy(value)
+            else:
+                merged[key] = _deep_merge(merged[key], value)
         else:
             merged[key] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
     # Validate required sections; defaults always supply keys.

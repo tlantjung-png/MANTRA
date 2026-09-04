@@ -199,6 +199,8 @@ class CommandTest(unittest.TestCase):
     def test_launch_runs_every_step_in_order(self):
         workflows.create("ship", ["one", "two", "three"])
         seen: list[str] = []
+        # Returns a truthy object so every step counts as completed; a
+        # plain None return would read as "step did not complete".
         with mock.patch.object(self.session, "handle", side_effect=seen.append) as handled:
             handled.side_effect = lambda text: seen.append(text) or object()
             _workflow(self.session, "launch ship")

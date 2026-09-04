@@ -8,6 +8,8 @@ import urllib.request
 
 key = os.environ.get("MODEL_API_KEY", "")
 if not key:
+    # Absence is a skip, not a failure: a caller cannot distinguish
+    # skip from pass by exit code alone.
     print("PROBE: MODEL_API_KEY not visible in this environment")
     sys.exit(0)
 
@@ -33,3 +35,5 @@ try:
 except urllib.error.HTTPError as exc:
     print(f"PROBE: HTTP {exc.code}")
     print("PROBE: body:", exc.read().decode(errors="replace")[:400])
+# Other failures (timeouts, connection errors, bad JSON) surface as an
+# uncaught traceback.

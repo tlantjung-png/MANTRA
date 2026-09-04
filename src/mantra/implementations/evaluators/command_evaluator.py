@@ -15,7 +15,7 @@ class CommandEvaluator(Evaluator):
         command = task.get("test_cmd", self.test_cmd)
         result = sandbox.exec(command, timeout=self.timeout)
         passed = result.exit_code == 0 and not result.timed_out
-        tail = (result.stdout + result.stderr)[-4000:]
+        tail = (result.stdout + result.stderr)[-4000:]  # last 4KB of combined output
         return EvaluationResult(
             passed=passed,
             detail=(

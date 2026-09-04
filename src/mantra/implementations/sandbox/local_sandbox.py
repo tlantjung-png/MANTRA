@@ -16,11 +16,7 @@ from mantra.interfaces.sandbox import ExecResult, Sandbox
 # The host sandbox executes with shell=True so containment cannot be
 # guaranteed; this check is defence-in-depth only. Use the container
 # sandbox when strong isolation is required.
-_TRAVERSAL_RE = re.compile(r"(\.\.[\\/]|[\\/]\.\.)")
 _ABSOLUTE_WIN_RE = re.compile(r"[a-zA-Z]:[\\/]")
-# Additional shell-meta patterns that can hide traversal inside
-# expansions such as $(...), `...`, ${...}, %VAR%, or encoded forms.
-_SHELL_EXPANSION_RE = re.compile(r"(\$\(|\$\{|`.*`|\${|%[A-Za-z_]+%)")
 _ENCODED_TRAVERSAL_RE = re.compile(r"(%2e%2e|%252e|\\u002e|\\x2e)", re.IGNORECASE)
 
 _MAX_READ_BYTES = 500_000
@@ -38,11 +34,10 @@ def _strip_quoted(s: str) -> str:
     return s
 
 def _contains_traversal(command: str) -> bool:
-    """Heuristic: does command likely escape workspace?
+    """Heuristic: is the command likely to escape the workspace?
 
-    This is defence-in-depth only. The host sandbox uses shell=True and
-    cannot guarantee containment; operators needing strong isolation must
-    use the container sandbox.
+    Defence in depth only: the host sandbox uses shell=True and cannot
+    guarantee containment. Quoted spans are data, not shell-resolved paths.
     """
     if not command:
         return False
@@ -60,11 +55,10 @@ def _contains_traversal(command: str) -> bool:
     if _ENCODED_TRAVERSAL_RE.search(stripped) or _ENCODED_TRAVERSAL_RE.search(decoded):
         return True
     # Block shell expansions that can hide paths: $(...), `...`, ${...}, %VAR%
-    if _SHELL_EXPANSION_RE.search(stripped) or _SHELL_EXPANSION_RE.search(decoded):
-        # Conservative: any command that uses expansions to build paths is
-        # treated as needing container isolation; block in host sandbox.
-        if re.search(r"(\$\(|\$\{|`)", stripped):
-            return True
+    # Check both the raw and the decoded forms so an expansion hidden by
+    # encoding cannot slip past the gate.
+    if re.search(r"(\$\(|\$\{|`)", stripped) or re.search(r"(\$\(|\$\{|`)", decoded):
+        return True
     # Block home-directory expansion which escapes the workspace via shell
     # Avoid flagging quoted strings like echo "~" or echo "$HOME"
     stripped_unquoted = _strip_quoted(stripped)
@@ -80,39 +74,31 @@ def _contains_traversal(command: str) -> bool:
     if re.search(r"%\s*USERPROFILE\s*%", decoded_unquoted, flags=re.IGNORECASE):
         return True
     # Block any parent directory reference, even without slash like `cd ..`
-    # or `dir ..` which still escapes the workspace.
-    # Check both raw and decoded forms.
-    for target in (stripped, decoded):
-        if ".." in target:
-            if re.search(r"(?:^|[\s\"'/\\:])\.\.(?:$|[\s\"'/\\])", target) or _TRAVERSAL_RE.search(target):
-                return True
-            if _TRAVERSAL_RE.search(target):
-                return True
+    # or `dir ..` which still escapes the workspace. Quoted spans are data
+    # (echo "a .. b" is harmless), so only unquoted text is inspected.
+    for target in (stripped_unquoted, decoded_unquoted):
+        if re.search(r"(?:^|[\s\"'/\\:])\.\.(?:$|[\s\"'/\\])", target):
+            return True
     # Check absolute paths in arguments only, not the executable name.
-    # Split into tokens and check from the second token onwards.
-    tokens = stripped.split()
-    if len(tokens) > 1:
-        args_stripped = " ".join(tokens[1:])
-        if _ABSOLUTE_WIN_RE.search(args_stripped):
-            return True
-        for token in re.findall(r"(?:^|\s)(/[^\s]+)", args_stripped):
-            token = token.strip()
-            if len(token) > 1 and not token.startswith("//"):
+    # Split into tokens and check from the second token onwards; quoted
+    # spans are excluded for the same reason as above.
+    for target in (stripped_unquoted, decoded_unquoted):
+        tokens = target.split()
+        if len(tokens) > 1:
+            args_stripped = " ".join(tokens[1:])
+            # Windows absolute paths are drive-letter rooted (C:\...), so
+            # they are caught by _ABSOLUTE_WIN_RE above. A bare leading
+            # slash on Windows is cmd.exe switch syntax (findstr /C:"...",
+            # dir /s /b) and must not be mistaken for a POSIX absolute
+            # path; only POSIX shells resolve /etc/passwd style paths.
+            if _ABSOLUTE_WIN_RE.search(args_stripped):
                 return True
-        # Also check decoded args for obfuscated absolute paths (e.g. %20)
-        try:
-            decoded_args = _up.unquote(args_stripped)
-        except Exception:
-            decoded_args = args_stripped
-        if _ABSOLUTE_WIN_RE.search(decoded_args):
-            return True
-        # Also check for decoded absolute POSIX path that may have been hidden
-        if "/" in decoded_args and re.search(r"(?:^|\s)/[^\s]+", decoded_args):
-            # Verify decoded absolute path not just // (protocol relative)
-            for tok in re.findall(r"(?:^|\s)(/[^\s]+)", decoded_args):
-                tok = tok.strip()
-                if len(tok) > 1 and not tok.startswith("//"):
-                    return True
+            if os.name != "nt":
+                for token in re.findall(r"(?:^|\s)(/[^\s]+)", args_stripped):
+                    token = token.strip()
+                    # //-prefixed tokens are UNC-style network paths.
+                    if len(token) > 1 and not token.startswith("//"):
+                        return True
     return False
 
 
@@ -167,6 +153,20 @@ class LocalSandbox(Sandbox):
             raise SandboxError("sandbox not set up")
         return self._root
 
+    def screen_command(self, command: str) -> str | None:
+        """Reject a command before execution; the reason or None.
+
+        Shared by the foreground ``exec`` path and the command tool's
+        background path so background tasks cannot bypass screening.
+        """
+        if _contains_traversal(command):
+            return (
+                "blocked: command appears to access paths outside the workspace; "
+                "use relative paths inside the workspace or use the container "
+                "sandbox for stronger isolation"
+            )
+        return None
+
     def exec(self, command: str, timeout: float = 120.0) -> ExecResult:
         abort = getattr(self, "abort", None)
         if abort is not None and abort.is_set():
@@ -178,13 +178,9 @@ class LocalSandbox(Sandbox):
             return ExecResult(exit_code=-1, stdout="", stderr=f"invalid timeout {timeout!r}", timed_out=False)
         if timeout_f <= 0 or timeout_f > 600:
             return ExecResult(exit_code=-1, stdout="", stderr="timeout out of range (0,600]", timed_out=False)
-        if _contains_traversal(command):
-            return ExecResult(
-                exit_code=-1,
-                stdout="",
-                stderr="blocked: command appears to access paths outside the workspace; use relative paths inside the workspace or use the container sandbox for stronger isolation",
-                timed_out=False,
-            )
+        reason = self.screen_command(command)
+        if reason:
+            return ExecResult(exit_code=-1, stdout="", stderr=reason, timed_out=False)
         # Use Popen so abort can interrupt a long-running command.
         try:
             proc = subprocess.Popen(
@@ -244,22 +240,17 @@ class LocalSandbox(Sandbox):
 
     def read_file(self, path: str) -> str:
         full = self._resolve(path)
-        # Cap read to avoid OOM on huge files
+        # Cap the read in bytes (not characters) so the cap holds for
+        # multi-byte content and the truncation marker is only appended
+        # when content was actually cut.
         try:
-            # Use os.path.getsize check first if available
-            try:
-                if os.path.getsize(full) > _MAX_READ_BYTES:
-                    with open(full, "r", encoding="utf-8", errors="replace") as handle:
-                        return handle.read(_MAX_READ_BYTES) + "\n... [truncated]"
-            except OSError:
-                pass
-            with open(full, "r", encoding="utf-8", errors="replace") as handle:
+            with open(full, "rb") as handle:
                 data = handle.read(_MAX_READ_BYTES + 1)
-                if len(data) > _MAX_READ_BYTES:
-                    return data[:_MAX_READ_BYTES] + "\n... [truncated]"
-                return data
         except OSError as exc:
             raise SandboxError(str(exc)) from exc
+        if len(data) > _MAX_READ_BYTES:
+            return data[:_MAX_READ_BYTES].decode("utf-8", errors="replace") + "\n... [truncated]"
+        return data.decode("utf-8", errors="replace")
 
     def write_file(self, path: str, content: str) -> None:
         if len(content) > _MAX_READ_BYTES * 2:
@@ -274,6 +265,8 @@ class LocalSandbox(Sandbox):
             if not (real_parent == real_base or real_parent.startswith(real_base + os.sep)):
                 raise SandboxError(f"path escapes sandbox workspace: {path}")
             cur = parent
+            # Walk each parent component: a symlink anywhere in the chain
+            # can point the write outside the workspace.
             while cur and cur != real_base and cur.startswith(real_base):
                 if os.path.islink(cur):
                     raise SandboxError(f"path escapes sandbox workspace: {path}")
@@ -302,6 +295,7 @@ class LocalSandbox(Sandbox):
                     os.remove(tmp)
             except OSError:
                 pass
+        # Normalized separators keep the changed set OS-independent.
         self.changed.add(path.replace("\\", "/"))
 
     def cleanup(self) -> None:

@@ -112,6 +112,8 @@ def html_to_text(html: str) -> str:
 
 
 def _decode(raw: bytes, encoding: str | None, note: list[str]) -> str:
+    # Charset cascade: declared encoding, then utf-8, then latin-1, which
+    # decodes any byte stream and makes the final fallback unreachable.
     for candidate in (encoding, "utf-8", "latin-1"):
         if not candidate:
             continue
@@ -319,7 +321,13 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 try:
                     infos = fut.result(timeout=2)
                 except concurrent.futures.TimeoutError:
-                    # Don't cache timeout — transient failure should not poison cache
+                    # A stalled resolution is not a rebinding primitive:
+                    # rebinding needs a *successful* public answer here and
+                    # a private one at connect time. Blocking every slow or
+                    # unresolvable host would deny legitimate fetches, so
+                    # the fetch proceeds and fails naturally on a bad name;
+                    # the per-hop redirect checks and the final-URL re-check
+                    # below remain the gate for actual private targets.
                     return False
                 for family, _, _, _, sockaddr in infos:
                     addr = sockaddr[0]
@@ -330,9 +338,14 @@ def _is_private_hostname(hostname: str | None) -> bool:
                             break
                     except ValueError:
                         continue
-            _DNS_CACHE[host] = (now, result)
-            if result:
-                return True
+                # Bound the cache: an attacker supplying many unique
+                # hostnames must not grow it without limit.
+                if len(_DNS_CACHE) >= 1024:
+                    for stale_host in list(_DNS_CACHE.keys())[:256]:
+                        _DNS_CACHE.pop(stale_host, None)
+                _DNS_CACHE[host] = (now, result)
+                if result:
+                    return True
     except Exception:
         pass
     return False

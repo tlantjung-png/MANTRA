@@ -53,7 +53,8 @@ def _coerce_numeric_string(s: str, expect: str) -> int | float | None:
     except (ValueError, TypeError):
         return None
 
-# Aliases for path-like params — model sends filePath, absolutePath, etc.
+# Aliases per canonical parameter; shared aliases resolve against the
+# vocabulary of the tool being repaired.
 ALIASES: dict[str, list[str]] = {
     "path": ["path", "file_path", "filePath", "filepath", "absolutePath", "absolute_path", "target_file", "filename", "file"],
     "command": ["command", "cmd", "shellCommand", "shell_command", "shellCmd"],
@@ -66,13 +67,6 @@ ALIASES: dict[str, list[str]] = {
     "new_string": ["new_string", "newString", "new", "replace", "newText", "content"],
     "max_chars": ["max_chars", "maxChars", "maxLength", "limit"],
 }
-
-# Reverse map: alias -> canonical
-_ALIAS_REVERSE: dict[str, str] = {}
-for canon, alist in ALIASES.items():
-    for a in alist:
-        _ALIAS_REVERSE[a] = canon
-        _ALIAS_REVERSE[a.lower()] = canon
 
 # Markdown auto-link: only when link text == url without protocol
 _AUTO_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://([^\)]+)\)")
@@ -92,11 +86,7 @@ def _unwrap_auto_link(value: str) -> str:
     return _AUTO_LINK_RE.sub(_repl, value)
 
 def _repair_quoted_escapes_json(text: str) -> str:
-    r"""Fix single-backslash Windows paths in JSON strings.
-
-    Repair-QuotedEscapesLocal: handles C:\ paths
-    Handles C:\\ vs C:\ and invalid \U escapes by doubling.
-    """
+    r"""Double single backslashes in JSON string literals so Windows paths survive parsing."""
     # Use regex to find JSON string values: "...." with escapes
     def _fix_string(m: re.Match[str]) -> str:
         inner = m.group(1)
@@ -131,6 +121,7 @@ def _repair_quoted_escapes_json(text: str) -> str:
                             i += 1
                             continue
                 else:
+                    # Trailing backslash with no next char: double it.
                     out.append("\\\\")
                     i += 1
                     continue
@@ -147,6 +138,8 @@ def repair_quoted_escapes_json_text(json_text: str) -> str:
     return _repair_quoted_escapes_json(json_text)
 
 def _is_json_array_string(s: str) -> bool:
+    # Matches arrays, objects, and quoted strings despite the name; also
+    # gates the object-string parse path below.
     s = s.strip()
     return (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")) or (s.startswith('"') and s.endswith('"'))
 
@@ -170,7 +163,6 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
     repaired = dict(arguments)
     notes: list[str] = []
 
-    # 1. Alias repair: map filePath -> path etc.
     # Build expected params from schema if available
     expected: set[str] = set()
     if schema and isinstance(schema.get("properties"), dict):
@@ -191,16 +183,34 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
         }
         expected = fallback.get(tool_name, set())
 
-    for key in list(repaired.keys()):
-        canon = _ALIAS_REVERSE.get(key) or _ALIAS_REVERSE.get(key.lower())
-        if canon and canon in expected:
-            if canon not in repaired:
+    # 1. Alias repair: each expected parameter claims a missing value from
+    # its own alias list, never a global map.
+    moved: set[str] = set()
+    for canon in sorted(expected):
+        if canon in repaired:
+            continue
+        aliases = [a.lower() for a in ALIASES.get(canon, [])]
+        for key in list(repaired.keys()):
+            if key in moved:
+                continue
+            if key != canon and key.lower() in aliases:
                 repaired[canon] = repaired.pop(key)
+                # One claim per alias key, so a shared alias cannot be
+                # taken by two canonical names in the same pass.
+                moved.add(key)
                 notes.append(f"aliased {key} -> {canon}")
-            elif key != canon:
-                # Remove stale alias when canonical already present
-                repaired.pop(key, None)
-                notes.append(f"removed stale alias {key} (kept {canon})")
+                break
+    # Remove stale aliases whose canonical name is already present.
+    for key in list(repaired.keys()):
+        if key in expected:
+            continue
+        canon = next(
+            (c for c, lst in ALIASES.items() if key.lower() in [a.lower() for a in lst]),
+            None,
+        )
+        if canon and canon != key and canon in repaired:
+            repaired.pop(key, None)
+            notes.append(f"removed stale alias {key} (kept {canon})")
 
     # 2. Null-for-optional: strip None values
     for k in list(repaired.keys()):
@@ -217,7 +227,8 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
                 repaired[k] = unwrapped
                 notes.append(f"unwrapped auto-link {k}")
 
-    # 4. JSON-array-parse + bare-string-wrap (ordered: parse before wrap)
+    # 4. JSON-array-parse + bare-string-wrap (ordered: parse before wrap).
+    # Without a schema, only the generic numeric-key coercion below runs.
     if schema and isinstance(schema.get("properties"), dict):
         props = schema["properties"]
         for param, spec in props.items():
@@ -267,7 +278,8 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
                 repaired[num_key] = coerced
                 notes.append(f"coerced string {num_key} to {type(coerced).__name__}")
 
-    # Relational defaults: read_file offset/limit pair
+    # Relational defaults: a limit without an offset implies a full read
+    # from the start; an offset without a limit reads one default window.
     if tool_name == "read_file":
         has_offset = "offset" in repaired
         has_limit = "limit" in repaired

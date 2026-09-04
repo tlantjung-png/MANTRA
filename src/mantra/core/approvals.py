@@ -17,12 +17,13 @@ _DESTRUCTIVE = (
     r"rm\s+(-[rRfF]+\s+)*[^\s]*\s*(-[rRfF]+)",  # rm -rf / rm -fr
     r"\brm\s+-[rR]",
     r"\brmdir\b",
+    r"\brm\s+.*\*",
     r"\bformat\s+[a-zA-Z]{1,2}:",  # format C: - not "--format=..." flags
     r"\bmkfs\b",
+    r"\bfind\b[^\n;|&]*-\s?exec(dir)?\b[^\n;|&]*\brm\b",  # find ... -exec rm {}
     r"\bdd\b\s+if=",
     r"del\s+/[sfqSFQ]",
     r"\bRemove-Item\b[^\n]*-Recurse",
-    r"\brm\s+.*\*",
     r"git\s+push[^\n]*--force",
     r"git\s+push\s+-f\b",
     r"git\s+reset\s+--hard",
@@ -51,7 +52,7 @@ _DESTRUCTIVE = (
     r"\battrib\s+",
 )
 
-# Safe read-only commands: auto-allowed in all modes.
+# Low-risk commands auto-allowed in all modes (includes test runners).
 _SAFE_COMMANDS = (
     r"^\s*(ls|dir|cat|type|echo|head|tail|wc|find|rg|grep|where|which|pwd|cd)\b",
     r"^\s*git\s+(status|diff|log|show|branch|rev-parse|ls-files|remote)\b",
@@ -86,7 +87,7 @@ def _load_rules() -> list[dict[str, Any]]:
     candidates = []
     if os.environ.get("MANTRA_RULES_FILE"):
         candidates.append(os.environ["MANTRA_RULES_FILE"])
-    # MANTRA repo rules
+    # Repo-shipped rules at the project root.
     try:
         from pathlib import Path
         candidates.append(str(Path(__file__).resolve().parents[3] / "rules" / "commands.rules"))
@@ -201,9 +202,8 @@ def _get_tokens(segment: str) -> list[str]:
         # Recursively tokenize the inner quoted command
         inner = tokens[0]
         return _get_tokens(inner) + tokens[1:]
-    # Wrapper expansion: cmd /c, powershell -Command, bash -c
-    # Classify only the inner command, not outer wrapper plus inner, to avoid
-    # double counting when checking for destructive patterns.
+    # Wrapper expansion: classify the inner command only, so the wrapper
+    # does not double-count the risk.
     if len(tokens) >= 3:
         wrapper = tokens[0].lower().replace("\\", "/").split("/")[-1]
         switch = tokens[1].lower()
@@ -222,37 +222,46 @@ def _get_tokens(segment: str) -> list[str]:
     return tokens
 
 def _is_blocked_path_check(s: str) -> bool:
-    # Helper to avoid recursion flag for quoted program name check
+    # Always False: quoted single-token commands are recursed unconditionally.
     return False
 
 def _split_command(cmd: str) -> list[str]:
-    """Split on &&, ||, ;, | outside quotes."""
+    """Split on &&, ||, ;, |, &, and newlines outside quotes."""
+    # Newlines are separators too; folding them into ';' first also closes
+    # the hole where a destructive pattern hid after a line break.
+    cmd = cmd.replace("\r\n", "\n").replace("\n", "; ")
     parts: list[str] = []
     start = 0
     in_single = False
     in_double = False
-    for i, ch in enumerate(cmd):
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
         esc = _is_escaped(cmd, i)
         if ch == "'" and not in_double and not esc:
             in_single = not in_single
+            i += 1
             continue
         if ch == '"' and not in_single and not esc:
             in_double = not in_double
+            i += 1
             continue
         if in_single or in_double:
+            i += 1
             continue
-        # Check operators
         length = 0
-        if i + 1 < len(cmd) and cmd[i:i+2] in ("&&", "||"):
+        if i + 1 < len(cmd) and cmd[i : i + 2] in ("&&", "||"):
             length = 2
-        elif ch in (";", "|"):
+        elif ch in (";", "|", "&"):
             length = 1
         if length:
             part = cmd[start:i].strip()
             if part:
                 parts.append(part)
-            i += length - 1
-            start = i + 1
+            i += length
+            start = i
+            continue
+        i += 1
     tail = cmd[start:].strip()
     if tail:
         parts.append(tail)
@@ -268,12 +277,68 @@ def _test_match(tokens: list[str], pattern: list[str], start: int = 0, exact_sta
             return True
     return False
 
+
+def _has_redirect(segment: str) -> bool:
+    """True when a redirect operator appears outside quotes."""
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(segment):
+        esc = _is_escaped(segment, i)
+        if ch == "'" and not in_double and not esc:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single and not esc:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == ">":
+            return True
+    return False
+
+
+def _classify_segment(segment: str) -> str:
+    """Classify one command segment; safe only if the whole segment is read-only."""
+    segment = segment.strip()
+    if not segment:
+        return "safe"
+    tokens = [t.lower() for t in _get_tokens(segment)]
+    if not tokens:
+        return "safe"
+    # Token-level destructive checks, including deletion-capable search
+    # flags that no earlier pattern covers.
+    for idx, tok in enumerate(tokens):
+        if tok == "rm":
+            for pat, _ in _DESTRUCTIVE_TOKENS:
+                if _test_match(tokens, pat, start=idx):
+                    return "destructive"
+        elif tok == "rmdir":
+            return "destructive"
+        elif tok == "find":
+            rest = tokens[idx + 1 :]
+            if "-delete" in rest:
+                return "destructive"
+            if any(f in rest for f in ("-exec", "-execdir", "-ok", "-okdir")):
+                return "mutating"
+    # echo never executes its arguments, unless an expansion inside them
+    # could; the expansion check below handles that case.
+    if tokens[0] == "echo" and not re.search(r"(\$\(|\$\{|`)", segment):
+        return "mutating" if _has_redirect(segment) else "safe"
+    if _has_redirect(segment):
+        return "mutating"
+    if re.search(r"(\$\(|\$\{|`)", segment):
+        return "mutating"
+    if _SAFE_RE.match(segment):
+        return "safe"
+    return "mutating"
+
 _DESTRUCTIVE_TOKENS = [
     (["rm", "-rf"], False),
     (["rm", "-r"], False),
     (["rmdir"], False),
 ]
 
+# Token patterns used by _classify_segment; _SAFE_TOKENS is unused.
 _SAFE_TOKENS = [
     (["ls"], False),
     (["git", "status"], False),
@@ -281,16 +346,16 @@ _SAFE_TOKENS = [
 ]
 
 def classify_command(command: str) -> str:
-    """Return ``destructive``, ``safe``, or ``mutating`` for a shell command."""
+    """Risk of a shell command: destructive, safe, or mutating. Worst segment wins."""
     if not command or not command.strip():
         return "safe"
-    # Check rules file first (harness forbid > prompt > allow)
+    # Rules file first: only regex forbid rules are enforced here.
     try:
         rules = _load_rules()
         if rules:
             worst = ""
-            worst_just = ""
-            # Regex rules match whole command
+            # Regex rules match the whole command; token allow/prompt rules
+            # are not enforced here.
             for r in rules:
                 if r["kind"] != "regex":
                     continue
@@ -298,13 +363,10 @@ def classify_command(command: str) -> str:
                     if re.search(r["pattern"], command, re.IGNORECASE):
                         if worst != "forbid":
                             worst = "forbid"
-                            worst_just = r["justification"]
                 except re.error:
                     pass
             if worst == "forbid":
                 return "destructive"
-            # Token rules need segment analysis — handled below, but collect worst
-            # For now, also check broad destructive as fallback
     except Exception:
         pass
     # Forbidre regex first — matches whole command even across wrappers/segments
@@ -314,38 +376,30 @@ def classify_command(command: str) -> str:
                 return "destructive"
         except Exception:
             pass
-    # Quick broad check for curl|sh style that spans segments (kept for compatibility)
-    # But exclude echo "curl | sh" quoted data case
+    # Broad scan flags destructive text anywhere in the command; only
+    # echo-quoted data is exempt.
     if _DESTRUCTIVE_RE.search(command):
         # Exclude quoted echo data: echo "rm -rf /" should be safe
         if re.match(r'^\s*echo\s+"[^"]*rm', command, re.IGNORECASE):
             pass
         elif re.match(r'^\s*echo\s+', command, re.IGNORECASE) and '"' in command and "rm" in command.lower():
             # Generic: if command is echo with quoted rm, don't flag as destructive
-            # Let token check decide
+            # Let segment analysis decide
             pass
         else:
             return "destructive"
-    # Split compounds and check each segment at token level to catch smuggling
-    # e.g. git add . && rm -rf /  or  cmd /c rm -rf / — but echo "rm -rf /" stays safe
+    # Split compounds and classify every segment; the worst verdict wins.
     try:
-        segments = _split_command(command)
-        for seg in segments:
-            tokens = [t.lower() for t in _get_tokens(seg)]
-            if not tokens:
-                continue
-            for idx, tok in enumerate(tokens):
-                if tok == "rm":
-                    for pat, _ in _DESTRUCTIVE_TOKENS:
-                        if _test_match(tokens, pat, start=idx):
-                            return "destructive"
-                if tok == "rmdir":
-                    return "destructive"
+        worst = "safe"
+        for seg in _split_command(command):
+            risk = _classify_segment(seg)
+            if risk == "destructive":
+                return "destructive"
+            if risk == "mutating":
+                worst = "mutating"
+        return worst
     except Exception:
-        pass
-    if _SAFE_RE.match(command):
-        return "safe"
-    return "mutating"
+        return "mutating"
 
 
 def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
@@ -393,6 +447,15 @@ class ApprovalPolicy:
 
             log_path = os.path.join(os.path.expanduser("~"), ".mantra", "logs", "pre-tool-use.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            # Rotate before appending so the audit log cannot grow unbounded.
+            try:
+                if os.path.getsize(log_path) > 1_000_000:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        tail = f.read()[-200_000:]
+                    with open(log_path, "w", encoding="utf-8") as f:
+                        f.write(tail)
+            except OSError:
+                pass
             safe_detail = _redact_sensitive(detail)[:200]
             safe_tool = _redact_sensitive(tool)
             with open(log_path, "a", encoding="utf-8") as f:
@@ -457,10 +520,22 @@ class ApprovalPolicy:
             p = str(arguments.get("path", "")).replace("\\", "/")
             import posixpath
 
+            # POSIX normalization governs Windows-style paths too, so both
+            # spellings of a path produce the same session key.
             p = posixpath.normpath(p)
             if p == ".":
                 p = ""
             return f"{tool}::{p}"
+        if tool == "kill_shell":
+            # Key by target: one "always" must not blanket-authorize every
+            # future kill of any process for the session.
+            target = (
+                arguments.get("task_id")
+                or arguments.get("pid")
+                or arguments.get("port")
+                or ""
+            )
+            return f"kill_shell::{target}"
         return tool
 
 

@@ -37,6 +37,8 @@ class DockerSandbox(Sandbox):
     def setup(self, task: dict) -> None:
         self._container_id = f"mantra-{uuid.uuid4().hex[:12]}"
         network = "--network none" if not self.network_enabled_during_setup else ""
+        # Detached container kept alive with `sleep infinity` so later
+        # docker exec calls have a running target.
         if not self._run_cli(
             [
                 "docker",
@@ -103,7 +105,7 @@ class DockerSandbox(Sandbox):
                 errors="replace",
             )
             interval = 0.1
-            limit = min(timeout_f, _EXEC_TIMEOUT)
+            limit = min(timeout_f, _EXEC_TIMEOUT)  # clamp: no exec runs forever
             deadline = time.monotonic() + limit
             while True:
                 if abort is not None and abort.is_set():
@@ -148,10 +150,13 @@ class DockerSandbox(Sandbox):
     def _is_safe_path(self, path: str) -> bool:
         if not path or "\x00" in path or "\n" in path or "\r" in path or ":" in path:
             return False
-        # Validate fully joined container path.
+        # Validate fully joined container path. Container paths are POSIX
+        # paths regardless of the host OS, so posixpath is used throughout:
+        # os.path on a Windows host would treat "/workspace" as relative
+        # and normalise with backslashes.
         import posixpath
 
-        joined = path if os.path.isabs(path) else posixpath.join(self.workdir, path)
+        joined = path if posixpath.isabs(path) else posixpath.join(self.workdir, path)
         normalized = posixpath.normpath(joined.replace("\\", "/"))
         wd = self.workdir.rstrip("/")
         if normalized == wd or normalized.startswith(wd + "/"):
@@ -160,8 +165,26 @@ class DockerSandbox(Sandbox):
             return True
         return False
 
+    def _resolved_path(self, path: str) -> str:
+        """The container's view of the path with symlinks resolved; best effort."""
+        import posixpath
+
+        joined = path if posixpath.isabs(path) else posixpath.join(self.workdir, path)
+        result = self._exec_no_shell(["readlink", "-f", joined], timeout=15)
+        if result.exit_code == 0:
+            resolved = result.stdout.strip()
+            if resolved:
+                return resolved
+        return posixpath.normpath(joined.replace("\\", "/"))
+
     def read_file(self, path: str) -> str:
         if not self._is_safe_path(path):
+            raise SandboxError(f"path escapes sandbox workspace: {path}")
+        # Follow the path to its real target inside the container before
+        # reading: a container-internal symlink must not reach outside
+        # the workdir.
+        resolved = self._resolved_path(path)
+        if not self._is_safe_path(resolved):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
         result = self._exec_no_shell(["cat", path])
         if result.exit_code != 0:
@@ -175,13 +198,22 @@ class DockerSandbox(Sandbox):
             raise SandboxError("sandbox not set up")
         if not self._is_safe_path(path):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
+        # Resolve before copying too: an existing symlink at the
+        # destination must not redirect the write outside the workdir.
+        # Container paths are POSIX paths, so join with posixpath even
+        # when the host is Windows (os.path would mix in backslashes).
+        import posixpath
+
+        dest = path
+        if not posixpath.isabs(dest):
+            dest = posixpath.join(self.workdir, dest)
+        resolved = self._resolved_path(path)
+        if not self._is_safe_path(resolved):
+            raise SandboxError(f"path escapes sandbox workspace: {path}")
         if len(content) > _MAX_READ_BYTES * 2:
             raise SandboxError(f"content too large ({len(content)} bytes)")
-        # Stage locally, then docker cp; avoids shell-quoting hazards entirely.
-        # Ensure destination is absolute inside workdir to avoid relative ambiguity
-        dest = path
-        if not os.path.isabs(dest):
-            dest = os.path.join(self.workdir, dest)
+        # Stage the content in a host temp file (owner-only) and copy it
+        # in, avoiding shell-quoting issues with arbitrary content.
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", newline="\n", suffix=".harness", delete=False
         ) as handle:
@@ -237,7 +269,7 @@ class DockerSandbox(Sandbox):
                 errors="replace",
             )
             interval = 0.1
-            limit = min(timeout_f, _EXEC_TIMEOUT)
+            limit = min(timeout_f, _EXEC_TIMEOUT)  # clamp: no exec runs forever
             deadline = time.monotonic() + limit
             while True:
                 if abort is not None and abort.is_set():
@@ -287,6 +319,7 @@ class DockerSandbox(Sandbox):
         if url.startswith(("http://", "https://", "git@", "ssh://", "git://")):
             return True
         if url.startswith("file://"):
+            # Disabled by default: file URLs read arbitrary local paths.
             return bool(os.environ.get("MANTRA_ALLOW_FILE_URL"))
         return False
 

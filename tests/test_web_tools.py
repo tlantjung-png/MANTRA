@@ -218,6 +218,7 @@ class FetchTest(unittest.TestCase):
                       self._fetch(Gzipped(), url="https://x"))
 
     def test_a_bad_max_chars_falls_back_to_the_default(self):
+        # A non-numeric max_chars must fall back, not raise.
         out = self._fetch(_Response(PAGE), url="https://x", max_chars="lots")
         self.assertIn("Release notes", out)
 

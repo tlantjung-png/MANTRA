@@ -13,9 +13,9 @@ from typing import Any, Iterable, Sequence
 _CURSOR_REPORT = re.compile(r"\033\[(\d+);(\d+)R")
 
 
-# Re-exported: the console's secret reader imports it from here. The
-# implementation now lives in one module shared by every interactive part.
-from mantra.term import raw_mode, visible_len  # noqa: F401
+# Re-exported for the console's secret reader; shared by every interactive part.
+from mantra.term import raw_mode, safe_write, visible_len  # noqa: F401
+from mantra import theme
 
 # ANSI: enable mouse click reporting and the SGR coordinate format that
 # reports positions larger than 223 cells.
@@ -104,9 +104,7 @@ class Menu:
         self.allow_filter = allow_filter
         self.query = ""
         self.cursor = cursor
-        # When the console is running inside its frame, menus are drawn
-        # as frame rows too. A menu that escaped the box would leave the
-        # operator reading a list hanging off the side of the screen.
+        # Menus draw inside the frame so a list never hangs off the screen edge.
         self.frame = frame
         # Measured once, on the first draw: see _cursor_row.
         self._row_base_auto: int | None = None
@@ -117,11 +115,9 @@ class Menu:
     # ---- public API ------------------------------------------------------
 
     def pick(self) -> str | None:
-        """Show the menu and return the chosen value, or None if cancelled.
+        """Show the menu and return the chosen value.
 
-        Returns None immediately when there is no terminal to draw on:
-        a piped run has nobody to move a cursor, and blocking there
-        would eat the next line of the script.
+        "" cancels by key; None means no terminal to draw on or an interrupt.
         """
         if not self.options:
             return None
@@ -173,7 +169,7 @@ class Menu:
     def _handle(self, key: str) -> str | None:
         """Return a value to finish, or None to keep going."""
         matches = self.matches
-        # 'd' to delete highlighted item (only when not filtering and allow_delete)
+        # d/D delete the highlighted item, except while filtering.
         if self.allow_delete and key in ("d", "D") and not self.query:
             if matches and 0 <= self.cursor < len(matches):
                 target = matches[self.cursor]
@@ -212,7 +208,7 @@ class Menu:
                 return None
             return matches[self.cursor].value
         if key == KEY_CANCEL:
-            return ""
+            return ""  # key-cancel, distinct from None (interrupt / no tty)
         if isinstance(key, MouseEvent):
             # Only a left press selects: a drag-release reports the row
             # it ended on, which is not what the operator clicked.
@@ -230,13 +226,7 @@ class Menu:
         return None
 
     def _option_at_row(self, screen_row: int) -> Option | None:
-        """Translate a 1-based terminal row into an option.
-
-        The terminal reports absolute rows, but the menu only knows
-        about rows relative to itself, and it has no way to ask where
-        it is. So the click path measures the offset on the first
-        report of a session and maps later clicks against it.
-        """
+        """Map an absolute terminal row to an option using the measured base row."""
         if self._row_base is None:
             return None
         index = screen_row - self._row_base
@@ -246,29 +236,18 @@ class Menu:
 
     # ---- rendering -------------------------------------------------------
 
+    # Class attribute: the click path reads it before any _locate has run.
     _row_base: int | None = None
 
     def _locate(self, offset: int) -> None:
-        """Work out which absolute screen row the first option is on.
-
-        Mouse reports give absolute coordinates, so a menu has to know
-        where it is on screen. Guessing landed every click on the wrong
-        row once the conversation had scrolled, which is exactly when
-        the mouse is the natural way to pick.
-        """
+        """Measure the first option's absolute screen row so clicks map correctly."""
         if self._row_base_auto is None:
             self._row_base_auto = self._cursor_row()
         if self._row_base_auto is not None:
             self._row_base = self._row_base_auto + offset
 
     def _cursor_row(self) -> int | None:
-        """Ask the terminal for the caret's row. None if it will not say.
-
-        ``ESC [ 6 n`` is the standard Device Status Report; terminals
-        answer ``ESC [ row ; col R`` on stdin. Bounded by a short
-        deadline because a terminal that does not answer must not hang
-        the menu.
-        """
+        """The caret's absolute row via Device Status Report, or None on timeout."""
         out = sys.stdout
         try:
             out.write("\033[6n")
@@ -309,6 +288,7 @@ class Menu:
         """Erase the menu rows and leave the caret on a clean line."""
         out = sys.stdout
         if drawn:
+            # Down one row and clear per drawn row, then back up over them.
             for _ in range(drawn):
                 out.write("\033[1B\r\033[K")
             out.write(f"\033[{drawn}A")
@@ -333,7 +313,9 @@ class Menu:
             for index, row in enumerate(painted):
                 if index:
                     out.write("\n")
-                out.write(row)
+                # Option labels are user content (endpoints, models, skill
+                # descriptions) and must not crash a narrow-locale console.
+                safe_write(row)
             if len(painted) > 1:
                 out.write(f"\033[{len(painted) - 1}A")
             out.write("\r")
@@ -341,8 +323,10 @@ class Menu:
         else:
             for row in rows:
                 out.write("\n\033[K")
-                out.write(row)
+                safe_write(row)
             if rows:
+                # Move the caret back up over the painted rows so the menu
+                # stays anchored below the original line.
                 out.write(f"\033[{len(rows)}A")
             out.write("\r")
             self._locate(offset=2)
@@ -355,32 +339,33 @@ class Menu:
         visible = self._visible()
         self._row_base = 2
 
-        # Vampire: title aqua bold, filter amber, selected emerald/aqua.
-        rows = [s._wrap("1;38;5;51", self.title) if self.title else ""]
+        # Blood & Bone: title in bone bold, filter in ash, the selected
+        # row in the single crimson accent, everything else quiet.
+        rows = [s._wrap(theme.BONE_BOLD, self.title) if self.title else ""]
         if self.allow_filter and self.query:
-            rows.append(s._wrap("38;5;172", f"  filter: {self.query}_"))
+            rows.append(s._wrap(theme.ASH, f"  filter: {self.query}_"))
         elif self.allow_filter and len(self.options) > self.max_rows:
-            rows.append(s._wrap("38;5;240", "  type to filter"))
+            rows.append(s._wrap(theme.FAINT, "  type to filter"))
 
         if not matches:
-            rows.append(s._wrap("38;5;240", "  (no matches)"))
+            rows.append(s._wrap(theme.FAINT, "  (no matches)"))
             return rows
 
         for index, option in enumerate(visible):
             marker = "›" if index == self.cursor else " "
             line = f" {marker} {option.text}"
             if index == self.cursor:
-                rows.append(s._wrap("38;5;51", line))  # aqua selected
+                rows.append(s._wrap(theme.BLOOD_BOLD, line))  # selected — crimson
             elif not option.enabled:
-                rows.append(s._wrap("38;5;240", line))
+                rows.append(s._wrap(theme.FAINT, line))
             else:
                 rows.append(line)
 
         hidden = len(matches) - len(visible)
         if hidden > 0:
-            rows.append(s._wrap("38;5;240", f"   ... {hidden} more"))
+            rows.append(s._wrap(theme.FAINT, f"   ... {hidden} more"))
         if self.hint:
-            rows.append(s._wrap("38;5;240", "  " + self.hint))
+            rows.append(s._wrap(theme.FAINT, "  " + self.hint))
         return rows
 
     # ---- input -----------------------------------------------------------
@@ -414,6 +399,7 @@ class Menu:
 
             char = msvcrt.getwch()
             if char in ("\x00", "\xe0"):
+                # Extended keys: the prefix byte is followed by a code byte.
                 return {"H": KEY_UP, "P": KEY_DOWN}.get(msvcrt.getwch(), char)
             return char
         return sys.stdin.read(1)
@@ -425,25 +411,24 @@ class Menu:
         if char == "\x03":  # ctrl+c
             raise KeyboardInterrupt
         if char == "\x1b":
-            # A lone Escape cancels, but so does not an arrow key or a
-            # mouse report: both arrive as Escape followed by more
-            # bytes. Peek before committing - reading ahead on a real
-            # Escape would swallow the operator's next keystroke, and
-            # returning here unconditionally broke every arrow key and
-            # every click on POSIX.
+            # A lone Escape cancels, but an arrow or mouse report also
+            # starts with Escape; peek before committing to cancel.
             if self._input_pending():
                 return self._read_sequence(char)
             return KEY_CANCEL
         if char in ("\x7f", "\b"):
             return KEY_BACKSPACE
         if char == " ":
-            # Space pages forward in menus (PageDown equivalent). Filter
-            # typing uses space via _handle, but _read_key is tested
-            # directly so handle paging here as well.
+            # Space pages forward in menus (PageDown equivalent), but only
+            # while the filter query is empty: once the operator is typing
+            # a query, space is a character like any other.
+            if self.allow_filter and self.query:
+                return char
             self.cursor = min(len(self.matches) - 1, self.cursor + self.max_rows)
             return None
         if not self._input_pending():
             return char
+        # Buffered input means this char starts a sequence, not a literal key.
         return self._read_sequence(char)
 
     def _read_sequence(self, first: str):
@@ -467,6 +452,7 @@ class Menu:
 
     def _read_bracket(self):
         if os.name == "nt":
+            # Windows never classifies bracket sequences; treat them as cancel.
             return KEY_CANCEL
         body = ""
         while len(body) < 32:
@@ -476,6 +462,8 @@ class Menu:
                 break
             body += char
             if char in ("<",) and not self._input_pending():
+                # No more buffered bytes: the rest of this report will
+                # never arrive, so stop waiting on it.
                 break
 
         match = _SGR_MOUSE.match(body)

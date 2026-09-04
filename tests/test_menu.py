@@ -325,6 +325,7 @@ class KeyReadingTest(unittest.TestCase):
             with mock.patch.object(sys, "stdin", fake), \
                  mock.patch("mantra.core.menu.os.name", "posix"):
                 self.assertIsNone(menu._read_key())
+        # 12 is the default page size (max_rows).
         self.assertEqual(menu.cursor, 12)
 
 
@@ -340,6 +341,8 @@ class PickTest(unittest.TestCase):
         fake_out.isatty.return_value = True
         fake_out.write = out.write
         fake_out.flush = lambda: None
+        # Fake terminal plus scripted keys; os.system is stubbed to skip
+        # the screen-clear side effect of pick().
         with mock.patch.object(sys, "stdin", fake_in), \
              mock.patch.object(sys, "stdout", fake_out), \
              mock.patch.object(Menu, "_read_key", side_effect=list(keys)), \

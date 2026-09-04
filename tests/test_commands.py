@@ -46,6 +46,7 @@ class TempSettings:
 
 def _session(workspace):
     session = make_session(workspace, [])
+    # Force an active endpoint so /model and /connect behave deterministically.
     session.config["llm"]["base_url"] = "https://x.test/v1"
     return session
 
@@ -135,8 +136,8 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
         self.assertIn("second", values)
 
     def test_connect_with_nothing_saved_skips_the_menu(self):
-        # One path leads to adding an endpoint, so there is no choice
-        # to put in front of anyone.
+        # With zero saved endpoints, /connect jumps straight into the
+        # add-endpoint flow, so no menu is shown.
         for name in ("first", "second"):
             from mantra.core.settings import remove_endpoint
 

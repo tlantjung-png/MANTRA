@@ -1,7 +1,6 @@
-"""Command and git tools — TEF-optimized shell.
+"""Command and git tools: run_command, shell_output, kill_shell, git_diff, git_reset.
 
-Implements Command Code shell TEF capabilities:
-- background by default for long work (task id + log path instant)
+- background requires an explicit boolean opt-in (background=true)
 - from_offset cursor reads (shell_output)
 - middle-out truncation with omitted counts + full log on disk
 - honest exits (137/143, grep 1 note)
@@ -32,6 +31,40 @@ _TASKS_LOCK = threading.Lock()
 _TASK_COUNTER = 0
 _MAX_TASKS = 100
 _TASK_TTL_SECONDS = 3600  # 1 hour; completed tasks older than this are pruned
+
+# Full-output log files written by _format_result when a command's output
+# exceeds the inline budget. Each is a tempfile that nothing removes, so
+# the files are tracked here and pruned on every new allocation: entries
+# older than the TTL are deleted, and the registry is size-capped.
+_FULL_LOG_FILES: dict[str, float] = {}
+_FULL_LOG_LOCK = threading.Lock()
+_FULL_LOG_TTL_SECONDS = 3600
+_MAX_FULL_LOGS = 50
+
+
+def _register_full_log(path: str) -> None:
+    """Track a full-output log file and prune expired/surplus ones."""
+    import time as _t
+
+    with _FULL_LOG_LOCK:
+        now = _t.monotonic()
+        for old_path, created in list(_FULL_LOG_FILES.items()):
+            if now - created > _FULL_LOG_TTL_SECONDS:
+                _FULL_LOG_FILES.pop(old_path, None)
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+        _FULL_LOG_FILES[path] = now
+        if len(_FULL_LOG_FILES) > _MAX_FULL_LOGS:
+            # Remove the oldest first; dict preserves insertion order.
+            excess = len(_FULL_LOG_FILES) - _MAX_FULL_LOGS
+            for old_path in list(_FULL_LOG_FILES.keys())[:excess]:
+                _FULL_LOG_FILES.pop(old_path, None)
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
 
 
 def _prune_tasks_locked() -> None:
@@ -81,6 +114,35 @@ def _next_task_id() -> str:
         _TASK_COUNTER += 1
         return f"tsk_{_TASK_COUNTER:04d}_{uuid.uuid4().hex[:6]}"
 
+
+def _finish_task(
+    task_id: str,
+    log_path: str,
+    exit_code: int,
+    note: str = "",
+    timed_out: bool = False,
+    duration: float = 0.0,
+) -> None:
+    """Write the closing block to the task log and mark the task done."""
+    try:
+        with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+            if note:
+                f.write(f"\n[{note}]\n")
+            f.write(f"\nexit_code: {exit_code}\n")
+    except Exception:
+        pass
+    with _TASKS_LOCK:
+        if task_id in _TASKS:
+            _TASKS[task_id].update({
+                "exit_code": exit_code,
+                "stdout": "",
+                "stderr": note,
+                "timed_out": timed_out,
+                "done": True,
+                "end_time": time.monotonic(),
+                "duration": duration,
+            })
+
 def _is_long_command(cmd: str) -> bool:
     # Heuristic: long builds, dev servers, watch modes
     long_markers = ["npm run", "pnpm ", "yarn ", "pytest", "cargo test", "go test", "sleep ", "watch", "dev", "serve", "build"]
@@ -122,16 +184,11 @@ class RunCommandTool(Tool):
         if len(command) > 10000:
             return "ERROR: command too long"
 
-        # Background now requires explicit opt-in (background=true).
-        # Previously a heuristic auto-backgrounded based on substrings, which
-        # surprised operators who expected immediate output. Explicit is
-        # predictable and production-safe.
-        use_bg = False
-        if background is True:
-            use_bg = True
-        elif background is not None and background not in (False, None):
-            # Truthy non-bool (e.g. 1, "true") also opts in; explicit only.
-            use_bg = bool(background)
+        # Background requires an explicit boolean opt-in; anything else
+        # is an error so the model learns to send the right type.
+        if background is not None and not isinstance(background, bool):
+            return "ERROR: background must be a boolean (true or false)"
+        use_bg = bool(background)
 
         if use_bg:
             return self._execute_background(sandbox, command, timeout_f)
@@ -188,10 +245,11 @@ class RunCommandTool(Tool):
                     log_path = os.path.join(private_base, f"mantra_{task_id}.log")
                 except Exception:
                     log_path = os.path.join(tempfile.gettempdir(), f"mantra_{task_id}.log")
-        # Create log file with owner-only perms
+        # Create log file with owner-only perms; the command header goes in
+        # immediately so readers always see what the task runs.
         try:
             with open(log_path, "w", encoding="utf-8") as _lf:
-                pass
+                _lf.write(f"$ {command}\n")
             try:
                 os.chmod(log_path, 0o600)
             except OSError:
@@ -202,7 +260,7 @@ class RunCommandTool(Tool):
                 ws_root = getattr(sandbox, "root", None) or os.getcwd()
                 log_path = os.path.join(ws_root, f".mantra_{task_id}.log")
                 with open(log_path, "w", encoding="utf-8") as _lf:
-                    pass
+                    _lf.write(f"$ {command}\n")
                 try:
                     os.chmod(log_path, 0o600)
                 except OSError:
@@ -212,75 +270,111 @@ class RunCommandTool(Tool):
 
         def _run():
             start = time.monotonic()
-            # Use shell for background too
+            # Screen before spawning: a background task must obey the same
+            # command screening as the foreground path instead of bypassing
+            # the sandbox's only command-level defence.
+            try:
+                reason = sandbox.screen_command(command)
+            except Exception:
+                reason = None
+            if reason:
+                _finish_task(task_id, log_path, -1, note=reason, duration=0.0)
+                return
+            abort = getattr(sandbox, "abort", None)
             try:
                 proc = subprocess.Popen(
                     command,
                     shell=True,
                     cwd=getattr(sandbox, "root", None) or os.getcwd(),
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     errors="replace",
                 )
-                # Store pid
-                with _TASKS_LOCK:
-                    if task_id in _TASKS:
-                        _TASKS[task_id]["pid"] = proc.pid
-                        _TASKS[task_id]["process"] = proc
-                # Wait with timeout
-                try:
-                    stdout, stderr = proc.communicate(timeout=timeout)
-                    exit_code = proc.returncode
-                    timed_out = False
-                except subprocess.TimeoutExpired:
-                    # sigterm -> poll -> sigkill
-                    try:
-                        proc.terminate()
-                        time.sleep(0.5)
-                        if proc.poll() is None:
-                            proc.kill()
-                        stdout, stderr = proc.communicate(timeout=2)
-                    except Exception:
-                        stdout, stderr = "", "killed after timeout"
-                    exit_code = 143 if proc.returncode is None else proc.returncode
-                    timed_out = True
+            except Exception as exc:
+                _finish_task(task_id, log_path, -1, note=str(exc), duration=0.0)
+                return
+            # Store pid
+            with _TASKS_LOCK:
+                if task_id in _TASKS:
+                    _TASKS[task_id]["pid"] = proc.pid
+                    _TASKS[task_id]["process"] = proc
 
-                # Write full log
+            # Stream output incrementally so shell_output can follow the
+            # run's progress instead of seeing nothing until exit.
+            def _pump():
                 try:
-                    with open(log_path, "w", encoding="utf-8", errors="replace") as f:
-                        f.write(f"$ {command}\n")
-                        if stdout:
-                            f.write(stdout)
-                        if stderr:
-                            f.write("\n[stderr]\n" + stderr)
-                        f.write(f"\nexit_code: {exit_code}\n")
+                    with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
+                        for line in proc.stdout or []:
+                            lf.write(line)
+                            lf.flush()
                 except Exception:
                     pass
 
-                # Update task
-                with _TASKS_LOCK:
-                    if task_id in _TASKS:
-                        _TASKS[task_id].update({
-                            "exit_code": exit_code,
-                            "stdout": stdout or "",
-                            "stderr": stderr or "",
-                            "timed_out": timed_out,
-                            "done": True,
-                            "end_time": time.monotonic(),
-                            "duration": time.monotonic() - start,
-                        })
-            except Exception as exc:
-                with _TASKS_LOCK:
-                    if task_id in _TASKS:
-                        _TASKS[task_id].update({
-                            "exit_code": -1,
-                            "stderr": str(exc),
-                            "done": True,
-                        })
+            pumper = threading.Thread(target=_pump, daemon=True)
+            pumper.start()
+            deadline = time.monotonic() + timeout
+            exit_code: int | None = None
+            timed_out = False
+            while True:
+                if abort is not None and abort.is_set():
+                    # Operator abort: terminate the child, then force-kill,
+                    # join the pumper, and finalize the task as interrupted.
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    pumper.join(timeout=2)
+                    _finish_task(
+                        task_id, log_path,
+                        proc.returncode if proc.returncode is not None else -1,
+                        note="interrupted by operator",
+                        duration=time.monotonic() - start,
+                    )
+                    return
+                try:
+                    proc.wait(timeout=0.1)
+                    exit_code = proc.returncode
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() < deadline:
+                        continue
+                    timed_out = True
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    exit_code = 143 if proc.returncode is None else proc.returncode
+                    break
+            pumper.join(timeout=2)
+            _finish_task(
+                task_id, log_path,
+                exit_code if exit_code is not None else -1,
+                note="(command timed out — sigterm→sigkill)" if timed_out else "",
+                timed_out=timed_out,
+                duration=time.monotonic() - start,
+            )
 
-        # Register task — prune first if at capacity
+        # Register task — prune expired and excess entries on every
+        # registration so the one-hour TTL actually applies.
         with _TASKS_LOCK:
+            _prune_tasks_locked()
             if len(_TASKS) >= _MAX_TASKS:
                 _prune_tasks_locked()
             _TASKS[task_id] = {
@@ -308,7 +402,8 @@ class RunCommandTool(Tool):
         )
 
     def _format_result(self, result: ExecResult, command: str) -> str:
-        # Honest exits — harness lib-shell.ps1:5 Get-HonestExitCode + Get-BenignExitNote:20
+        # Honest exits: signal deaths map to 128+n; grep/Select-String
+        # exiting 1 means "no matches", not an error.
         exit_code = result.exit_code
         # Handle Python negative signal codes (e.g., -9 -> 137)
         if exit_code is not None and exit_code < 0:
@@ -355,22 +450,31 @@ class RunCommandTool(Tool):
             # Write full log to temp
             try:
                 fd, full_log_path = tempfile.mkstemp(prefix="mantra_cmd_", suffix=".log")
+                _register_full_log(full_log_path)
                 with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
                     f.write(f"$ {command}\n")
                     f.write(stdout)
                     if stderr:
                         f.write("\n[stderr]\n" + stderr)
-                omitted = combined_len - MAX_TOTAL
-                # Keep head and tail
+                # Keep head and tail; the omitted count is per stream and
+                # reflects what was actually cut.
                 if len(stdout) > MAX_TOTAL:
+                    omitted_out = len(stdout) - (MAX_HEAD + MAX_TAIL)
                     head = stdout[:MAX_HEAD]
                     tail = stdout[-MAX_TAIL:]
-                    stdout = head + f"\n... [{omitted} chars omitted, counted] ...\n" + tail
+                    stdout = head + f"\n... [{omitted_out} chars omitted, counted] ...\n" + tail
                     if full_log_path:
                         stdout += f"\n[full log at {full_log_path} — grep it, don't rerun]"
-                # Similar for stderr if needed
-                if len(stderr) > 8000:
-                    stderr = stderr[:4000] + f"\n... [{len(stderr)-8000} chars omitted] ..."
+                if len(stderr) > MAX_TOTAL // 2:
+                    # Stderr gets half the head/tail budget of stdout.
+                    kept_head = MAX_HEAD // 2
+                    kept_tail = MAX_TAIL // 2
+                    omitted_err = len(stderr) - (kept_head + kept_tail)
+                    stderr = (
+                        stderr[:kept_head]
+                        + f"\n... [{omitted_err} chars omitted] ...\n"
+                        + stderr[-kept_tail:]
+                    )
             except Exception:
                 pass
 
@@ -516,15 +620,26 @@ class KillShellTool(Tool):
         if pid is not None:
             try:
                 pid_int = int(pid)
+            except (TypeError, ValueError):
+                return f"ERROR: invalid pid {pid!r}"
+            try:
                 import signal
                 os.kill(pid_int, signal.SIGTERM)
                 time.sleep(0.5)
-                try:
-                    os.kill(pid_int, 0)
-                    os.kill(pid_int, signal.SIGKILL)
+                if os.name != "nt":
+                    # POSIX: check liveness and force-kill if still alive.
+                    try:
+                        os.kill(pid_int, 0)
+                    except OSError:
+                        return f"OK: pid {pid_int} terminated"
+                    forced = getattr(signal, "SIGKILL", None)
+                    if forced is not None:
+                        os.kill(pid_int, forced)
                     return f"OK: killed pid {pid_int} (sigterm→sigkill)"
-                except OSError:
-                    return f"OK: pid {pid_int} terminated"
+                # win32: os.kill with SIGTERM already terminated the
+                # process outright, and no SIGKILL constant exists here —
+                # report success instead of a spurious error.
+                return f"OK: killed pid {pid_int}"
             except Exception as exc:
                 return f"ERROR: kill pid failed: {exc}"
 
@@ -532,37 +647,43 @@ class KillShellTool(Tool):
         if port is not None:
             try:
                 port_int = int(port)
-                # Find pid by port (best effort via netstat/lsof)
-                found = None
-                for cmd in [
-                    f"lsof -ti tcp:{port_int}",
-                    f"netstat -ano | findstr :{port_int}",
-                    f"ss -lptn 'sport = :{port_int}'",
-                ]:
-                    try:
-                        # Use sandbox exec to run host command? For local, use subprocess
-                        import subprocess
-                        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
-                        if res.stdout.strip():
-                            # Parse first pid
-                            import re
-                            m = re.search(r"\b(\d+)\b", res.stdout)
-                            if m:
-                                found = int(m.group(1))
-                                break
-                    except Exception:
-                        continue
-                if found:
-                    import signal
-                    os.kill(found, signal.SIGTERM)
-                    time.sleep(0.5)
+            except (TypeError, ValueError):
+                return f"ERROR: invalid port {port!r}"
+            # Find pid by port (best effort via netstat/lsof)
+            found = None
+            for cmd in [
+                f"lsof -ti tcp:{port_int}",
+                f"netstat -ano | findstr :{port_int}",
+                f"ss -lptn 'sport = :{port_int}'",
+            ]:
+                try:
+                    # Find the pid listening on the port, per platform.
+                    import subprocess
+                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+                    if res.stdout.strip():
+                        # Parse first pid
+                        import re
+                        m = re.search(r"\b(\d+)\b", res.stdout)
+                        if m:
+                            found = int(m.group(1))
+                            break
+                except Exception:
+                    continue
+            if not found:
+                return f"ERROR: no process found on port {port}"
+            try:
+                import signal
+                os.kill(found, signal.SIGTERM)
+                time.sleep(0.5)
+                if os.name != "nt":
                     try:
                         os.kill(found, 0)
-                        os.kill(found, signal.SIGKILL)
                     except OSError:
-                        pass
-                    return f"OK: killed port {port_int} (pid {found})"
-                return f"ERROR: no process found on port {port}"
+                        return f"OK: killed port {port_int} (pid {found})"
+                    forced = getattr(signal, "SIGKILL", None)
+                    if forced is not None:
+                        os.kill(found, forced)
+                return f"OK: killed port {port_int} (pid {found})"
             except Exception as exc:
                 return f"ERROR: kill port failed: {exc}"
 

@@ -1,0 +1,24 @@
+# Command rules. Format: decision|pattern tokens|justification
+# decisions: forbid > prompt > allow. "prompt" maps to allow-with-log because hooks cannot
+# show an interactive prompt; for real per-action prompts switch MANTRA's permission_mode to a
+# confirm-based mode. Compound commands are split and every segment is evaluated, and a rule
+# matches at any token position with quotes stripped.
+# Regex rules: forbidre|<regex>|<justification> match the whole command text, so they catch
+# shapes that span segments or wrappers. Regex matching is case-insensitive.
+forbid|rm -rf|Destructive deletion; use careful targeted removal
+forbid|Remove-Item -Recurse -Force|Destructive deletion; confirm scope first
+forbid|git push --force|Force-push without lease can destroy history; use --force-with-lease
+forbid|git reset --hard|Destructive reset; uncommitted work will be lost
+forbidre|git\s+reset\s+--hard|Destructive reset, any position or wrapper
+prompt|git push|Pushing to a remote changes shared state; logged
+allow|git diff|Safe read-only diff
+allow|git status|Safe read-only status
+allow|git log|Safe read-only log
+# Cache-prefix guards: AGENTS.md and the per-project MEMORY.md are loaded
+# into the provider prompt prefix, and rewriting either mid-session
+# invalidates the prefix cache (a full-prefix re-bill on the next call).
+# Shell-layer writes are forbidden; deliberate updates go through the
+# instruction-audit / update-memory flows at session boundaries.
+forbidre|(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md|Mid-session AGENTS.md edits invalidate the provider prefix cache; defer to session boundaries
+forbidre|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md|Mid-session native-memory fence edits invalidate the provider prefix cache; memory-mirror handles this at close
+

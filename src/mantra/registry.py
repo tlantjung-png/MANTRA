@@ -160,7 +160,10 @@ def _construct(cls, config: dict):
             kwargs[key] = value
     missing_required = {
         name for name, param in params.items()
-        if param.default is param.empty and name not in kwargs and not name.startswith("_")
+        if param.default is param.empty
+        and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        and name not in kwargs
+        and not name.startswith("_")
     }
     if missing_required:
         raise ConfigError(

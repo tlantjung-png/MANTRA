@@ -34,6 +34,16 @@ class Sandbox(ABC):
         """Run a shell command in the sandbox and capture its output."""
         raise NotImplementedError
 
+    def screen_command(self, command: str) -> str | None:
+        """Reject a command before execution; return a reason or None.
+
+        Sandboxes with command-level screening (the host sandbox)
+        override this so every execution path — foreground and
+        background alike — can share one implementation. The default
+        accepts everything.
+        """
+        return None
+
     @abstractmethod
     def read_file(self, path: str) -> str:
         """Return file content relative to the sandbox workspace."""

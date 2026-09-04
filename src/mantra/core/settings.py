@@ -80,6 +80,7 @@ def _read() -> dict[str, Any]:
         _last_error = f"{file} could not be read: {exc}"
         return {}
     _last_error = None
+    # Non-dict documents count as empty; only parse/IO failures set _last_error.
     return data if isinstance(data, dict) else {}
 
 
@@ -107,10 +108,8 @@ def _break_stale_lock(lock_path: Path) -> bool:
         age = time.time() - stat.st_mtime
         if age < _LOCK_STALE_SECONDS:
             return False
-        # Atomicity: only remove if mtime hasn't changed since we checked.
-        # Use compare-and-remove pattern with a second stat.
+        # Compare-and-remove: re-stat before unlink so a fresh lock is never deleted.
         try:
-            # Re-stat to ensure no one is actively writing (recent mtime change)
             stat2 = lock_path.stat()
             if stat2.st_mtime != stat.st_mtime:
                 return False
@@ -123,7 +122,8 @@ def _break_stale_lock(lock_path: Path) -> bool:
     return False
 
 
-def _write(data: dict[str, Any]) -> None:
+def _write(data: dict[str, Any]) -> bool:
+    """Persist the document atomically. Returns False when the write failed."""
     file = path()
     file.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -132,7 +132,7 @@ def _write(data: dict[str, Any]) -> None:
         pass
     if _last_error is not None:
         _quarantine(file, _last_error)
-    data["version"] = _VERSION
+    data["version"] = _VERSION  # Force the current schema version on every write.
     content = json.dumps(data, indent=2, sort_keys=True) + "\n"
     # File lock for inter-process safety (best effort).
     # Use atomic exclusive create as the sole arbiter; stale check is
@@ -161,14 +161,24 @@ def _write(data: dict[str, Any]) -> None:
                 pass
         except OSError:
             break
-    tmp = file.with_suffix(file.suffix + ".tmp")
+    if not acquired:
+        # Another process holds the lock: skip the write rather than race it.
+        return False
+    # Unique temp name: no fixed path for a planted symlink to hijack and
+    # no shared file for two writers to interleave into.
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(file.parent), prefix=file.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(content, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
         try:
             os.chmod(tmp, 0o600)
         except OSError:
             pass
         tmp.replace(file)
+        return True
     except OSError:
         try:
             file.write_text(content, encoding="utf-8")
@@ -176,8 +186,14 @@ def _write(data: dict[str, Any]) -> None:
                 os.chmod(file, 0o600)
             except OSError:
                 pass
+            return True
         except OSError:
-            pass
+            return False
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     finally:
         if acquired and lock_fd is not None:
             try:
@@ -201,6 +217,7 @@ def load() -> dict[str, Any]:
     }
     skills = data.get("skills")
     if isinstance(skills, dict):
+        # Copy only known preference keys; unknown stored keys are dropped.
         out["skills"].update({key: skills.get(key, value) for key, value in DEFAULT_FILE["skills"].items()})
     endpoints = data.get("endpoints")
     if isinstance(endpoints, dict):
@@ -231,6 +248,7 @@ def endpoints() -> dict[str, dict[str, Any]]:
 
 
 def get_endpoint(name: str) -> dict[str, Any] | None:
+    # Endpoints are stored lowercased, so lookups normalize too.
     return endpoints().get((name or "").strip().lower())
 
 
@@ -269,6 +287,7 @@ def remove_endpoint(name: str) -> bool:
     if name not in data["endpoints"]:
         return False
     del data["endpoints"][name]
+    # Removing the active endpoint also blanks the active pick.
     if data["active"].get("endpoint") == name:
         data["active"]["endpoint"] = ""
         data["active"]["model"] = ""

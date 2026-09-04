@@ -105,7 +105,7 @@ class DerivationTest(unittest.TestCase):
         self.assertEqual(_derive_name("http://localhost:11434/v1"), "localhost")
 
     def test_host_without_scheme(self):
-        # A bare host is tolerated rather than rejected.
+        # A scheme-ful host resolves to its first label.
         self.assertEqual(_derive_name("https://llm.internal/v1"), "llm")
 
     def test_unparseable_falls_back(self):
@@ -117,6 +117,35 @@ class DerivationTest(unittest.TestCase):
 
     def test_key_env_is_upper_and_underscored(self):
         self.assertRegex(_derive_key_env("my-box"), r"^[A-Z0-9_]+$")
+
+
+# ---- --endpoint override -------------------------------------------------
+
+
+class EndpointOverrideTest(TempStorage, unittest.TestCase):
+    """``--endpoint URL`` must switch the key env too.
+
+    The config default ``api_key_env`` is ``OPENAI_API_KEY``, which is
+    always truthy: naively ``or``-ing a derivation onto it never fires,
+    so overriding the endpoint kept sending the wrong provider's key.
+    The override must prefer the saved endpoint's env var, then derive
+    from the hostname.
+    """
+
+    def test_override_uses_saved_endpoint_key_env(self):
+        from mantra.core.settings import add_endpoint
+
+        add_endpoint("inceptionlabs", "https://api.inceptionlabs.ai/v1", "INCEPTIONLABS_API_KEY")
+        config = {"llm": {"api_key_env": "OPENAI_API_KEY"}}
+        console._apply_endpoint_override(config, "https://api.inceptionlabs.ai/v1")
+        self.assertEqual(config["llm"]["base_url"], "https://api.inceptionlabs.ai/v1")
+        self.assertEqual(config["llm"]["api_key_env"], "INCEPTIONLABS_API_KEY")
+
+    def test_override_derives_env_when_endpoint_unknown(self):
+        config = {"llm": {"api_key_env": "OPENAI_API_KEY"}}
+        console._apply_endpoint_override(config, "https://example.com/v1")
+        self.assertEqual(config["llm"]["base_url"], "https://example.com/v1")
+        self.assertEqual(config["llm"]["api_key_env"], "EXAMPLE_API_KEY")
 
 
 # ---- /connect ------------------------------------------------------------
@@ -135,18 +164,9 @@ class ConnectTest(TempStorage, unittest.TestCase):
              key: str = "sk-test-1234", effort: str | None = None):
         """Drive ``_connect`` with scripted menu selections.
 
-        HTTP is always stubbed: the flow ends by asking the endpoint for
-        its catalogue, so a test that leaves the network live would make
-        a real request.
-
-        ``console._menu`` is stubbed rather than ``input``: the flow
-        finishes in a cursor-and-mouse menu, not a numbered prompt, and
-        a menu reads single keystrokes from a terminal pytest does not
-        have.
-
-        Picking a model now also opens an effort menu, so the scripted
-        answers are padded with one - a bare ``_run("my-model-a")``
-        reads as "choose my-model-a, then leave effort off".
+        HTTP is stubbed (the flow fetches a catalogue), ``_menu`` is
+        stubbed instead of ``input`` (the real flow is cursor-driven),
+        and the scripted answers are padded with an effort-menu pick.
         """
         buf = io.StringIO()
         scripted = list(choices) + [effort]
@@ -292,10 +312,8 @@ class ConnectTest(TempStorage, unittest.TestCase):
 class KeyReplacementTest(TempStorage, unittest.TestCase):
     """A rejected key must be fixable without editing files by hand.
 
-    This is the bug that started as "cant re add key if past key
-    incorrect": discovery 401s, /connect is re-run, and the key prompt
-    is skipped because something is already in the store - so the bad
-    key is permanent.
+    Regression: once any key was in the store, re-running /connect
+    skipped the key prompt, so a mistyped key became permanent.
     """
 
     def setUp(self):
@@ -355,6 +373,7 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
         options_seen = {}
 
         def fake_menu(session, title, options, **kwargs):
+            # Capture the menu contents without triggering a selection.
             options_seen["values"] = [o.value for o in options]
             return None
 
@@ -375,6 +394,7 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
         options_seen = {}
 
         def fake_menu(session, title, options, **kwargs):
+            # Capture the menu contents without triggering a selection.
             options_seen["values"] = [o.value for o in options]
             return None
 
@@ -397,6 +417,67 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
                     )
         env = self.session.config["llm"]["api_key_env"]
         self.assertEqual(resolve(env), "sk-fixed-4321")
+
+    def test_direct_key_form_honors_custom_api_key_env(self):
+        # /connect key <name> <key> must store under the endpoint's own
+        # api_key_env, not the env derived from the short name - otherwise
+        # the key lands in a variable the resolver never reads (an orphan).
+        from mantra.core.keys import stored_keys
+        from mantra.core.settings import add_endpoint
+
+        add_endpoint(
+            "inceptionlabs", "https://api.inceptionlabs.ai/v1", "MY_CUSTOM_ENV"
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ok = console._connect(
+                self.session, ["key", "inceptionlabs", "sk-custom-1"]
+            )
+        self.assertTrue(ok)
+        self.assertIn("key stored for inceptionlabs", buf.getvalue())
+        self.assertEqual(resolve("MY_CUSTOM_ENV"), "sk-custom-1")
+        # Nothing under the derived env name: no orphan credential.
+        self.assertNotIn("INCEPTIONLABS_API_KEY", stored_keys())
+
+    def test_direct_key_form_falls_back_to_derived_env_for_unknown_name(self):
+        # A name with no saved endpoint still works (derived env), so the
+        # one-liner is usable before /connect is ever run.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ok = console._connect(self.session, ["key", "mybox", "sk-box-2"])
+        self.assertTrue(ok)
+        self.assertEqual(resolve(_derive_key_env("mybox")), "sk-box-2")
+
+
+class CredentialStoreTest(TempStorage, unittest.TestCase):
+    """Credential writes stay atomic; no insecure direct-write fallback."""
+
+    def test_store_writes_atomically_without_leftover_temp(self):
+        from mantra.core.keys import credentials_path, store, stored_keys
+
+        store("A", "1")
+        store("B", "2")
+        self.assertEqual(stored_keys(), {"A": "1", "B": "2"})
+        leftovers = [
+            p for p in os.listdir(credentials_path().parent) if p.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_failed_atomic_replace_raises_and_writes_nothing(self):
+        """When the atomic replace fails, store() must raise instead of
+        falling back to a direct write to the target path, which could
+        follow a planted symlink and silently weaken the guarantee."""
+        from mantra.core.keys import credentials_path, store
+
+        target = credentials_path()
+        target.write_text('{"keys": {"old": "keep"}}', encoding="utf-8")
+        with mock.patch("pathlib.Path.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                store("NEW_KEY", "sk-new")
+        # No fallback write happened; the previous content survives.
+        on_disk = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["keys"], {"old": "keep"})
+        self.assertNotIn("NEW_KEY", on_disk["keys"])
 
 
 def _connect_key_with(session, new_key: str) -> bool:

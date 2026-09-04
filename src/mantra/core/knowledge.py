@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
@@ -219,6 +220,11 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                         pass
                 except OSError:
                     break
+            if not lock_acquired:
+                # Another process holds the lock: skip the write rather
+                # than race it. The entry is dropped this turn instead of
+                # two writers clobbering each other's lines.
+                return False
             # Re-read before write to avoid lost update (even without lock).
             fresh = _read_file(memory_path)
             if fresh != existing:
@@ -229,9 +235,15 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     if "\n" not in combined and len(combined) > cap:
                         combined = combined[-cap:]
                         break
-            tmp_path = memory_path + ".tmp"
+            # Unique temp name in the same directory: no fixed path for a
+            # planted symlink to hijack.
+            fd_tmp, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(memory_path) or ".",
+                prefix=os.path.basename(memory_path) + ".",
+                suffix=".tmp",
+            )
             try:
-                with open(tmp_path, "w", encoding="utf-8", newline="\n") as handle:
+                with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
                     handle.write(combined)
                 try:
                     os.chmod(tmp_path, 0o600)
@@ -251,6 +263,11 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     return True
                 except OSError:
                     return False
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
         finally:
             if lock_acquired and lock_handle is not None:
                 try:
