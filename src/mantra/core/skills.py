@@ -269,7 +269,10 @@ def load_bundles() -> dict[str, list[str]]:
             name = cells[0].strip().strip("`").lower()
             skills = _backticked(cells[1])
             if name and skills:
-                bundles[name] = skills
+                # Earlier roots win, matching load_skill precedence for
+                # individual skills: the personal tree overrides the
+                # workspace library, not the other way around.
+                bundles.setdefault(name, skills)
     _cache_bundles = dict(bundles)
     _cache_bundles_ts = now
     _cache_bundles_roots = current_roots
@@ -477,7 +480,7 @@ def recommend(query: str) -> tuple[Skill | None, str | None]:
     """
     # Generic workspace queries like "Explain this project" must not auto-attach help
     wanted = _stems(query)
-    if wanted and wanted.issubset(_GENERIC_NO_AUTO | {"thi", "what"}):
+    if wanted and wanted.issubset(_GENERIC_NO_AUTO):
         return None, match_bundle(query)
     # Don't auto-attach the help skill to generic workspace queries.
     if wanted and "project" in wanted and len(wanted) <= 3:

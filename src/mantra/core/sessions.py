@@ -103,7 +103,6 @@ def _break_stale_lock(lock_path: Path) -> bool:
             return True
     except OSError:
         return False
-    return False
 
 
 def _trim_messages(messages: list[Any]) -> list[Any]:
@@ -178,6 +177,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
     # file for two writers to interleave into.
     import tempfile
 
+    tmp_name = None
     try:
         fd, tmp_name = tempfile.mkstemp(
             dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
@@ -189,6 +189,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
         except OSError:
             pass
         os.replace(tmp_name, target)
+        tmp_name = None
     except OSError:
         # Fallback: direct write, risking a partially written file rather
         # than losing the transcript entirely.
@@ -201,12 +202,13 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
                 pass
         except OSError:
             return None
-        finally:
+    finally:
+        # Clean up a staged temp file that never got promoted, if any.
+        if tmp_name is not None:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
-    finally:
         if acquired and lock_fd is not None:
             try:
                 os.close(lock_fd)
@@ -235,7 +237,10 @@ def load(name: str) -> dict[str, Any] | None:
         try:
             with open(cand, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError covers json.JSONDecodeError and the
+            # UnicodeDecodeError raised by a file in an unexpected
+            # encoding; both mean "unusable session file".
             continue
         if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
             continue
@@ -290,7 +295,9 @@ def list_sessions(limit: int = 20) -> list[dict[str, Any]]:
         try:
             with open(file, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError covers JSONDecodeError and UnicodeDecodeError so
+            # one undecodable file cannot abort the whole listing.
             continue
         if not isinstance(data, dict):
             continue

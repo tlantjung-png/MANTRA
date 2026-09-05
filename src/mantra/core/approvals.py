@@ -151,7 +151,7 @@ def _redact_sensitive(s: str) -> str:
     s = re.sub(r"(?i)(?<![A-Za-z0-9])(sk-[a-zA-Z0-9_\-]{12,}|sk_[a-f0-9_\-]{12,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z_\-]{20,})(?![A-Za-z0-9])", "[REDACTED]", s)
     s = re.sub(r"(?i)(passw(or)?d|secret|token|apikey|api[-_]?key|authorization|bearer|credential)\s*[=:]\s*[\"']?(?:bearer\s+)?[^\"'\s,;]+", r"\1=[REDACTED]", s)
     # Generic high-entropy bare tokens near assignment (e.g. key=abc123... 20+ chars)
-    s = re.sub(r"(?i)(?:key|secret|token)\s*=\s*[\"']?[A-Za-z0-9_\-]{20,}[\"']?", "[REDACTED]", s)
+    s = re.sub(r"(?i)\b(key|secret|token)\s*=\s*[\"']?[A-Za-z0-9_\-]{20,}[\"']?", r"\1=[REDACTED]", s)
     # Bare bearer tokens (eyJ... JWT style) without prefix
     s = re.sub(r"\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b", "[REDACTED]", s)
     # Also redact any value that exactly matches a stored credential (exact match)
@@ -166,9 +166,11 @@ def _redact_sensitive(s: str) -> str:
     return s
 
 def _is_escaped(text: str, idx: int) -> bool:
+    # Only backslashes escape in POSIX shells; a backtick is command
+    # substitution, not an escape, and must not affect quote state.
     slashes = 0
     for j in range(idx - 1, -1, -1):
-        if text[j] == "\\" or text[j] == "`":
+        if text[j] == "\\":
             slashes += 1
         else:
             break
@@ -198,12 +200,15 @@ def _get_tokens(segment: str) -> list[str]:
         tokens.append("".join(cur))
     # Handle quoted leading command like "\"rm\" -rf"
     trimmed = segment.strip()
-    if tokens and len(tokens) == 1 and trimmed and trimmed[0] in ('"', "'") and " " in tokens[0] and not _is_blocked_path_check(tokens[0]):
+    if tokens and len(tokens) == 1 and trimmed and trimmed[0] in ('"', "'") and " " in tokens[0]:
         # Recursively tokenize the inner quoted command
         inner = tokens[0]
         return _get_tokens(inner) + tokens[1:]
     # Wrapper expansion: classify the inner command only, so the wrapper
-    # does not double-count the risk.
+    # does not double-count the risk. Slice the token stream after the
+    # switch token instead of re-searching the raw segment — the switch
+    # text can appear earlier inside a quoted body or a path, and a
+    # leftmost search there would truncate the real inner command.
     if len(tokens) >= 3:
         wrapper = tokens[0].lower().replace("\\", "/").split("/")[-1]
         switch = tokens[1].lower()
@@ -213,17 +218,10 @@ def _get_tokens(segment: str) -> list[str]:
             or (wrapper in ("bash", "bash.exe") and switch == "-c")
         )
         if is_wrapper:
-            inner_text = segment[segment.find(tokens[1]) + len(tokens[1]):].strip()
-            inner_text = inner_text.strip().strip('"').strip("'")
-            inner_tokens = _get_tokens(inner_text)
-            # Return only inner tokens for classification to avoid double count;
-            # outer wrapper is trusted shell launcher.
-            return inner_tokens
+            # The outer tokenizer already flattened quoted inner arguments,
+            # so tokens after the switch are the inner command's tokens.
+            return tokens[2:]
     return tokens
-
-def _is_blocked_path_check(s: str) -> bool:
-    # Always False: quoted single-token commands are recursed unconditionally.
-    return False
 
 def _split_command(cmd: str) -> list[str]:
     """Split on &&, ||, ;, |, &, and newlines outside quotes."""
@@ -338,13 +336,6 @@ _DESTRUCTIVE_TOKENS = [
     (["rmdir"], False),
 ]
 
-# Token patterns used by _classify_segment; _SAFE_TOKENS is unused.
-_SAFE_TOKENS = [
-    (["ls"], False),
-    (["git", "status"], False),
-    (["git", "diff"], False),
-]
-
 def classify_command(command: str) -> str:
     """Risk of a shell command: destructive, safe, or mutating. Worst segment wins."""
     if not command or not command.strip():
@@ -447,9 +438,17 @@ class ApprovalPolicy:
 
             log_path = os.path.join(os.path.expanduser("~"), ".mantra", "logs", "pre-tool-use.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            # Rotate before appending so the audit log cannot grow unbounded.
             try:
-                if os.path.getsize(log_path) > 1_000_000:
+                os.chmod(log_path, 0o600)
+            except OSError:
+                pass
+            # Rotate before appending so the audit log cannot grow unbounded.
+            # Size is sampled every 64th call; reading and rewriting the file
+            # on every tool call is filesystem churn on long sessions.
+            _log_check_counter = getattr(ApprovalPolicy, "_log_check_counter", 0) + 1
+            ApprovalPolicy._log_check_counter = _log_check_counter
+            try:
+                if _log_check_counter % 64 == 0 and os.path.getsize(log_path) > 1_000_000:
                     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                         tail = f.read()[-200_000:]
                     with open(log_path, "w", encoding="utf-8") as f:

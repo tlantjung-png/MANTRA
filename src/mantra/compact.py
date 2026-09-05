@@ -186,7 +186,7 @@ def _wrap_ansi(text: str, width: int) -> list[str]:
     return out if out else [""]
 
 
-def _version(session: Any) -> str:
+def _version() -> str:
     try:
         from mantra import __version__  # type: ignore
         return __version__
@@ -210,7 +210,7 @@ def render_card(session: Any, width: int | None = None, enabled: bool = True) ->
         width = max(30, cols - 8)
         if width > 80:
             width = 80
-    ver = _version(session)
+    ver = _version()
     inner = width
     # M A N T R A wordmark in the muted-crimson accent; tagline and
     # version stay quiet below it so the splash reads as one calm mark.
@@ -528,6 +528,10 @@ class CompactLayout:
             if not self.active:
                 if self.partial:
                     _safe_write(self.partial)
+                    # Clear the written text: otherwise the next write()
+                    # prepends it again once the layout activates and the
+                    # same text is committed into the buffer twice.
+                    self.partial = ""
                 return
             self._last_render = 0.0
             self._render_content_locked()

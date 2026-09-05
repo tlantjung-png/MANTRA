@@ -160,6 +160,56 @@ def _clip_vis(text: str, width: int) -> str:
     return "".join(out)
 
 
+def _char_columns(text: str) -> int:
+    """Visible width of one character (wide chars take two columns)."""
+    import unicodedata
+
+    if unicodedata.combining(text):
+        return 0
+    if unicodedata.category(text) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(text) in ("W", "F") else 1
+
+
+def _column_to_index(text: str, col: int) -> int:
+    """Buffer index whose visible column is ``col`` (wide-char aware).
+
+    Mouse reports give a terminal column; mapping it by raw character
+    count lands on the wrong character whenever wide (CJK/emoji)
+    characters precede the click point.
+    """
+    width = 0
+    for i, ch in enumerate(text):
+        if width >= col:
+            return i
+        width += _char_columns(ch)
+    return len(text)
+
+
+def _display_to_buffer_index(buffer: str, display_index: int) -> int:
+    """Map an index in the newline-expanded display text back to the buffer.
+
+    The display form replaces each newline with " ↵ ", so every
+    newline before the target adds two display-only characters.
+    """
+    remaining = display_index
+    bi = 0
+    while bi < len(buffer) and remaining > 0:
+        if buffer[bi] == "\n":
+            remaining -= 3
+        else:
+            remaining -= 1
+        bi += 1
+    return min(bi, len(buffer))
+
+
+def _click_to_buffer_index(buffer: str, col: int) -> int:
+    """Terminal column on the prompt row -> buffer index."""
+    display = buffer.replace("\n", " ↵ ")
+    display_index = _column_to_index(display, col)
+    return _display_to_buffer_index(buffer, display_index)
+
+
 def _size_chip(buffer: str) -> str:
     """Dim row marker: line and character counts of the prompt buffer.
 
@@ -362,6 +412,10 @@ class LineEditor:
         self._sel_anchor: int | None = None
         self._sel_end: int | None = None
         self._sel_active = False
+        # Deferred "copied" toast: (mode, layout, clear_after). The toast
+        # must not sleep inside the raw-mode read loop — that froze input
+        # for up to 0.7s — so it is cleared on a later draw instead.
+        self._toast: tuple[str, Any, float] | None = None
 
         # Keys buffered elsewhere (e.g. by the turn-scoped scroll reader
         # while a task streams) that the editor must deliver at its next
@@ -530,7 +584,8 @@ class LineEditor:
                                 if is_prompt:
                                     pvis = visible_len(prompt)
                                     col = max(0, key.column - pvis - 1)
-                                    self._sel_anchor = max(0, min(len(buffer), col))
+                                    idx = _click_to_buffer_index(buffer, col)
+                                    self._sel_anchor = max(0, min(len(buffer), idx))
                                     self._sel_end = self._sel_anchor
                                     self._sel_active = True
                                 else:
@@ -541,7 +596,8 @@ class LineEditor:
                                 if is_prompt:
                                     pvis = visible_len(prompt)
                                     col = max(0, key.column - pvis - 1)
-                                    cur = max(0, min(len(buffer), col))
+                                    idx = _click_to_buffer_index(buffer, col)
+                                    cur = max(0, min(len(buffer), idx))
                                     # Inclusive of the release cell, so a
                                     # drag ending on "o" copies "hello".
                                     self._sel_end = min(len(buffer), cur + 1)
@@ -556,29 +612,13 @@ class LineEditor:
                                         if start == finish:
                                             pvis = visible_len(prompt)
                                             col = max(0, key.column - pvis - 1)
-                                            end = max(0, min(len(buffer), col))
+                                            end = max(0, min(len(buffer), _click_to_buffer_index(buffer, col)))
                                             start = min(self._sel_anchor, end)
                                             finish = max(self._sel_anchor, end)
                                         if start != finish:
                                             sel_text = buffer[start:finish]
                                             _set_clipboard_text(sel_text)
-                                            try:
-                                                layout = getattr(self, "layout_ref", None)
-                                                msg = self.style.dim("copied")
-                                                if layout is not None and getattr(layout, "active", False):
-                                                    layout.draw_border_status(msg)
-                                                    import time as _t
-                                                    _t.sleep(0.7)
-                                                    layout.draw_border_status("")
-                                                else:
-                                                    sys.stdout.write("\r\033[K" + msg + "\n")
-                                                    sys.stdout.flush()
-                                                    import time as _t
-                                                    _t.sleep(0.35)
-                                                    sys.stdout.write("\033[1A\r\033[K")
-                                                    sys.stdout.flush()
-                                            except Exception:
-                                                pass
+                                            self._show_copied_toast(getattr(self, "layout_ref", None))
                                     else:
                                         try:
                                             layout = getattr(self, "layout_ref", None)
@@ -599,23 +639,7 @@ class LineEditor:
                                                 clean = _re2.sub(r"\x1b\[[0-9;]*m", "", raw).strip()
                                                 if clean:
                                                     _set_clipboard_text(clean)
-                                                    try:
-                                                        layout = getattr(self, "layout_ref", None)
-                                                        msg = self.style.dim("copied")
-                                                        if layout is not None and getattr(layout, "active", False):
-                                                            layout.draw_border_status(msg)
-                                                            import time as _t
-                                                            _t.sleep(0.7)
-                                                            layout.draw_border_status("")
-                                                        else:
-                                                            sys.stdout.write("\r\033[K" + msg + "\n")
-                                                            sys.stdout.flush()
-                                                            import time as _t
-                                                            _t.sleep(0.35)
-                                                            sys.stdout.write("\033[1A\r\033[K")
-                                                            sys.stdout.flush()
-                                                    except Exception:
-                                                        pass
+                                                    self._show_copied_toast(getattr(self, "layout_ref", None))
                                         except Exception:
                                             pass
                                 except Exception:
@@ -898,8 +922,44 @@ class LineEditor:
             return None
         return glyph if glyph else None
 
+    def _show_copied_toast(self, layout: Any) -> None:
+        """Show the "copied" confirmation without blocking the read loop."""
+        msg = self.style.dim("copied")
+        import time as _t
+
+        try:
+            if layout is not None and getattr(layout, "active", False):
+                layout.draw_border_status(msg)
+                self._toast = ("border", layout, _t.monotonic() + 0.7)
+            else:
+                sys.stdout.write("\r\x1b[K" + msg + "\n")
+                sys.stdout.flush()
+                self._toast = ("line", None, _t.monotonic() + 0.35)
+        except Exception:
+            pass
+
+    def _expire_toast(self) -> None:
+        """Clear the "copied" toast once its display window has elapsed."""
+        if not self._toast:
+            return
+        import time as _t
+
+        mode, layout, until = self._toast
+        if _t.monotonic() < until:
+            return
+        try:
+            if mode == "border" and layout is not None:
+                layout.draw_border_status("")
+            elif mode == "line":
+                sys.stdout.write("\x1b[1A\r\x1b[K")
+                sys.stdout.flush()
+        except Exception:
+            pass
+        self._toast = None
+
     def _draw(self, prompt, buffer, cursor, popup, selected, drawn) -> int:
         out = sys.stdout
+        self._expire_toast()
 
         # The active compact layout is the single source of truth for
         # geometry: its prompt_row always wins over any cached or
@@ -1007,9 +1067,13 @@ class LineEditor:
             if space <= 0:
                 shown = ""
                 cpos = 0
+                # start must always be bound: the selection highlight below
+                # indexes with it even in this clipped state.
+                start = 0
             elif visible_len(display_buffer) <= space:
                 shown = display_buffer
                 cpos = display_cursor
+                start = 0
             else:
                 if self.popup_above and self.fixed_row is not None:
                     wide_chip = _size_chip(buffer)
@@ -1403,12 +1467,19 @@ class LineEditor:
                 if buf and buf[0] in _POSIX_SPECIALS:
                     return _POSIX_SPECIALS[buf[0]]
                 return char
+            if not self._await_more_input():
+                # Nothing followed ESC <seq> within the grace window: give
+                # the Escape back instead of blocking on a read that may
+                # never complete.
+                return char
             buf = sys.stdin.read(1)
             if buf == "<":
                 return "\x1b"
             # "3"/"5"/"6" start legacy sequences (e.g. ESC 3 ~): read the
             # completing char instead of treating the digit as a literal.
-            rest = buf + (sys.stdin.read(1) if buf in "356" else "")
+            rest = buf
+            if buf in "356" and self._await_more_input():
+                rest += sys.stdin.read(1)
             return _POSIX_SPECIALS.get(rest, char)
         return char
 
@@ -1452,8 +1523,6 @@ class LineEditor:
             if ch.isalpha() or ch == "~":
                 break
         inner = rest[1:]
-        if inner.startswith("3") or inner.startswith("5") or inner.startswith("6"):
-            return _POSIX_SPECIALS.get(inner[:2], "\x1b")
         return _POSIX_SPECIALS.get(inner[:2], "\x1b")
 
     def _await_more_input(self, max_wait: float = 0.05, poll: float = 0.005) -> bool:

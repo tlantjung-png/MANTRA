@@ -70,10 +70,12 @@ def _read() -> dict[str, Any]:
         return {}
     try:
         data = json.loads(file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        # A file the user is editing by hand will be broken sometimes.
-        # Starting empty is fine; silently overwriting what we could not
-        # read is not, so the failure is remembered for _write.
+    except (json.JSONDecodeError, ValueError) as exc:
+        # ValueError covers JSONDecodeError and the UnicodeDecodeError of
+        # a file saved in an unexpected encoding. A file the user is
+        # editing by hand will be broken sometimes. Starting empty is
+        # fine; silently overwriting what we could not read is not, so
+        # the failure is remembered for _write.
         _last_error = f"{file} could not be parsed: {exc}"
         return {}
     except OSError as exc:
@@ -119,13 +121,15 @@ def _break_stale_lock(lock_path: Path) -> bool:
             return True
     except OSError:
         return False
-    return False
 
 
 def _write(data: dict[str, Any]) -> bool:
     """Persist the document atomically. Returns False when the write failed."""
     file = path()
-    file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        file.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
     try:
         os.chmod(file.parent, 0o700)
     except OSError:
@@ -168,7 +172,21 @@ def _write(data: dict[str, Any]) -> bool:
     # no shared file for two writers to interleave into.
     import tempfile
 
-    fd, tmp_name = tempfile.mkstemp(dir=str(file.parent), prefix=file.name + ".", suffix=".tmp")
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=str(file.parent), prefix=file.name + ".", suffix=".tmp")
+    except OSError:
+        # Temporary-file creation failed outside the guarded region below;
+        # release the lock and report the failure per the bool contract.
+        if acquired and lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -283,6 +301,9 @@ def add_endpoint(
 
 
 def remove_endpoint(name: str) -> bool:
+    # Stored keys are lowercased; normalize so a mixed-case name does not
+    # silently do nothing.
+    name = (name or "").strip().lower()
     data = load()
     if name not in data["endpoints"]:
         return False
@@ -297,6 +318,7 @@ def remove_endpoint(name: str) -> bool:
 
 def set_models(name: str, models: Iterable[str]) -> None:
     """Record what an endpoint serves, so /model can list it offline."""
+    name = (name or "").strip().lower()
     data = load()
     entry = data["endpoints"].get(name)
     if entry is None:

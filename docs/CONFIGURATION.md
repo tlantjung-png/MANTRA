@@ -24,6 +24,8 @@ User-wide endpoint and model selections are kept in a separate hand-editable doc
 
 A parallel credentials store holds secret values with restricted permissions and is never written to the main settings file. The store is keyed by lookup name, supports masking for display, and records a schema version. Secrets are resolved first from the process environment and then from the store, with a one-time warning on platforms where permission bits are not enforced. An environment variable override relocates the store for testing.
 
+Residual risk of stored secrets: credentials are held in plaintext (protected only by file permissions), so any process running as the same user, or any backup of the home directory, can read them. Prefer supplying secrets through the process environment where possible. Command text and output are redacted for known secret formats before being written to persistent task logs, but unrecognized secret shapes may still land in those logs; treat task and full-output logs as sensitive.
+
 Workflow definitions are kept in another document that stores named sequences of prompts with version, creation timestamp, and steps, subject to limits on step count and step length, with atomic writes and verified locking.
 
 Session transcripts are kept as one file per session under a dedicated directory, with an override location available via an environment variable. Each transcript records version, name, timestamp, workspace, model, summary, totals, goals, notes, and the full message list, with per-message size caps, atomic writes, restricted permissions, and legacy-name fallback.

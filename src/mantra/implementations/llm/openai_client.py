@@ -64,7 +64,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
         if piece:
             if not isinstance(piece, str):
                 piece = str(piece)
-            content_bytes += len(piece)
+            content_bytes += len(piece.encode("utf-8"))
             if content_bytes > _MAX_CONTENT_PARTS_BYTES:
                 raise LLMError("stream content exceeds cap")
             content_parts.append(piece)
@@ -99,9 +99,13 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
                     arg_part = str(arg_part)
                 slot["args"] += arg_part
 
-    # No sentinel, no content, no calls, no usage: the stream was empty.
-    if not seen_done and not content_parts and not tool_acc and usage is None:
-        raise LLMError("stream ended without DONE and no data")
+    # The stream must end with the DONE sentinel. Without it the response
+    # was truncated mid-answer; treating that as success would let the
+    # agent act on a half-written tool call. Reuse the same error prefix
+    # so the retry logic in chat() treats a no-output truncation as
+    # transient and a partial-output truncation as a failed turn.
+    if not seen_done:
+        raise LLMError("stream ended without DONE")
     tool_calls = []
     for i, slot in sorted(tool_acc.items()):
         name = slot["name"].strip()
@@ -341,13 +345,13 @@ class OpenAICompatClient(LLMClient):
                 detail = raw_detail.decode(errors="replace").lower()[:500]
             except Exception:
                 pass
-            if "max_tokens" in detail or "max_completion_tokens" in detail or "reasoning_effort" in detail or "stream_options" in detail:
+            if any(
+                self._blamed(detail, field)
+                for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options")
+            ):
                 # Re-raise with fresh body so outer handler can still read it
-                try:
-                    import io as _io
-                    raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io.BytesIO(raw_detail))
-                except Exception:
-                    raise
+                import io as _io
+                raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io.BytesIO(raw_detail))
             # Agnostic fallback: if chat fails and provider offers Responses API, try it
             # Preserve original error for diagnostics if fallback also fails
             _orig_exc = exc
@@ -567,19 +571,20 @@ class OpenAICompatClient(LLMClient):
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
 
                 def _line_iter():
-                    # Prefer readline for real HTTPResponse; fall back to iteration for mocks
+                    # Prefer readline for real HTTPResponse; fall back to
+                    # iteration for mocks. Read errors must propagate: a
+                    # mid-stream network drop that ends the generator here
+                    # would surface a silently truncated response as a
+                    # successful one.
                     if hasattr(response, "readline"):
-                        try:
-                            while True:
-                                raw = response.readline()
-                                if not raw:
-                                    break
-                                if isinstance(raw, bytes):
-                                    yield raw.decode("utf-8", errors="replace")
-                                else:
-                                    yield str(raw)
-                        except Exception:
-                            pass
+                        while True:
+                            raw = response.readline()
+                            if not raw:
+                                break
+                            if isinstance(raw, bytes):
+                                yield raw.decode("utf-8", errors="replace")
+                            else:
+                                yield str(raw)
                         return
                     for raw in response:  # type: ignore[attr-defined]
                         if isinstance(raw, bytes):
@@ -601,12 +606,12 @@ class OpenAICompatClient(LLMClient):
                 detail = raw2.decode(errors="replace").lower()[:500]
             except Exception:
                 pass
-            if "max_tokens" in detail or "max_completion_tokens" in detail or "reasoning_effort" in detail or "stream_options" in detail:
-                try:
-                    import io as _io2
-                    raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io2.BytesIO(raw2))
-                except Exception:
-                    raise
+            if any(
+                self._blamed(detail, field)
+                for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options")
+            ):
+                import io as _io2
+                raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io2.BytesIO(raw2))
             _orig = exc
             _orig_detail2 = detail
             if exc.code in (400, 500):

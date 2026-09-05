@@ -287,7 +287,17 @@ class LocalSandbox(Sandbox):
                 handle.write(content)
             os.replace(tmp, full)
         except OSError:
-            # Fallback direct
+            # Fallback direct write. The symlink checks above ran before
+            # the tmp attempt; re-validate immediately so a path swapped
+            # to a symlink in the meantime cannot redirect the write
+            # outside the workspace.
+            if os.path.islink(full) or os.path.islink(tmp):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                raise SandboxError(f"path escapes sandbox workspace: {path}")
             with open(full, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
             try:

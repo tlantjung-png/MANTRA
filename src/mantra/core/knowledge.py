@@ -150,9 +150,9 @@ def _read_tail(path: str | None, cap: int) -> str:
                 handle.seek(max(0, size - cap - 500))
                 data = handle.read(cap + 1000)
                 content = data.decode("utf-8", errors="replace")
-                # If we started mid-file, drop partial line.
-                if size > cap + 500:
-                    content = content.split("\n", 1)[-1] if "\n" in content else content
+                # If we started mid-file, drop the partial first line.
+                if "\n" in content:
+                    content = content.split("\n", 1)[-1]
                 if len(content) > cap:
                     content = content[-cap:]
                     content = content.split("\n", 1)[-1]
@@ -237,37 +237,43 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                         break
             # Unique temp name in the same directory: no fixed path for a
             # planted symlink to hijack.
-            fd_tmp, tmp_path = tempfile.mkstemp(
-                dir=os.path.dirname(memory_path) or ".",
-                prefix=os.path.basename(memory_path) + ".",
-                suffix=".tmp",
-            )
             try:
-                with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(combined)
-                try:
-                    os.chmod(tmp_path, 0o600)
-                except OSError:
-                    pass
-                os.replace(tmp_path, memory_path)
-                return True
+                fd_tmp, tmp_path = tempfile.mkstemp(
+                    dir=os.path.dirname(memory_path) or ".",
+                    prefix=os.path.basename(memory_path) + ".",
+                    suffix=".tmp",
+                )
             except OSError:
-                # Fallback: direct write.
+                # Temp creation failed: the fallback below still applies,
+                # so no NameError may escape through the finally block.
+                tmp_path = None
+            if tmp_path is not None:
                 try:
-                    with open(memory_path, "w", encoding="utf-8", newline="\n") as handle:
+                    with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
                         handle.write(combined)
                     try:
-                        os.chmod(memory_path, 0o600)
+                        os.chmod(tmp_path, 0o600)
                     except OSError:
                         pass
+                    os.replace(tmp_path, memory_path)
                     return True
                 except OSError:
-                    return False
-                finally:
+                    # Fallback: direct write.
                     try:
-                        os.unlink(tmp_path)
+                        with open(memory_path, "w", encoding="utf-8", newline="\n") as handle:
+                            handle.write(combined)
+                        try:
+                            os.chmod(memory_path, 0o600)
+                        except OSError:
+                            pass
+                        return True
                     except OSError:
-                        pass
+                        return False
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
         finally:
             if lock_acquired and lock_handle is not None:
                 try:
@@ -300,7 +306,6 @@ def _break_stale_lock(lock_path: str) -> bool:
             return True
     except OSError:
         return False
-    return False
 
 
 def _read_file(path: str) -> str:

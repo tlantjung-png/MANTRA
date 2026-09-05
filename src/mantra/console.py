@@ -224,11 +224,15 @@ class StreamingRenderer:
     def render_piece(self, piece: str) -> str:
         """Render a text fragment with inline markdown."""
         self._buf += _sanitize_output(piece)
-        # Bound single-line growth without newlines to avoid unbounded memory
+        # Bound single-line growth without newlines to avoid unbounded
+        # memory. Render the chunk but do not inject a line break: a
+        # forced break can split an inline-code span, a bold marker or a
+        # partial fence opener and desync the fence state machine for the
+        # rest of the stream. The caller clips overflow at flush time.
         if len(self._buf) > 30000 and "\n" not in self._buf:
             chunk = self._buf[:20000]
             self._buf = self._buf[20000:]
-            return _render_md_line(chunk, self.style, self) + "\n"
+            return _render_md_line(chunk, self.style, self)
         if len(self._buf) > 50000:
             self._buf = self._buf[-50000:]
         out = ""
@@ -1642,12 +1646,6 @@ class ConsoleSession:
                         self.layout.draw_prompt("")
                     except Exception:
                         pass
-                    # Nudge the spinner to repaint its border immediately.
-                    if getattr(self, "_spinner", None) is not None and getattr(self._spinner, "_layout", None) is not None:
-                        try:
-                            self._spinner._last_render = 0
-                        except Exception:
-                            pass
                 except Exception:
                     self._print(msg)
             else:
@@ -2429,8 +2427,11 @@ class ConsoleSession:
             and sys.stdout.isatty()
         ):
             if os.name != "nt":
+                # cbreak_mode is a real context manager; entering it
+                # manually still guarantees restoration via __exit__ below
+                # even if the turn raises.
                 cbreak = cbreak_mode()
-                next(cbreak)
+                cbreak.__enter__()
             scroll_reader = _TurnScrollReader(self, self.layout)
             scroll_reader.start()
         try:
@@ -2492,9 +2493,6 @@ class ConsoleSession:
                     self.frame.row(body)
                 else:
                     self._print(f"{self.style.brand('ENCHANTER')} {body}")
-            elif result is not None and not result.final_message and not self._streamed_this_run:
-                # Empty final without streaming: nothing to render.
-                pass
             if result is not None:
                 self._record_usage(result)
                 self._record_memory(task, result)
@@ -2509,7 +2507,10 @@ class ConsoleSession:
                 scroll_reader.stop()
             if cbreak is not None:
                 try:
-                    cbreak.close()
+                    # __exit__ restores termios even when the turn raised;
+                    # the old generator-close protocol left modes unrestored
+                    # on any exception that bypassed close().
+                    cbreak.__exit__(None, None, None)
                 except Exception:
                     pass
             self._stop_dashboard_refresh()
@@ -3372,10 +3373,11 @@ class ConsoleSession:
             self._print(s.dim(f"instructions loaded from {os.path.basename(self.instructions_path)}"))
         if os.path.isfile(KNOWN_FAILURES_PATH):
             # Skip the "## KF-N" template line: only numbered entries count.
-            count = sum(
-                1 for ln in open(KNOWN_FAILURES_PATH, encoding="utf-8", errors="replace")
-                if ln.startswith("## KF-") and ln[6:7].isdigit()
-            )
+            with open(KNOWN_FAILURES_PATH, encoding="utf-8", errors="replace") as kf:
+                count = sum(
+                    1 for ln in kf
+                    if ln.startswith("## KF-") and ln[6:7].isdigit()
+                )
             self._print(s.dim(f"known-failure registry: {count} classes"))
         self._print(s.dim("type /help for commands"))
 

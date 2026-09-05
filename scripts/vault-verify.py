@@ -84,9 +84,17 @@ def main():
                     if not first_break:
                         first_break = f"blob missing for {rel} ({sha})"
                 else:
-                    actual = get_sha256(blob)
-                    if actual != sha and not first_break:
-                        first_break = f"blob tampered for {rel}"
+                    try:
+                        actual = get_sha256(blob)
+                    except Exception:
+                        # Unreadable blob is an environment problem, not a
+                        # integrity failure: a raw crash here would exit 1,
+                        # which scripted consumers read as TAMPERED.
+                        if not first_break:
+                            first_break = f"blob unreadable for {rel}"
+                    else:
+                        if actual != sha and not first_break:
+                            first_break = f"blob tampered for {rel}"
             elif kind == "reference":
                 rel = ent.get("rel", "")
                 sha = ent.get("sha256", "")

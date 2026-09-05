@@ -36,6 +36,12 @@ class ContextManager:
         self._chars = 0
 
     def seed(self, system_prompt: str, user_task: str) -> None:
+        # Enforce the same single-message cap as append(): a seeded task
+        # sits below the eviction floor, so nothing else would ever
+        # truncate an oversized one.
+        if len(user_task) > self.max_chars:
+            cap = max(1000, int(self.max_chars * 0.8))
+            user_task = user_task[:cap] + f"\n... [truncated — single message exceeded {cap} chars]"
         self.messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_task},

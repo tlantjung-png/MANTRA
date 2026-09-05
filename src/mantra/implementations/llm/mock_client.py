@@ -35,17 +35,13 @@ def tool_call_response(name: str, arguments: dict) -> LLMResponse:
     )
 
 
-def final_response(content: str, stream: bool = False) -> LLMResponse:
-    """A no-tool final answer.
+def streaming_client(content: str) -> ScriptedLLMClient:
+    """A client that emits ``content`` word-by-word through ``on_delta``.
 
-    ``stream=True`` is for console tests: it returns a ``ScriptedLLMClient``
-    that emits the reply word-by-word through ``on_delta`` before returning
-    the same response, so the streaming render path is exercised rather
-    than the whole-delivery path.
+    Prefer this over ``final_response(..., stream=True)``: it always
+    returns a client, so the return type never changes under a flag.
     """
     response = LLMResponse(content=content)
-    if not stream:
-        return response
 
     def chat(self, messages, tools=None, on_delta=None):
         if on_delta:
@@ -60,3 +56,17 @@ def final_response(content: str, stream: bool = False) -> LLMResponse:
     # instead of replaying the queued script.
     client.chat = types.MethodType(chat, client)
     return client
+
+
+def final_response(content: str, stream: bool = False) -> LLMResponse:
+    """A no-tool final answer.
+
+    ``stream=True`` is for console tests: it returns a ``ScriptedLLMClient``
+    that emits the reply word-by-word through ``on_delta`` before returning
+    the same response, so the streaming render path is exercised rather
+    than the whole-delivery path. Note the return type changes under the
+    flag; new code should call ``streaming_client(content)`` directly.
+    """
+    if stream:
+        return streaming_client(content)
+    return LLMResponse(content=content)

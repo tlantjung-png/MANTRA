@@ -19,6 +19,7 @@ from typing import Any
 
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
+from mantra.implementations.tools.search_tools import _SKIP_DIRS
 
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
@@ -258,14 +259,18 @@ class ReadFileTool(Tool):
             out_parts: list[str] = []
             total = 0
             skipped = 0
-            for rel in sorted(files)[:20]:
+            unreadable = 0
+            for rel in sorted(files):
                 res = self._execute_single(sandbox, rel, 0, 400)  # per-file window
                 # Strip notes for bulk, keep content
                 if res.startswith("ERROR") or res.startswith("Note:"):
+                    unreadable += 1
                     continue
                 chunk = f"--- {rel} ---\n{res}\n"
                 if total + len(chunk) > 100_000:
-                    skipped = len(files) - len(out_parts)
+                    # Count only the files actually dropped by the cap:
+                    # errors and notes were never cap-skipped.
+                    skipped = max(0, len(files) - unreadable - len(out_parts))
                     break
                 out_parts.append(chunk)
                 total += len(chunk)
@@ -330,19 +335,23 @@ class ReadFileTool(Tool):
             # Not found — did-you-mean
             if root is not None:
                 try:
-                    # substring match + levenshtein 2
+                    # substring match + levenshtein 2. Walk cost is bounded:
+                    # heavy directories (caches, dependencies) are skipped,
+                    # matching the search tool's behavior, and the walk is
+                    # capped so a miss on a huge repo cannot stall the turn.
                     base = os.path.basename(path)
+                    base_lower = base.lower()
                     candidates = []
-                    for dirpath, _, filenames in os.walk(root):
+                    visited = 0
+                    for dirpath, dirnames, filenames in os.walk(root):
+                        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+                        visited += len(filenames)
+                        if visited > 20_000:
+                            break
                         for fn in filenames:
-                            if base.lower() in fn.lower():
+                            if base_lower in fn.lower() or _levenshtein(base_lower, fn.lower(), 2) <= 2:
                                 rel = os.path.relpath(os.path.join(dirpath, fn), root)
                                 candidates.append(rel)
-                            elif _levenshtein(base.lower(), fn.lower(), 2) <= 2:
-                                rel = os.path.relpath(os.path.join(dirpath, fn), root)
-                                candidates.append(rel)
-                            if len(candidates) >= 5:
-                                break
                         if len(candidates) >= 5:
                             break
                     if candidates:

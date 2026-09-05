@@ -58,31 +58,42 @@ class DockerSandbox(Sandbox):
                 "infinity",
             ]
         ):
+            self._container_id = None
             raise SandboxError("docker run failed to start the container")
 
-        repo_url = task.get("repo_url")
-        if repo_url:
-            repo_str = str(repo_url)
-            if not self._is_safe_repo_url(repo_str):
-                raise SandboxError(f"repo_url rejected: {repo_str!r}")
-            result = self._exec_no_shell(
-                ["git", "clone", repo_str, "."], timeout=300
-            )
-            if result.exit_code != 0:
-                raise SandboxError(f"git clone failed: {result.stderr[:2000]}")
-            commit = task.get("base_commit")
-            if commit:
-                commit_str = str(commit)
-                if not self._is_safe_commit(commit_str):
-                    raise SandboxError(f"base_commit rejected: {commit_str!r}")
-                if self._exec_no_shell(
-                    ["git", "checkout", commit_str], timeout=60
-                ).exit_code != 0:
-                    raise SandboxError(f"git checkout failed for {commit_str}")
+        # A setup failure after the container starts must not leak the
+        # container (it holds its memory/cpus reservation): remove it
+        # before surfacing the error.
+        try:
+            repo_url = task.get("repo_url")
+            if repo_url:
+                repo_str = str(repo_url)
+                if not self._is_safe_repo_url(repo_str):
+                    raise SandboxError(f"repo_url rejected: {repo_str!r}")
+                result = self._exec_no_shell(
+                    ["git", "clone", repo_str, "."], timeout=300
+                )
+                if result.exit_code != 0:
+                    raise SandboxError(f"git clone failed: {result.stderr[:2000]}")
+                commit = task.get("base_commit")
+                if commit:
+                    commit_str = str(commit)
+                    if not self._is_safe_commit(commit_str):
+                        raise SandboxError(f"base_commit rejected: {commit_str!r}")
+                    if self._exec_no_shell(
+                        ["git", "checkout", commit_str], timeout=60
+                    ).exit_code != 0:
+                        raise SandboxError(f"git checkout failed for {commit_str}")
 
-        setup_cmd = task.get("setup_cmd")
-        if setup_cmd and self.exec(setup_cmd, timeout=600).exit_code != 0:
-            raise SandboxError(f"setup_cmd failed in container {self._container_id}")
+            setup_cmd = task.get("setup_cmd")
+            if setup_cmd and self.exec(setup_cmd, timeout=600).exit_code != 0:
+                raise SandboxError(f"setup_cmd failed in container {self._container_id}")
+        except Exception:
+            try:
+                self.cleanup()
+            except Exception:
+                pass
+            raise
 
     def exec(self, command: str, timeout: float = 120.0) -> ExecResult:
         if self._container_id is None:
@@ -186,7 +197,9 @@ class DockerSandbox(Sandbox):
         resolved = self._resolved_path(path)
         if not self._is_safe_path(resolved):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
-        result = self._exec_no_shell(["cat", path])
+        # Read the resolved target, not the original: a symlink swapped
+        # in between the two calls must not redirect the read.
+        result = self._exec_no_shell(["cat", resolved])
         if result.exit_code != 0:
             raise SandboxError(f"read_file failed for {path}: {result.stderr[:500]}")
         if len(result.stdout) > _MAX_READ_BYTES:
@@ -200,16 +213,14 @@ class DockerSandbox(Sandbox):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
         # Resolve before copying too: an existing symlink at the
         # destination must not redirect the write outside the workdir.
-        # Container paths are POSIX paths, so join with posixpath even
-        # when the host is Windows (os.path would mix in backslashes).
-        import posixpath
-
-        dest = path
-        if not posixpath.isabs(dest):
-            dest = posixpath.join(self.workdir, dest)
         resolved = self._resolved_path(path)
         if not self._is_safe_path(resolved):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
+        # A directory destination would make the copy nest the staged
+        # file inside itself instead of writing the intended path.
+        dir_check = self._exec_no_shell(["test", "-d", resolved])
+        if dir_check.exit_code == 0:
+            raise SandboxError(f"write_file destination is a directory: {path}")
         if len(content) > _MAX_READ_BYTES * 2:
             raise SandboxError(f"content too large ({len(content)} bytes)")
         # Stage the content in a host temp file (owner-only) and copy it
@@ -229,7 +240,7 @@ class DockerSandbox(Sandbox):
                     "docker",
                     "cp",
                     temp_path,
-                    f"{self._container_id}:{dest}",
+                    f"{self._container_id}:{resolved}",
                 ],
                 capture_output=True,
                 text=True,

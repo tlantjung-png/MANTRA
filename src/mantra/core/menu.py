@@ -104,6 +104,11 @@ class Menu:
         self.allow_filter = allow_filter
         self.query = ""
         self.cursor = cursor
+        # First visible index in the scroll window (see _visible).
+        self._scroll = 0
+        # Measured absolute screen row of the first option row; None until
+        # a DSR report succeeds. Instance state: two menus must not share it.
+        self._row_base: int | None = None
         # Menus draw inside the frame so a list never hangs off the screen edge.
         self.frame = frame
         # Measured once, on the first draw: see _cursor_row.
@@ -164,7 +169,19 @@ class Menu:
         return [o for o in self.options if needle in o.text.lower()]
 
     def _visible(self) -> list[Option]:
-        return self.matches[: self.max_rows]
+        """The scroll window of options on screen, following the cursor.
+
+        Without a moving window, navigation past ``max_rows`` advanced the
+        cursor through rows that were never rendered — the operator was
+        moving a highlight they could not see.
+        """
+        matches = self.matches
+        if len(matches) <= self.max_rows:
+            self._scroll = 0
+            return matches
+        start = max(0, min(self.cursor - self.max_rows // 2, len(matches) - self.max_rows))
+        self._scroll = start
+        return matches[start : start + self.max_rows]
 
     def _handle(self, key: str) -> str | None:
         """Return a value to finish, or None to keep going."""
@@ -194,14 +211,16 @@ class Menu:
             self.cursor = max(0, self.cursor - 1)
             return None
         if key == KEY_DOWN:
-            self.cursor = min(len(matches) - 1, self.cursor + 1)
+            if matches:
+                self.cursor = min(len(matches) - 1, self.cursor + 1)
             return None
         if key == KEY_BACKSPACE:
             self.query = self.query[:-1]
             self.cursor = 0
             return None
         if key == KEY_PAGE_DOWN:
-            self.cursor = min(len(matches) - 1, self.cursor + self.max_rows)
+            if matches:
+                self.cursor = min(len(matches) - 1, self.cursor + self.max_rows)
             return None
         if key == KEY_ENTER:
             if not matches or self.cursor >= len(matches):
@@ -235,9 +254,6 @@ class Menu:
         return None
 
     # ---- rendering -------------------------------------------------------
-
-    # Class attribute: the click path reads it before any _locate has run.
-    _row_base: int | None = None
 
     def _locate(self, offset: int) -> None:
         """Measure the first option's absolute screen row so clicks map correctly."""
@@ -337,7 +353,13 @@ class Menu:
         s = self.style
         matches = self.matches
         visible = self._visible()
-        self._row_base = 2
+
+        # Fallback click mapping until a DSR cursor report measures the
+        # real row (see _locate): the first option sits one row below the
+        # header block, which is the title plus an optional filter/invite
+        # row. A hardcoded guess broke once a filter row appeared.
+        header_rows = 1 + (1 if self.allow_filter and (self.query or len(self.options) > self.max_rows) else 0)
+        self._row_base = header_rows + 1
 
         # Blood & Bone: title in bone bold, filter in ash, the selected
         # row in the single crimson accent, everything else quiet.
@@ -352,9 +374,12 @@ class Menu:
             return rows
 
         for index, option in enumerate(visible):
-            marker = "›" if index == self.cursor else " "
+            # The window scrolls, so the highlighted row is the one whose
+            # absolute match index equals the cursor, not window index 0.
+            selected = self._scroll + index == self.cursor
+            marker = "›" if selected else " "
             line = f" {marker} {option.text}"
-            if index == self.cursor:
+            if selected:
                 rows.append(s._wrap(theme.BLOOD_BOLD, line))  # selected — crimson
             elif not option.enabled:
                 rows.append(s._wrap(theme.FAINT, line))
@@ -424,7 +449,9 @@ class Menu:
             # a query, space is a character like any other.
             if self.allow_filter and self.query:
                 return char
-            self.cursor = min(len(self.matches) - 1, self.cursor + self.max_rows)
+            matches = self.matches
+            if matches:
+                self.cursor = min(len(matches) - 1, self.cursor + self.max_rows)
             return None
         if not self._input_pending():
             return char

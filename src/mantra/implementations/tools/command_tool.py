@@ -21,6 +21,7 @@ import time
 import uuid
 from typing import Any
 
+from mantra.core.approvals import _redact_sensitive
 from mantra.interfaces.sandbox import ExecResult, Sandbox
 from mantra.interfaces.tool import Tool
 
@@ -143,11 +144,6 @@ def _finish_task(
                 "duration": duration,
             })
 
-def _is_long_command(cmd: str) -> bool:
-    # Heuristic: long builds, dev servers, watch modes
-    long_markers = ["npm run", "pnpm ", "yarn ", "pytest", "cargo test", "go test", "sleep ", "watch", "dev", "serve", "build"]
-    return any(m in cmd for m in long_markers) or len(cmd) > 80
-
 class RunCommandTool(Tool):
     name = "run_command"
     description = (
@@ -198,6 +194,15 @@ class RunCommandTool(Tool):
         return self._format_result(result, command)
 
     def _execute_background(self, sandbox: Sandbox, command: str, timeout: float) -> str:
+        # Background execution spawns the process directly on the host, so
+        # it is only safe for the host-local sandbox. Any other sandbox
+        # (e.g. a container) must refuse here rather than silently escape
+        # its isolation boundary.
+        if getattr(sandbox, "root", None) is None or not hasattr(sandbox, "screen_command"):
+            return (
+                "ERROR: background execution is only supported by the host "
+                "sandbox; run this command in the foreground instead"
+            )
         task_id = _next_task_id()
         # Prefer workspace-private logs with owner-only permissions; avoid
         # world-writable shared temp directory. Fall back to a private
@@ -249,7 +254,7 @@ class RunCommandTool(Tool):
         # immediately so readers always see what the task runs.
         try:
             with open(log_path, "w", encoding="utf-8") as _lf:
-                _lf.write(f"$ {command}\n")
+                _lf.write(f"$ {_redact_sensitive(command)}\n")
             try:
                 os.chmod(log_path, 0o600)
             except OSError:
@@ -260,7 +265,7 @@ class RunCommandTool(Tool):
                 ws_root = getattr(sandbox, "root", None) or os.getcwd()
                 log_path = os.path.join(ws_root, f".mantra_{task_id}.log")
                 with open(log_path, "w", encoding="utf-8") as _lf:
-                    _lf.write(f"$ {command}\n")
+                    _lf.write(f"$ {_redact_sensitive(command)}\n")
                 try:
                     os.chmod(log_path, 0o600)
                 except OSError:
@@ -271,12 +276,13 @@ class RunCommandTool(Tool):
         def _run():
             start = time.monotonic()
             # Screen before spawning: a background task must obey the same
-            # command screening as the foreground path instead of bypassing
-            # the sandbox's only command-level defence.
+            # command screening as the foreground path. A screening failure
+            # fails closed — the task is refused, not silently spawned.
             try:
                 reason = sandbox.screen_command(command)
-            except Exception:
-                reason = None
+            except Exception as exc:
+                _finish_task(task_id, log_path, -1, note=f"command screening failed: {exc}", duration=0.0)
+                return
             if reason:
                 _finish_task(task_id, log_path, -1, note=reason, duration=0.0)
                 return
@@ -393,7 +399,9 @@ class RunCommandTool(Tool):
         # Return instantly
         time.sleep(0.05)  # brief to get pid
         with _TASKS_LOCK:
-            pid = _TASKS[task_id].get("pid", "?")
+            # The task may already have been pruned by a concurrent
+            # registration; never assume the entry still exists.
+            pid = (_TASKS.get(task_id) or {}).get("pid", "?")
         return (
             f"background task {task_id} started\n"
             f"  pid: {pid}\n"
@@ -452,7 +460,7 @@ class RunCommandTool(Tool):
                 fd, full_log_path = tempfile.mkstemp(prefix="mantra_cmd_", suffix=".log")
                 _register_full_log(full_log_path)
                 with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
-                    f.write(f"$ {command}\n")
+                    f.write(f"$ {_redact_sensitive(command)}\n")
                     f.write(stdout)
                     if stderr:
                         f.write("\n[stderr]\n" + stderr)
@@ -498,14 +506,15 @@ class ShellOutputTool(Tool):
     name = "shell_output"
     description = (
         "Read background task output from offset. "
-        "Use from_offset to get only new bytes, never re-read. "
+        "from_offset must be the next_offset value returned by a previous "
+        "call (a text-stream cursor, not a byte count) — never re-read. "
         "Wait modes: now (instant), next_write, exit."
     )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
             "task_id": {"type": "string", "description": "Background task id"},
-            "from_offset": {"type": "number", "description": "Byte offset to read from"},
+            "from_offset": {"type": "number", "description": "Cursor from a previous next_offset"},
             "wait": {"type": "string", "enum": ["now", "next_write", "exit"], "description": "Wait mode"},
             "timeout": {"type": "number", "description": "Wait timeout seconds"},
         },
@@ -649,28 +658,47 @@ class KillShellTool(Tool):
                 port_int = int(port)
             except (TypeError, ValueError):
                 return f"ERROR: invalid port {port!r}"
-            # Find pid by port (best effort via netstat/lsof)
+            # Find the pid listening on the port, parsing per platform so
+            # the first integer in the output (often part of an address)
+            # is never mistaken for the PID column.
             found = None
-            for cmd in [
-                f"lsof -ti tcp:{port_int}",
-                f"netstat -ano | findstr :{port_int}",
-                f"ss -lptn 'sport = :{port_int}'",
-            ]:
-                try:
-                    # Find the pid listening on the port, per platform.
-                    import subprocess
-                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
-                    if res.stdout.strip():
-                        # Parse first pid
-                        import re
-                        m = re.search(r"\b(\d+)\b", res.stdout)
+            my_pid = os.getpid()
+            try:
+                if os.name == "nt":
+                    res = subprocess.run(
+                        f"netstat -ano | findstr :{port_int}",
+                        shell=True, capture_output=True, text=True, timeout=5,
+                    )
+                    for line in res.stdout.splitlines():
+                        if f":{port_int}" not in line or "LISTENING" not in line.upper():
+                            continue
+                        m = re.search(r"(\d+)\s*$", line.strip())
                         if m:
                             found = int(m.group(1))
                             break
-                except Exception:
-                    continue
-            if not found:
-                return f"ERROR: no process found on port {port}"
+                else:
+                    res = subprocess.run(
+                        f"lsof -ti tcp:{port_int}",
+                        shell=True, capture_output=True, text=True, timeout=5,
+                    )
+                    for line in res.stdout.splitlines():
+                        m = re.fullmatch(r"\s*(\d+)\s*", line)
+                        if m:
+                            found = int(m.group(1))
+                            break
+                    if found is None:
+                        res = subprocess.run(
+                            f"ss -lptn 'sport = :{port_int}'",
+                            shell=True, capture_output=True, text=True, timeout=5,
+                        )
+                        m = re.search(r"pid=(\d+)", res.stdout)
+                        if m:
+                            found = int(m.group(1))
+            except Exception:
+                found = None
+            # Never signal pid 0/1 (process groups, init) or ourselves.
+            if found is None or found <= 1 or found == my_pid:
+                return f"ERROR: no killable process found on port {port_int}"
             try:
                 import signal
                 os.kill(found, signal.SIGTERM)

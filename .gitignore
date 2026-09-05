@@ -4,13 +4,14 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .mypy_cache/
-.pytest_cache/
 .hypothesis/
 
 # Runtime state
 logs/
-workspace/.mantra/
-workspace/__pycache__/
+workspace/
+
+# Build metadata
+*.egg-info/
 
 # Virtual environments
 .venv/

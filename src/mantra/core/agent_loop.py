@@ -141,11 +141,10 @@ class AgentLoop:
                         # Surface the tool name, not the raw JSON decode
                         # error - the operator needs the cause (budget),
                         # not the truncated fragment.
-                        tool = ""
-                        try:
-                            tool = message.split("mid-tool-call (", 1)[1].split(")", 1)[0]
-                        except Exception:
-                            tool = ""
+                        import re as _re
+
+                        m = _re.search(r"mid-tool-call \(([^)]*)\):", message)
+                        tool = m.group(1) if m else ""
                         raise LLMError(
                             "the model response was cut off mid-tool-call"
                             + (f" ({tool})" if tool else "")
@@ -193,8 +192,7 @@ class AgentLoop:
                         final_message = "mantra error: model returned empty final"
                         break
                     stopped_reason = "final"
-                    # Normalize final_message to string for downstream consumers
-                    final_message = content_str if isinstance(raw, str) else (str(raw) if raw is not None else "")
+                    final_message = content_str
                     content = content_str
                     context.append({"role": "assistant", "content": content})
                     break
@@ -284,6 +282,10 @@ class AgentLoop:
                                 f"{call.name}|{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
                             )
                         cnt = recent_calls.get(key, 0) + 1
+                        # Re-insert so the key just counted moves to the end
+                        # of the eviction order and can never be evicted by
+                        # its own increment.
+                        recent_calls.pop(key, None)
                         recent_calls[key] = cnt
                         # Bound registry to prevent unbounded growth
                         if len(recent_calls) > 500:
@@ -443,10 +445,17 @@ class AgentLoop:
                     "tool_repaired",
                     {"task_id": task_id, "step": step, "tool": call.name, "notes": notes, "issues": issues},
                 )
-                self.logger.log("tool_input_repaired", {"tool": call.name, "notes": notes})
+                # Log best-effort, never break run() — same contract as _emit.
+                try:
+                    self.logger.log("tool_input_repaired", {"tool": call.name, "notes": notes})
+                except Exception:
+                    pass
             else:
                 # Repair failed or no change — return model-readable retry
-                self.logger.log("tool_input_invalid", {"tool": call.name, "issues": issues})
+                try:
+                    self.logger.log("tool_input_invalid", {"tool": call.name, "issues": issues})
+                except Exception:
+                    pass
                 return (
                     f"ERROR: invalid arguments for '{call.name}': {'; '.join(issues)}. "
                     f"Expected {schema.get('properties', {}) if schema else 'valid args'}. "
@@ -508,15 +517,17 @@ class AgentLoop:
         pinned first message is replaced in place instead of ignored.
         """
         rendered = self._render_task(task)
+        # Check budget on both branches: a fresh seed bypasses append-time
+        # truncation (seeded history is below the eviction floor), so an
+        # oversized task would otherwise be sent to the model in full.
+        if len(rendered) > context.max_chars:
+            rendered = rendered[: max(1000, int(context.max_chars * 0.8))] + "\n... [truncated — task too large]"
         if not context.messages:
             context.seed(self.system_prompt, rendered)
         else:
             if context.messages[0].get("role") == "system":
                 context.messages[0] = {"role": "system", "content": self.system_prompt}
                 context.resync()
-            # Check budget before append to avoid immediate truncation
-            if len(rendered) > context.max_chars:
-                rendered = rendered[: max(1000, int(context.max_chars * 0.8))] + "\n... [truncated — task too large]"
             context.append({"role": "user", "content": rendered})
 
     def _absorb_usage(self, response, metrics: dict[str, float]) -> None:

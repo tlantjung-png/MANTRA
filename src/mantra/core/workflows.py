@@ -96,7 +96,6 @@ def _break_stale(lock_path: Path) -> bool:
         return True
     except OSError:
         return False
-    return False
 
 
 def _save_all(data: dict[str, Any]) -> bool:
@@ -144,6 +143,15 @@ def _save_all(data: dict[str, Any]) -> bool:
         try:
             with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
+        except OSError:
+            # fdopen itself failed: the raw descriptor must be closed or
+            # it leaks.
+            try:
+                os.close(fd_tmp)
+            except OSError:
+                pass
+            raise
+        try:
             try:
                 os.chmod(tmp_name, 0o600)
             except OSError:

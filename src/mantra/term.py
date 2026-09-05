@@ -14,9 +14,15 @@ _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]|\033][^\x07\x1b]*(?:\x07|\x1b\
 
 
 def _char_width(ch: str) -> int:
-    """Width of one char; CJK/emoji count as 2."""
+    """Width of one char; CJK/emoji count as 2, zero-width chars as 0."""
     import unicodedata
 
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        # Nonspacing/enclosing marks and format characters (ZWJ,
+        # variation selectors) occupy no columns.
+        return 0
     eaw = unicodedata.east_asian_width(ch)
     if eaw in ("W", "F"):
         return 2
@@ -131,6 +137,7 @@ def raw_mode():
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
+@contextmanager
 def cbreak_mode():
     """Per-character input without echo; SIGINT still delivered. No-op on Windows.
 

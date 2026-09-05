@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import http.client
 import ipaddress
 import re
 import socket
@@ -12,7 +13,14 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen as stdlib_urlopen
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    Request,
+    build_opener,
+    urlopen as stdlib_urlopen,
+)
 
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
@@ -393,13 +401,137 @@ def _check_url_allowed(url: str) -> str | None:
 urlopen = stdlib_urlopen
 
 
+def _resolve_and_pin(hostname: str) -> str | None:
+    """Resolve ``hostname`` once and return an address safe to dial.
+
+    The single resolution is both the check and the connection target:
+    validating one answer and then dialing a second, independent
+    resolution is the classic DNS-rebinding window, so the address that
+    was validated is the address the transport must use.
+
+    Returns the pinned address, or None when the host resolves to
+    anything private (or does not resolve) — the caller must block.
+    """
+    host = (hostname or "").strip().strip("[]").rstrip(".")
+    if not host:
+        return None
+    infos: list[tuple[Any, ...]] = []
+
+    def _resolve():
+        return socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_resolve)
+            try:
+                infos = fut.result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                return None
+    except Exception:
+        return None
+    if not infos:
+        return None
+    pinned: str | None = None
+    for family, _, _, _, sockaddr in infos:
+        addr = sockaddr[0].split("%")[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return None
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return None
+        if pinned is None:
+            pinned = addr
+    return pinned
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection that dials a pre-validated address.
+
+    The Host header, TLS SNI and certificate verification all continue to
+    use the original hostname; only the socket's destination is pinned.
+    """
+
+    def __init__(self, *args: Any, pinned_ip: str | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:  # type: ignore[override]
+        if self._pinned_ip:
+            self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        else:
+            super().connect()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args: Any, pinned_ip: str | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:  # type: ignore[override]
+        if not self._pinned_ip:
+            super().connect()
+            return
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        # SNI and certificate verification stay bound to the hostname the
+        # user asked for, not the pinned address.
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinningHandler(HTTPRedirectHandler, HTTPHandler, HTTPSHandler):
+    """Open requests against an address validated in the same breath.
+
+    Subclassing the default HTTP/HTTPS/redirect handlers makes the opener
+    builder skip all three stdlib defaults, so every connection goes
+    through the pinned path. Resolves the request host once, refuses any
+    private answer, and pins the connection to the validated address —
+    closing the check-then-connect rebinding gap that two independent
+    resolutions would leave open. Redirects are re-validated by the
+    parent class and re-pinned here because each hop becomes a new
+    request.
+    """
+
+    _BLOCKED_MSG = "blocked: host {host!r} did not resolve to a public address"
+
+    def _pinned_for(self, req: Any) -> str | None:
+        hostname = urllib.parse.urlsplit(req.full_url).hostname or ""
+        return _resolve_and_pin(hostname)
+
+    def http_open(self, req: Any) -> Any:
+        pinned = self._pinned_for(req)
+        if pinned is None:
+            return self._blocked(req)
+        return self.do_open(_partial(_PinnedHTTPConnection, pinned_ip=pinned), req)
+
+    def https_open(self, req: Any) -> Any:
+        pinned = self._pinned_for(req)
+        if pinned is None:
+            return self._blocked(req)
+        return self.do_open(_partial(_PinnedHTTPSConnection, pinned_ip=pinned), req)
+
+    def _blocked(self, req: Any) -> HTTPError:
+        host = urllib.parse.urlsplit(req.full_url).hostname
+        return HTTPError(req.full_url, 403, self._BLOCKED_MSG.format(host=host), None, None)
+
+
+def _partial(cls: Any, **kwargs: Any) -> Any:
+    """Bind keyword constructor args, tolerating do_open's call shape.
+
+    ``do_open`` invokes ``cls(host, timeout=req.timeout, **extra)``, which
+    is exactly a partial application of ``pinned_ip``.
+    """
+    import functools
+
+    return functools.partial(cls, **kwargs)
+
+
 def _make_opener() -> object:
-    """Create an opener with safe redirect handling.
+    """Create an opener with safe redirects and pinned DNS.
 
     Separated for testability: tests can mock this function to return
     a custom opener that simulates responses without network access.
     """
-    return build_opener(_SafeRedirectHandler())
+    return build_opener(_PinningHandler())
 
 
 class _SafeRedirectHandler(HTTPRedirectHandler):

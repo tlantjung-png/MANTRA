@@ -309,9 +309,10 @@ def validate_arguments(arguments: dict[str, Any], schema: dict[str, Any] | None)
         ptype = spec.get("type")
         if ptype == "string" and not isinstance(v, str):
             issues.append(f"field '{k}' expected string got {type(v).__name__}")
-        elif ptype == "number" and not isinstance(v, (int, float)):
+        elif ptype == "number" and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            # bool is a subclass of int: True/False must not pass as numbers.
             issues.append(f"field '{k}' expected number got {type(v).__name__}")
-        elif ptype == "integer" and not isinstance(v, int):
+        elif ptype == "integer" and (isinstance(v, bool) or not isinstance(v, int)):
             issues.append(f"field '{k}' expected integer got {type(v).__name__}")
         elif ptype == "array" and not isinstance(v, list):
             issues.append(f"field '{k}' expected array got {type(v).__name__}")
