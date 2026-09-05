@@ -221,8 +221,9 @@ class DockerSandbox(Sandbox):
         dir_check = self._exec_no_shell(["test", "-d", resolved])
         if dir_check.exit_code == 0:
             raise SandboxError(f"write_file destination is a directory: {path}")
-        if len(content) > _MAX_READ_BYTES * 2:
-            raise SandboxError(f"content too large ({len(content)} bytes)")
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > _MAX_READ_BYTES * 2:
+            raise SandboxError(f"content too large ({content_bytes} bytes)")
         # Stage the content in a host temp file (owner-only) and copy it
         # in, avoiding shell-quoting issues with arbitrary content.
         with tempfile.NamedTemporaryFile(

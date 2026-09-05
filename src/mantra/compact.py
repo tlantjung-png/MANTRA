@@ -892,15 +892,21 @@ class CompactLayout:
             height = self._height_locked()
             top_pad = max(0, (height - len(card)) // 2)
 
-            self.raw = []
-            self.lines = [""] * top_pad
+            # Record the card as logical lines (self.raw), not just display
+            # rows: a resize re-wraps from self.raw, so splash content that
+            # only lived in self.lines used to collapse to blank rows the
+            # moment the terminal changed size.
+            centered = [
+                " " * max(0, (self._cols - _vis(line)) // 2) + line
+                for line in card
+            ]
+            self.raw = [""] * top_pad + centered
+            self.lines = []
+            for raw_line in self.raw:
+                self.lines.extend(_wrap_ansi(raw_line, self._cols))
             self.partial = ""
             self.offset = 0
             self._last_visible = None
-
-            for line in card:
-                pad = max(0, (self._cols - _vis(line)) // 2)
-                self.lines.append(" " * pad + line)
 
             self._splash_visible = True
             self._render_content_locked()

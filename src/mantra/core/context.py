@@ -153,6 +153,14 @@ class ContextManager:
             # If truncation didn't help, drop another turn
             if not self._drop_oldest_turn():
                 break
+        # The halving loop is capped, so a pathological history — many
+        # mid-size messages, or oversized tool-call payloads the content
+        # branch cannot shrink — could still be over budget here. Guarantee
+        # the budget with unconditional oldest-turn eviction; the pinned
+        # system+one-exchange floor is the only stopping point.
+        while self._over_budget() and len(self.messages) > 2:
+            if not self._drop_oldest_turn():
+                break
 
     def _over_budget(self) -> bool:
         return len(self.messages) > self.max_messages or self._chars > self.max_chars

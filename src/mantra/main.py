@@ -98,7 +98,8 @@ def main(argv: list[str] | None = None) -> int:
 
     approval_mode = config.get("approvals", "default")
     print(f"[approvals] headless policy: {approval_mode} "
-          "(plan refuses mutations; default/auto refuse destructive commands; yolo allows all)")
+          "(plan refuses mutations; default/auto refuse destructive commands "
+          "and interpreter one-liners; yolo allows all)")
     loop = AgentLoop(
         llm=llm,
         sandbox=sandbox,

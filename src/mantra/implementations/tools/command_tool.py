@@ -86,7 +86,10 @@ def _prune_tasks_locked() -> None:
                 os.remove(lp)
         except Exception:
             pass
-    # If still over capacity, remove oldest completed first, then oldest overall
+    # If still over capacity, remove oldest completed first. A registry
+    # full of running tasks is left over capacity: evicting a live entry
+    # would orphan its process — unfindable by kill_shell, unreadable by
+    # shell_output — which is worse than a temporarily larger registry.
     while len(_TASKS) > _MAX_TASKS:
         # Prefer to evict oldest completed task
         oldest_completed = None
@@ -99,8 +102,7 @@ def _prune_tasks_locked() -> None:
                     oldest_completed = tid
         victim = oldest_completed
         if victim is None:
-            # No completed tasks — evict oldest overall
-            victim = min(_TASKS.items(), key=lambda kv: kv[1].get("start_time", float("inf")))[0]
+            break
         info = _TASKS.pop(victim, None)
         try:
             lp = info.get("log_path") if info else None
@@ -260,10 +262,11 @@ class RunCommandTool(Tool):
             except OSError:
                 pass
         except Exception:
-            # Last resort: workspace fallback
+            # Last resort: a unique file in the system temp directory. The
+            # workspace is never polluted with stray logs — the operator
+            # would see the file in every listing and change report.
+            log_path = os.path.join(tempfile.gettempdir(), f"mantra_{task_id}.log")
             try:
-                ws_root = getattr(sandbox, "root", None) or os.getcwd()
-                log_path = os.path.join(ws_root, f".mantra_{task_id}.log")
                 with open(log_path, "w", encoding="utf-8") as _lf:
                     _lf.write(f"$ {_redact_sensitive(command)}\n")
                 try:
@@ -271,7 +274,7 @@ class RunCommandTool(Tool):
                 except OSError:
                     pass
             except Exception:
-                log_path = os.path.join(tempfile.gettempdir(), f"mantra_{task_id}.log")
+                pass
 
         def _run():
             start = time.monotonic()
@@ -507,7 +510,7 @@ class ShellOutputTool(Tool):
     description = (
         "Read background task output from offset. "
         "from_offset must be the next_offset value returned by a previous "
-        "call (a text-stream cursor, not a byte count) — never re-read. "
+        "call (a byte offset into the task log) — never re-read. "
         "Wait modes: now (instant), next_write, exit."
     )
     parameters: dict[str, Any] = {
@@ -556,12 +559,7 @@ class ShellOutputTool(Tool):
                     break
                 time.sleep(0.1)
         elif wait == "next_write":
-            # Poll for new bytes
-            initial_size = 0
-            try:
-                initial_size = os.path.getsize(log_path)
-            except Exception:
-                initial_size = from_offset
+            # Poll for new bytes past the cursor (both sides are byte counts).
             deadline = time.monotonic() + timeout_f
             while time.monotonic() < deadline:
                 try:
@@ -575,11 +573,18 @@ class ShellOutputTool(Tool):
                     pass
                 time.sleep(0.1)
 
+        # The cursor is a byte offset, in the same unit the next_write wait
+        # compares against (os.path.getsize). Reading in binary keeps the
+        # two in one unit; a text-mode stream's tell() cookie is an opaque
+        # number that drifts away from the byte size as soon as multi-byte
+        # characters enter the log, which used to make the wait spin past
+        # its timeout while output sat unread.
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(log_path, "rb") as f:
                 f.seek(from_offset)
-                data = f.read(50000)  # cap per read
-                next_offset = f.tell()
+                raw = f.read(50000)  # cap per read, in bytes
+                next_offset = from_offset + len(raw)
+            data = raw.decode("utf-8", errors="replace")
         except OSError as exc:
             return f"ERROR: cannot read log: {exc}"
 
@@ -607,6 +612,15 @@ class KillShellTool(Tool):
     }
 
     def execute(self, sandbox: Sandbox, task_id: str = "", pid: Any = None, port: Any = None) -> str:  # type: ignore[override]
+        # Direct pid/port signalling reaches the host operating system, so
+        # it must never fire from inside a container sandbox — the tool
+        # would be an isolation escape exactly like an unguarded background
+        # exec. Only the host sandbox may use those forms; task_id killing
+        # is registry-local and safe everywhere.
+        host_sandbox = (
+            hasattr(sandbox, "screen_command")
+            and getattr(sandbox, "root", None) is not None
+        )
         # Try task_id first
         if task_id:
             with _TASKS_LOCK:
@@ -627,10 +641,28 @@ class KillShellTool(Tool):
 
         # Try pid
         if pid is not None:
+            if not host_sandbox:
+                return (
+                    "ERROR: killing by pid is only supported by the host "
+                    "sandbox; use task_id for background tasks"
+                )
             try:
                 pid_int = int(pid)
             except (TypeError, ValueError):
                 return f"ERROR: invalid pid {pid!r}"
+            if pid_int <= 1 or pid_int == os.getpid():
+                return f"ERROR: refusing to kill pid {pid_int}"
+            # Restrict direct pid targeting to processes this harness
+            # spawned: the registry is the allowlist.
+            with _TASKS_LOCK:
+                known = {
+                    info.get("pid") for info in _TASKS.values() if info.get("pid")
+                }
+            if pid_int not in known:
+                return (
+                    f"ERROR: pid {pid_int} was not started by a background "
+                    "task of this session; kill by task_id or port instead"
+                )
             try:
                 import signal
                 os.kill(pid_int, signal.SIGTERM)
@@ -654,6 +686,11 @@ class KillShellTool(Tool):
 
         # Try port
         if port is not None:
+            if not host_sandbox:
+                return (
+                    "ERROR: killing by port is only supported by the host "
+                    "sandbox; use task_id for background tasks"
+                )
             try:
                 port_int = int(port)
             except (TypeError, ValueError):

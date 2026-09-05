@@ -253,8 +253,11 @@ class LocalSandbox(Sandbox):
         return data.decode("utf-8", errors="replace")
 
     def write_file(self, path: str, content: str) -> None:
-        if len(content) > _MAX_READ_BYTES * 2:
-            raise SandboxError(f"content too large ({len(content)} bytes)")
+        # Cap the encoded byte size: the limit is about the file that
+        # lands on disk, and character counts understate multi-byte
+        # content.
+        if len(content.encode("utf-8")) > _MAX_READ_BYTES * 2:
+            raise SandboxError(f"content too large ({len(content.encode('utf-8'))} bytes)")
         full = self._resolve(path)
         parent = os.path.dirname(full)
         if parent:

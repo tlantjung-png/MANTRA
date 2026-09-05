@@ -7,12 +7,13 @@ import http.client
 import ipaddress
 import re
 import socket
+import threading
 import urllib.parse
 import zlib
 from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from urllib.request import (
     HTTPHandler,
     HTTPRedirectHandler,
@@ -49,6 +50,7 @@ _TEXTUAL = ("text/", "application/json", "application/xml", "application/javascr
 
 # Cache DNS results to avoid repeated 2s stalls.
 _DNS_CACHE: dict[str, tuple[float, bool]] = {}
+_DNS_LOCK = threading.Lock()
 _DNS_TTL = 300.0
 
 
@@ -317,9 +319,12 @@ def _is_private_hostname(hostname: str | None) -> bool:
         if re.match(r"^[a-z0-9.-]+$", host):
             import time as _time
             now = _time.monotonic()
-            cached = _DNS_CACHE.get(host)
-            if cached and now - cached[0] < _DNS_TTL:
-                return cached[1]
+            # The cache is consulted from resolver threads and the fetch
+            # thread alike, so every touch is guarded.
+            with _DNS_LOCK:
+                cached = _DNS_CACHE.get(host)
+                if cached and now - cached[0] < _DNS_TTL:
+                    return cached[1]
             result = False
             def _resolve():
                 return socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
@@ -348,10 +353,11 @@ def _is_private_hostname(hostname: str | None) -> bool:
                         continue
                 # Bound the cache: an attacker supplying many unique
                 # hostnames must not grow it without limit.
-                if len(_DNS_CACHE) >= 1024:
-                    for stale_host in list(_DNS_CACHE.keys())[:256]:
-                        _DNS_CACHE.pop(stale_host, None)
-                _DNS_CACHE[host] = (now, result)
+                with _DNS_LOCK:
+                    if len(_DNS_CACHE) >= 1024:
+                        for stale_host in list(_DNS_CACHE.keys())[:256]:
+                            _DNS_CACHE.pop(stale_host, None)
+                    _DNS_CACHE[host] = (now, result)
                 if result:
                     return True
     except Exception:
@@ -532,28 +538,6 @@ def _make_opener() -> object:
     a custom opener that simulates responses without network access.
     """
     return build_opener(_PinningHandler())
-
-
-class _SafeRedirectHandler(HTTPRedirectHandler):
-    """Redirect handler that validates each redirect target before following."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # newurl may be relative; resolve against original request url
-        if newurl:
-            parsed = urlparse(newurl)
-            if not parsed.scheme:
-                newurl = urljoin(req.full_url, newurl)
-        # Validate scheme
-        try:
-            parsed = urlparse(newurl)
-        except ValueError:
-            raise HTTPError(newurl, code, f"blocked redirect to malformed URL {newurl!r}", headers, fp)
-        if parsed.scheme.lower() not in ("http", "https"):
-            raise HTTPError(newurl, code, f"blocked redirect to unsupported scheme {parsed.scheme!r}", headers, fp)
-        blocked = _check_url_allowed(newurl)
-        if blocked:
-            raise HTTPError(newurl, code, blocked, headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 try:

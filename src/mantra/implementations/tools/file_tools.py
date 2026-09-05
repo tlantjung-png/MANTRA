@@ -203,6 +203,17 @@ class ReadFileTool(Tool):
         # Handle bulk via glob or comma list (merged read_file)
         # If path contains glob chars, expand — guard traversal in pattern
         if any(c in path for c in ["*", "?", "[", "**"]):
+            # A genuine file whose name happens to contain a metacharacter
+            # ("foo[1].txt") must win over pattern reading: check for the
+            # literal file first and fall through to the glob only when no
+            # such file exists.
+            root_ = getattr(sandbox, "root", None)
+            if root_ is not None:
+                try:
+                    if os.path.isfile(os.path.join(root_, path)):
+                        return self._execute_single(sandbox, path, offset, limit)
+                except OSError:
+                    pass
             # Block patterns that could escape workspace (e.g. ../../etc/passwd)
             if ".." in path.replace("\\", "/").split("/") or path.startswith("/") or ":\\" in path:
                 return f"ERROR: refusing to read pattern {path!r}: traversal blocked"
@@ -573,6 +584,16 @@ class EditFileTool(Tool):
             return "ERROR: edit ledger not configured"
         if old_string not in content:
             return f"ERROR: old_string not found in {path}"
+        occurrences = content.count(old_string)
+        if occurrences > 1:
+            # An ambiguous needle silently edits whichever occurrence comes
+            # first — usually not the one the model meant. Refuse instead
+            # and make the model narrow the needle.
+            return (
+                f"ERROR: old_string occurs {occurrences} times in {path} - "
+                "refusing an ambiguous edit. Extend old_string with "
+                "surrounding lines until it matches exactly once, then retry."
+            )
         new_content = content.replace(old_string, new_string, 1)
         if len(new_content) > _MAX_WRITE_CHARS:
             return f"ERROR: result too large ({len(new_content)} > {_MAX_WRITE_CHARS})"

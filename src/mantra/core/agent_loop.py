@@ -204,6 +204,14 @@ class AgentLoop:
                     orig = getattr(c, "id", "") or ""
                     cid = orig
                     counter = 0
+                    if not cid:
+                        # Some gateways omit call ids entirely. An empty id
+                        # must never reach the API: providers that require a
+                        # non-empty tool_call id reject the whole request.
+                        # Synthesize a stable placeholder instead.
+                        while not cid or cid in seen_ids:
+                            cid = f"call_{counter}"
+                            counter += 1
                     while cid in seen_ids:
                         counter += 1
                         cid = f"{orig}_{counter}" if orig else f"call_{counter}"
@@ -249,89 +257,31 @@ class AgentLoop:
                                 }
                             )
                         break
-                    # Intent-normalized loop breaker. The key is the tool
-                    # plus a canonical form of its arguments, so a windowed
-                    # re-read (different offset/limit) is never mistaken
-                    # for a repeat; a successful write/edit clears the
-                    # read counters for that path so a verification
-                    # re-read after a change is allowed.
-                    import hashlib
-
-                    written_path = ""
+                    # Every call in the batch must end up with a tool message,
+                    # whatever happens inside the tool. An abort raised from
+                    # within a tool (the sandbox checks the abort signal
+                    # mid-execution) used to escape the loop before the
+                    # synthetic fill ran, leaving the just-appended assistant
+                    # tool_calls without answering tool messages — and the
+                    # next model request rejected by the provider until the
+                    # conversation was cleared. The fill below runs first,
+                    # then the abort propagates via the stopped_reason.
                     try:
-                        args = call.arguments if isinstance(call.arguments, dict) else {}
-                        if call.name == "run_command":
-                            key = f"run_command|{str(args.get('command', '')).strip()}"
-                        elif call.name in ("read_file", "list_dir"):
-                            rest = {k: v for k, v in args.items() if k != "path"}
-                            rest_json = json.dumps(rest, sort_keys=True, ensure_ascii=False, default=str)
-                            key = (
-                                f"{call.name}|{args.get('path', '')}|"
-                                f"{hashlib.sha256(rest_json.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                        self._process_tool_call(
+                            task_id, steps, call, cid, context, metrics, recent_calls
+                        )
+                    except AbortError:
+                        for rem_call, rem_cid in dedup_calls[idx:]:
+                            context.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": rem_cid,
+                                    "name": rem_call.name,
+                                    "content": "ERROR: interrupted by operator",
+                                }
                             )
-                        elif call.name in ("write_file", "edit_file"):
-                            payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
-                            key = (
-                                f"{call.name}|{args.get('path', '')}|"
-                                f"{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
-                            )
-                            written_path = str(args.get("path", ""))
-                        else:
-                            payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
-                            key = f"{call.name}|{payload}" if len(payload) < 300 else (
-                                f"{call.name}|{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
-                            )
-                        cnt = recent_calls.get(key, 0) + 1
-                        # Re-insert so the key just counted moves to the end
-                        # of the eviction order and can never be evicted by
-                        # its own increment.
-                        recent_calls.pop(key, None)
-                        recent_calls[key] = cnt
-                        # Bound registry to prevent unbounded growth
-                        if len(recent_calls) > 500:
-                            # Remove oldest 100 entries (dict preserves insertion order)
-                            oldest_keys = list(recent_calls.keys())[:100]
-                            for _k in oldest_keys:
-                                recent_calls.pop(_k, None)
-                    except Exception:
-                        try:
-                            key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)}"
-                        except Exception:
-                            key = f"{call.name}:{call.arguments}"
-                        cnt = recent_calls.get(key, 0) + 1
-                        recent_calls[key] = cnt
-                    if cnt >= 3:
-                        observation = f"STOP RETRYING: you already called {call.name} with the same arguments {cnt} times. Use the previous result. If you need a different result, change the arguments (a different path, offset, or command)."
-                        metrics["tool_errors"] += 1
-                    elif cnt == 2:
-                        observation = f"ERROR: you already called {call.name} {call.arguments} — result is already in history above. Do not repeat. Use it or try a different file (e.g. README.md, pyproject.toml)."
-                        metrics["tool_errors"] += 1
-                    else:
-                        observation = self._dispatch_tool(task_id, steps, call, metrics)
-                        if (
-                            written_path
-                            and isinstance(observation, str)
-                            and observation.startswith("OK")
-                        ):
-                            # A successful write/edit invalidates earlier
-                            # reads of that path: allow re-reading it.
-                            norm = written_path.replace("\\", "/")
-                            for done_key in [
-                                k for k in recent_calls
-                                if k.startswith(f"read_file|{written_path}|")
-                                or k.startswith(f"read_file|{norm}|")
-                                or k.startswith(f"list_dir|{written_path}|")
-                                or k.startswith(f"list_dir|{norm}|")
-                            ]:
-                                recent_calls.pop(done_key, None)
-                    context.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": cid,
-                            "name": call.name,
-                            "content": observation,
-                        }
-                    )
+                        stopped_reason = "aborted"
+                        break
                 if stopped_reason == "aborted":
                     break
             else:
@@ -392,6 +342,100 @@ class AgentLoop:
         except Exception:
             pass
         return result
+
+    def _process_tool_call(
+        self,
+        task_id: str,
+        step: int,
+        call,
+        cid: str,
+        context: ContextManager,
+        metrics: dict[str, float],
+        recent_calls: dict[str, int],
+    ) -> None:
+        """Run the loop breaker, dispatch one tool call, append its result.
+
+        The key is the tool plus a canonical form of its arguments, so a
+        windowed re-read (different offset/limit) is never mistaken for a
+        repeat; a successful write/edit clears the read counters for that
+        path and the run-command counters, so the natural verify step —
+        re-running the same test command after a change — executes again
+        while true no-op repetition stays blocked.
+        """
+        import hashlib
+
+        written_path = ""
+        try:
+            args = call.arguments if isinstance(call.arguments, dict) else {}
+            if call.name == "run_command":
+                key = f"run_command|{str(args.get('command', '')).strip()}"
+            elif call.name in ("read_file", "list_dir"):
+                rest = {k: v for k, v in args.items() if k != "path"}
+                rest_json = json.dumps(rest, sort_keys=True, ensure_ascii=False, default=str)
+                key = (
+                    f"{call.name}|{args.get('path', '')}|"
+                    f"{hashlib.sha256(rest_json.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                )
+            elif call.name in ("write_file", "edit_file"):
+                payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+                key = (
+                    f"{call.name}|{args.get('path', '')}|"
+                    f"{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                )
+                written_path = str(args.get("path", ""))
+            else:
+                payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+                key = f"{call.name}|{payload}" if len(payload) < 300 else (
+                    f"{call.name}|{hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+                )
+            cnt = recent_calls.get(key, 0) + 1
+            # Re-insert so the key just counted moves to the end
+            # of the eviction order and can never be evicted by
+            # its own increment.
+            recent_calls.pop(key, None)
+            recent_calls[key] = cnt
+            # Bound registry to prevent unbounded growth
+            if len(recent_calls) > 500:
+                # Remove oldest 100 entries (dict preserves insertion order)
+                oldest_keys = list(recent_calls.keys())[:100]
+                for _k in oldest_keys:
+                    recent_calls.pop(_k, None)
+        except Exception:
+            try:
+                key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)}"
+            except Exception:
+                key = f"{call.name}:{call.arguments}"
+            cnt = recent_calls.get(key, 0) + 1
+            recent_calls[key] = cnt
+        if cnt >= 3:
+            observation = f"STOP RETRYING: you already called {call.name} with the same arguments {cnt} times. Use the previous result. If you need a different result, change the arguments (a different path, offset, or command)."
+            metrics["tool_errors"] += 1
+        elif cnt == 2:
+            observation = f"ERROR: you already called {call.name} {call.arguments} — result is already in history above. Do not repeat. Use it or try a different file (e.g. README.md, pyproject.toml)."
+            metrics["tool_errors"] += 1
+        else:
+            observation = self._dispatch_tool(task_id, step, call, metrics)
+            if (
+                written_path
+                and isinstance(observation, str)
+                and observation.startswith("OK")
+            ):
+                # A successful write/edit invalidates every earlier counter:
+                # the workspace state the previous results describe no longer
+                # exists, so a repeated read of the path or a re-run of the
+                # same verification command must execute again. Only this
+                # write's own counter survives.
+                for done_key in list(recent_calls.keys()):
+                    if done_key != key:
+                        recent_calls.pop(done_key, None)
+        context.append(
+            {
+                "role": "tool",
+                "tool_call_id": cid,
+                "name": call.name,
+                "content": observation,
+            }
+        )
 
     def _dispatch_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]

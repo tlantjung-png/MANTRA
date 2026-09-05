@@ -295,6 +295,37 @@ def _has_redirect(segment: str) -> bool:
     return False
 
 
+# Interpreters that can execute code passed inline. A payload handed to
+# one of these can do anything a destructive shell command can, spelled in
+# a way the destructive patterns never see, so the invocation is gated
+# behind explicit confirmation in every interactive mode rather than
+# riding through as an ordinary mutation.
+_INTERPRETER_TOKENS = frozenset(
+    {
+        "python", "python3", "pypy", "pypy3",
+        "node", "deno", "bun", "perl", "ruby", "php", "lua", "jshell",
+        "powershell", "pwsh",
+    }
+)
+
+# Flags that mean "run the next argument as code".
+_INLINE_CODE_FLAGS = frozenset(
+    {"-c", "-e", "-r", "--eval", "-enc", "-encodedcommand", "-command", "-ie"}
+)
+
+
+def _is_interpreter_oneliner(tokens: list[str]) -> bool:
+    """Interpreter invoked with its code inline."""
+    if not tokens:
+        return False
+    head = tokens[0].lower().replace("\\", "/").split("/")[-1]
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head not in _INTERPRETER_TOKENS:
+        return False
+    return any(tok.lower() in _INLINE_CODE_FLAGS for tok in tokens[1:])
+
+
 def _classify_segment(segment: str) -> str:
     """Classify one command segment; safe only if the whole segment is read-only."""
     segment = segment.strip()
@@ -318,6 +349,10 @@ def _classify_segment(segment: str) -> str:
                 return "destructive"
             if any(f in rest for f in ("-exec", "-execdir", "-ok", "-okdir")):
                 return "mutating"
+    # Interpreter one-liners: the payload is invisible to every pattern
+    # above, so the invocation needs a human yes/no regardless of mode.
+    if _is_interpreter_oneliner(tokens):
+        return "confirm"
     # echo never executes its arguments, unless an expansion inside them
     # could; the expansion check below handles that case.
     if tokens[0] == "echo" and not re.search(r"(\$\(|\$\{|`)", segment):
@@ -380,14 +415,16 @@ def classify_command(command: str) -> str:
         else:
             return "destructive"
     # Split compounds and classify every segment; the worst verdict wins.
+    # Severity ladder: destructive > confirm > mutating > safe.
     try:
         worst = "safe"
+        rank = {"safe": 0, "mutating": 1, "confirm": 2, "destructive": 3}
         for seg in _split_command(command):
             risk = _classify_segment(seg)
             if risk == "destructive":
                 return "destructive"
-            if risk == "mutating":
-                worst = "mutating"
+            if rank.get(risk, 1) > rank.get(worst, 0):
+                worst = risk
         return worst
     except Exception:
         return "mutating"
@@ -472,6 +509,11 @@ class ApprovalPolicy:
         if self.mode == "yolo":
             return True
 
+        # "confirm" risk (interpreter one-liners and anything else whose
+        # payload the pattern screen cannot see) never rides through on
+        # the auto-mode mutating allowance: it always reaches the prompt
+        # here, and a session-level "always" for the exact command is the
+        # only way to stop being asked.
         if self.mode == "auto" and risk == "mutating":
             return True
 

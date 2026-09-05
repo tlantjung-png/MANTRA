@@ -24,7 +24,7 @@ from mantra.core.agent_loop import DEFAULT_SYSTEM_PROMPT, AgentLoop, RunResult
 from mantra.core.approvals import MODES, ApprovalPolicy
 from mantra.core.context import ContextManager
 from mantra.core.events import EventBus
-from mantra.core.exceptions import AbortError, HarnessError
+from mantra.core.exceptions import AbortError, ConfigError, HarnessError
 from mantra.core.keys import has_stored, mask, store as store_key, stored_keys
 from mantra.core.menu import Option, choose, raw_mode
 from mantra.core.models import fetch_models, is_reasoning_model
@@ -570,6 +570,18 @@ def _short(count: int) -> str:
     if count < 10_000:
         return f"{count / 1000:.1f}k"
     return f"{round(count / 1000)}k"
+
+
+def _safe_int(value: Any) -> int:
+    """Total from a session file as an int; corrupt values read as zero.
+
+    Session files are hand-editable JSON, so one non-numeric total must
+    cost that counter, not the whole restore command.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -2488,7 +2500,10 @@ class ConsoleSession:
                         except Exception:
                             pass
             elif result is not None and result.final_message:
-                body = render_markdown(result.final_message, self.style)
+                # Same sanitization contract as the streaming path: model
+                # text must never drive the terminal, whether it arrives
+                # one fragment at a time or all at once.
+                body = render_markdown(_sanitize_output(result.final_message), self.style)
                 if self.frame is not None:
                     self.frame.row(body)
                 else:
@@ -2788,7 +2803,7 @@ class ConsoleSession:
         self.context.enforce_budget()
         totals = payload.get("totals")
         if isinstance(totals, dict):
-            self.totals.update({k: int(v) for k, v in totals.items() if k in self.totals})
+            self.totals.update({k: _safe_int(v) for k, v in totals.items() if k in self.totals})
         output_pref = payload.get("show_tool_output")
         if isinstance(output_pref, bool):
             self._show_tool_output = output_pref
@@ -2871,7 +2886,7 @@ class ConsoleSession:
         self.context.enforce_budget()
         totals = data.get("totals")
         if isinstance(totals, dict):
-            self.totals.update({k: int(v) for k, v in totals.items() if k in self.totals})
+            self.totals.update({k: _safe_int(v) for k, v in totals.items() if k in self.totals})
         self.message_count = sum(
             1 for m in messages if isinstance(m, dict) and m.get("role") == "user"
         )
@@ -2944,22 +2959,24 @@ class ConsoleSession:
                 else:
                     self._print(f"{self.style.ash('you')} (empty)")
             elif role == "assistant":
-                # Assistant may have content null + tool_calls — render markdown for body so colors show
+                # Assistant may have content null + tool_calls — render markdown for body so colors show.
+                # Model-controlled text is sanitized exactly like the live
+                # reply paths: saved output must not drive the terminal.
                 if isinstance(content, str) and content.strip():
                     self._print(f"{self.style.brand('ENCHANTER')}")
-                    self._print(render_markdown(content, self.style))
+                    self._print(render_markdown(_sanitize_output(content), self.style))
                 elif msg.get("tool_calls"):
                     calls = ", ".join((c.get("function") or {}).get("name","?") for c in msg.get("tool_calls") or [])
                     self._print(f"{self.style.brand('ENCHANTER')} [called {calls}]")
                     if isinstance(content, str) and content.strip():
-                        self._print(render_markdown(content, self.style))
+                        self._print(render_markdown(_sanitize_output(content), self.style))
                 elif isinstance(content, str):
-                    self._print(f"{self.style.brand('ENCHANTER')} {content}")
+                    self._print(f"{self.style.brand('ENCHANTER')} {_sanitize_output(content)}")
             elif role == "tool":
                 text = content if isinstance(content, str) else str(content or "")
                 if text.strip():
                     # Keep the replay compact: 300 chars per tool result.
-                    self._print(f"{self.style.dim('tool')} {self.style.dim(text[:300])}")
+                    self._print(f"{self.style.dim('tool')} {self.style.dim(_sanitize_output(text)[:300])}")
                 else:
                     self._print(f"{self.style.dim('tool')} (no output)")
         summary = data.get("summary") or ""
@@ -5310,7 +5327,13 @@ def main(argv: list[str] | None = None) -> int:
     # characters render instead of raising or degrading to "?".
     force_utf8_output()
 
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        # Same contract as the headless runner: a bad config file is a
+        # two-line diagnosis, never a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     # Apply the user's saved active pick so the startup check and header
     # reflect the chosen endpoint instead of the example default.
     # Failures here are non-fatal: defaults and explicit flags still apply.

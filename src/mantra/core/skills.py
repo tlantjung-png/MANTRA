@@ -155,11 +155,14 @@ _cache_all_roots: tuple[str, ...] | None = None
 def load_all() -> dict[str, Skill]:
     """Every skill, keyed by lowercase name.
 
-    Earlier roots win on a name collision, so a personal skills
-    directory can shadow a project one. A directory without SKILL.md is
-    skipped silently - skills/ legitimately holds INDEX.md and other
-    documentation. Results are cached briefly to avoid scanning on every
-    turn.
+    Earlier roots win on a name collision: the repo-shipped library is
+    searched first, so its bundled copy of a skill is what the console
+    uses, and the personal ``~/.mantra/skills`` tree only supplies names
+    the library does not carry. An explicit ``MANTRA_SKILLS`` override
+    replaces the root list outright and always wins. A directory without
+    SKILL.md is skipped silently - skills/ legitimately holds INDEX.md
+    and other documentation. Results are cached briefly to avoid scanning
+    on every turn.
     """
     global _cache_all, _cache_all_ts, _cache_all_roots
     import time
@@ -270,8 +273,9 @@ def load_bundles() -> dict[str, list[str]]:
             skills = _backticked(cells[1])
             if name and skills:
                 # Earlier roots win, matching load_skill precedence for
-                # individual skills: the personal tree overrides the
-                # workspace library, not the other way around.
+                # individual skills: the repo-shipped library is searched
+                # first, so its bundles are authoritative and the personal
+                # tree only supplies bundles the library does not carry.
                 bundles.setdefault(name, skills)
     _cache_bundles = dict(bundles)
     _cache_bundles_ts = now

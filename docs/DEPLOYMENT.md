@@ -22,6 +22,14 @@ Task documents may override the evaluator test command on a per-task basis. User
 
 Background task logs are written to workspace-private or per-process private locations with restricted permissions, and the registry of background tasks is bounded and pruned.
 
+## Sandbox Isolation Levels
+
+Two sandbox providers are available, and they offer different isolation guarantees.
+
+The host sandbox executes commands directly on the host in the workspace directory. It applies a best-effort traversal screen that blocks obvious path escapes, home-directory expansion, and shell expansions, but the screen is defence in depth only and is explicitly not a containment boundary: quoted payloads passed to interpreters, and any other construction the heuristic does not recognize, run with the full authority of the host account. Only the host sandbox supports background task execution and process termination by port; direct process-id termination is restricted to processes the harness itself started as background tasks.
+
+The container sandbox runs every command inside an ephemeral container with memory and processor limits, and offers strong isolation: file access is confined to the container workspace, symlinks are resolved and re-validated before every read and write, and host-side process control is unavailable by design. Use the container sandbox for any task whose inputs are untrusted or whose repository is not under operator control; keep the host sandbox for trusted, interactive work where its speed and simplicity are worth the weaker boundary.
+
 ## Operational Runbooks
 
 ### Monitoring
