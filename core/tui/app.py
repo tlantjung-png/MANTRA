@@ -802,13 +802,15 @@ class TuiApp:
             for i, ln in enumerate(card):
                 buf.set_styled_line(x, y + i, ln, styles, cols)
 
-        # Bottom border row with status.
+        # Bottom border row with status. The chip starts at column 2
+        # (right after the corner+dash), aligned with the MANTRA prompt
+        # label one row below.
         border_row = rows - 1 - composer_height
         status = self._border_text()
         marker = f" ^{self.transcript.scrolled}" if self.transcript.scrolled else ""
         if self.transcript.scrolled:
             status = (status + marker) if status else marker.lstrip()
-        line = "╭─ " + status + " "
+        line = "╭─" + status + " "
         line += "─" * max(0, cols - visible_len(line) - 1) + "╮"
         if not status:
             line = "╭" + "─" * max(0, cols - 2) + "╮"

@@ -18,8 +18,9 @@ ASH_ITAL  = "3;38;5;250"  # italics when the terminal honours SGR 3
 # Bright crimson, used where identity or intent matters: the wordmark,
 # the agent signature, selection, the spinner. One accent across the
 # whole UI so the top bar and the transcript share a single colour.
-BLOOD      = "38;5;197"
-BLOOD_BOLD = "1;38;5;197"
+# 204 (light red) keeps the identity readable on dark backgrounds.
+BLOOD      = "38;5;204"
+BLOOD_BOLD = "1;38;5;204"
 
 # --- semantic hues (distinct, professional) ---------------------------
 SAGE  = "38;5;114"        # code, additions, success — moss green
