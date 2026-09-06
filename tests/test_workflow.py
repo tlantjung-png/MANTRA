@@ -14,10 +14,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
 
-import mantra.core.workflows as workflows
-from mantra.console import ConsoleSession, Style, _workflow
+import core.agent.workflows as workflows
+from core.console import ConsoleSession, Style, _workflow
 
 
 class StoreTest(unittest.TestCase):
@@ -115,8 +115,8 @@ class CommandTest(unittest.TestCase):
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
         os.environ[workflows._OVERRIDE_ENV] = os.path.join(self.tmp, "workflows.json")
 
-        from mantra.config import merge_defaults
-        from mantra.implementations.llm.mock_client import ScriptedLLMClient
+        from core.config import merge_defaults
+        from core.scripted import ScriptedLLMClient
 
         self.session = ConsoleSession(
             config=merge_defaults({}),
@@ -168,12 +168,12 @@ class CommandTest(unittest.TestCase):
     # ---- create -------------------------------------------------------
 
     def test_create_reads_steps_until_the_dot(self):
-        with mock.patch("mantra.console._read_multiline", return_value="first\nsecond"):
+        with mock.patch("core.console._read_multiline", return_value="first\nsecond"):
             _workflow(self.session, "create ship")
         self.assertEqual(workflows.get("ship")["steps"], ["first", "second"])
 
     def test_create_reports_what_it_made(self):
-        with mock.patch("mantra.console._read_multiline", return_value="only"):
+        with mock.patch("core.console._read_multiline", return_value="only"):
             _workflow(self.session, "create ship")
         self.assertIn("created 'ship'", self._shown())
         self.assertIn("1 step", self._shown())
@@ -181,7 +181,7 @@ class CommandTest(unittest.TestCase):
     def test_creating_again_says_updated(self):
         workflows.create("ship", ["a"])
         self.printed.clear()
-        with mock.patch("mantra.console._read_multiline", return_value="b"):
+        with mock.patch("core.console._read_multiline", return_value="b"):
             _workflow(self.session, "create ship")
         self.assertIn("updated", self._shown())
 
@@ -190,7 +190,7 @@ class CommandTest(unittest.TestCase):
         self.assertIn("usage", self._shown())
 
     def test_create_with_no_steps_is_refused(self):
-        with mock.patch("mantra.console._read_multiline", return_value=""):
+        with mock.patch("core.console._read_multiline", return_value=""):
             _workflow(self.session, "create ship")
         self.assertIsNone(workflows.get("ship"))
 
@@ -201,8 +201,9 @@ class CommandTest(unittest.TestCase):
         seen: list[str] = []
         # Returns a truthy object so every step counts as completed; a
         # plain None return would read as "step did not complete".
-        with mock.patch.object(self.session, "handle", side_effect=seen.append) as handled:
-            handled.side_effect = lambda text: seen.append(text) or object()
+        with mock.patch.object(
+            self.session, "handle", side_effect=lambda text: seen.append(text) or object()
+        ):
             _workflow(self.session, "launch ship")
         self.assertEqual(seen, ["one", "two", "three"])
 
@@ -260,19 +261,19 @@ class CommandTest(unittest.TestCase):
     # ---- registration -------------------------------------------------
 
     def test_workflow_is_in_the_command_table(self):
-        from mantra.console import SLASH_COMMANDS
+        from core.console import SLASH_COMMANDS
 
         self.assertIn("/workflow", [c for c, _ in SLASH_COMMANDS])
 
     def test_workflow_is_in_the_help_text(self):
-        from mantra.console import HELP_TEXT
+        from core.console import HELP_TEXT
 
         self.assertIn("/workflow", HELP_TEXT)
 
     def test_dispatch_routes_to_the_workflow_handler(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
-        with mock.patch("mantra.console._workflow") as handled:
+        with mock.patch("core.console._workflow") as handled:
             dispatch(self.session, "/workflow show")
         handled.assert_called_once_with(self.session, "show")
 

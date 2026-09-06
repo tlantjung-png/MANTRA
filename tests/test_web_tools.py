@@ -14,15 +14,15 @@ import unittest
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
 
-from mantra.implementations.sandbox.local_sandbox import LocalSandbox
-from mantra.implementations.tools.web_tools import (
+from core.sandbox import LocalSandbox
+from core.tools.web import (
     WebFetchTool,
     _inflate,
     html_to_text,
 )
-from mantra.registry import TOOL_REGISTRY, build_tools
+from core.registry import TOOL_REGISTRY, build_tools
 
 PAGE = """<html><head><title>T</title>
 <style>body { color: red }</style>
@@ -147,7 +147,7 @@ class FetchTest(unittest.TestCase):
         # lives in that module. Patching urllib.request.urlopen would
         # leave the real one bound here and every fetch would hit the
         # network - which is how the first run of this file failed.
-        target = "mantra.implementations.tools.web_tools.urlopen"
+        target = "core.tools.web.urlopen"
         if side_effect is not None:
             patcher = mock.patch(target, side_effect=side_effect)
         else:
@@ -239,7 +239,7 @@ class RegistryTest(unittest.TestCase):
     def test_it_is_not_treated_as_a_mutating_tool(self):
         # A fetch cannot change the workspace, so it must not be gated
         # behind an approval prompt the way write_file is.
-        from mantra.core.approvals import MUTATING_TOOLS
+        from core.agent.approvals import MUTATING_TOOLS
 
         self.assertNotIn("web_fetch", MUTATING_TOOLS)
 

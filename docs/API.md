@@ -14,13 +14,13 @@ Commands are invoked with a leading slash. The full set is listed by the help co
 
 Workspace inspection commands display the workspace location and contents, the durable memory file, and uncommitted changes, with a confirmation step before discarding changes.
 
-Tool, model, endpoint, and approval commands list or select the available options. They present a menu when no argument is supplied and apply a direct assignment when an argument is supplied. Model commands also offer a thinking-effort choice and complete from the endpoint's own model catalogue. Endpoint commands support adding, switching, listing, removing, and replacing stored credentials, with always-prompted replacement to allow correction of a mistyped credential and with handling for both hidden and visible prompts.
+Model, endpoint, and approval commands list or select the available options. They present a menu when no argument is supplied and apply a direct assignment when an argument is supplied. Model commands also offer a thinking-effort choice and complete from the endpoint's own model catalogue. Endpoint commands support adding, switching, listing, removing, and replacing stored credentials, with always-prompted replacement to allow correction of a mistyped credential and with handling for both hidden and visible prompts.
 
 Cost and status commands display token usage, cache metrics, and conversation size in both human-readable and structured forms. History management commands summarize, clear, or reset the conversation while preserving the system prompt and files.
 
-Session persistence commands save the current conversation to a file, load from a file, or resume from automatically saved transcripts, with the most recent transcript listed first and with validation that the target path resides within allowed directories.
+The console autosaves the conversation to a session transcript after each turn, and the session resume command restores one from the automatically saved transcripts, with the most recent transcript listed first and traversal-unsafe names rejected.
 
-Goal and todo commands set, show, and clear a standing objective and a session checklist, both of which are injected into every turn's system prompt. Skill and workflow commands discover, display, attach, and launch procedural bundles. Pasting, step-limit, and verbosity commands control input and execution bounds. The exit command autosaves the session and terminates.
+Goal and todo commands set, show, and clear a standing objective and a session checklist, both of which are injected into every turn's system prompt. Skill and workflow commands discover, display, attach, and launch procedural bundles. The verbosity command toggles per-tool detail. The exit command autosaves the session and terminates.
 
 File references use a leading at-sign plus a path or pattern. They are resolved relative to the workspace, rejected if outside, and expanded to content, listing, or glob matches. Each file is capped, the total attached content is capped, the number of glob matches is capped, and unknown references are reported.
 

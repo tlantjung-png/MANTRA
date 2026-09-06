@@ -9,8 +9,8 @@ user-invocable: true
 
 ## Prerequisites
 
-- The repo's headless entrypoint present (`python -m mantra.main --config <cfg>
-  --task <task.json>`); it refuses to run without a valid config and task file.
+- The repo's headless entrypoint present (`mantra-headless --config <cfg>
+  --task <task.json>`, i.e. `core.main`); it refuses to run without a valid config and task file.
 - Operator approval for anything that mutates repositories or publishes changes.
 
 ## Use When
@@ -20,7 +20,7 @@ any work that must proceed without an operator watching each turn.
 
 ## Procedure
 
-1. Choose the vehicle: a one-shot bounded run (headless `mantra.main` with a task
+1. Choose the vehicle: a one-shot bounded run (headless `core.main` with a task
    JSON file) or a resumable work list via `/workflow` steps driven against the
    same workspace.
 2. Set the bounds before starting: provider retry limit (default 1), max steps in
@@ -32,9 +32,9 @@ any work that must proceed without an operator watching each turn.
 4. Keep artifacts on disk: deliverables, logs, and a state record (session file)
    that survives the run, so a later session can reconstruct progress (pair with
    context-handoff for long runs).
-5. Watchdog: run `python scripts/vault-verify.py` to confirm state integrity, run
-   `git status`/`git diff --check` to confirm the tree is clean, and re-read the
-   workspace memory before and after; compare rather than trusting exit codes alone.
+5. Watchdog: run `git status`/`git diff --check` to confirm the tree is clean,
+   and re-read the workspace memory before and after; compare rather than
+   trusting exit codes alone.
 
 ## Verification
 

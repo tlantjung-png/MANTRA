@@ -1,1 +1,1 @@
-"""MANTRA test suite (run with: python -m unittest discover -s tests -v)."""
+"""MANTRA test suite (run with: python -m pytest tests/ -q)."""

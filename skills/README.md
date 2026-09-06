@@ -1,7 +1,7 @@
 # MANTRA skill library
 
 Bundled skills that the console's `/skills` command discovers and attaches. The
-loader (`src/mantra/core/skills.py`) indexes this directory **first**, then your
+loader (`core/agent/skills.py`) indexes this directory **first**, then your
 personal `~/.mantra/skills` tree as a supplement - so a personal skill of the
 same name never shadows the bundled one, and your own additions are still found.
 
@@ -41,7 +41,7 @@ monitor stack) were rewritten to use the primitives this repo really ships:
 - known-failure registry: `knowledge/known-failures.md`
 - command rules: `rules/commands.rules` + `~/.mantra/rules/commands.rules`
 - workflows: `/workflow` (JSON prompt sequences in `~/.mantra/workflows.json`)
-- integrity chain: `.mantra/vault` + `scripts/vault-verify.py`
+- integrity chain: not shipped - deliberately left behind (see docs/ADOPTION.md)
 - sessions & logs: `~/.mantra/sessions/`, `logs/*.jsonl`
 - session state: `/goal`, `/todo`, `/compact`, `/resume`
 - tools: the console's bounded `read_file` / `list_dir` / `search_code` / diff

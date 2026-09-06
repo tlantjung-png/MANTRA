@@ -24,21 +24,21 @@ import tempfile
 import threading
 import unittest
 
-from mantra.core.agent_loop import AgentLoop
-from mantra.core.approvals import ApprovalPolicy, classify_command
-from mantra.core.context import ContextManager
-from mantra.core.events import EventBus
-from mantra.core.exceptions import AbortError
-from mantra.implementations.llm.mock_client import ScriptedLLMClient
-from mantra.implementations.loggers.jsonl_logger import JsonlLogger
-from mantra.implementations.sandbox.docker_sandbox import DockerSandbox
-from mantra.implementations.sandbox.local_sandbox import LocalSandbox
-from mantra.implementations.tools import command_tool
-from mantra.implementations.tools.command_tool import KillShellTool, RunCommandTool, ShellOutputTool
-from mantra.implementations.tools.edit_ledger import EditLedger
-from mantra.implementations.tools.file_tools import EditFileTool, ReadFileTool, WriteFileTool
-from mantra.interfaces.llm_client import LLMResponse, ToolCall
-from mantra.interfaces.tool import Tool
+from core.agent.loop import AgentLoop
+from core.agent.approvals import ApprovalPolicy, classify_command
+from core.agent.context import ContextManager
+from core.agent.events import EventBus
+from core.agent.exceptions import AbortError, SandboxError
+from core.scripted import ScriptedLLMClient
+from core.logs import JsonlLogger
+from core.container import DockerSandbox
+from core.sandbox import LocalSandbox
+from core.tools import commands as command_tool
+from core.tools.commands import KillShellTool, RunCommandTool, ShellOutputTool
+from core.tools.ledger import EditLedger
+from core.tools.files import EditFileTool, ReadFileTool, WriteFileTool
+from core.types import LLMResponse, ToolCall
+from core.types import Tool
 
 
 def _workspace() -> str:
@@ -386,7 +386,7 @@ class WriteByteCapTest(unittest.TestCase):
         sandbox.setup({})
         # 600k two-byte characters = 1.2MB of bytes: over the 1MB cap even
         # though the character count sits below it.
-        with self.assertRaises(Exception):
+        with self.assertRaises(SandboxError):
             sandbox.write_file("big.txt", "\u00e9" * 600_000)
 
     def test_ascii_content_under_cap_still_writes(self):

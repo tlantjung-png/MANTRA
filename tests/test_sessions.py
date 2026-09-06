@@ -14,18 +14,15 @@ import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
 
-import mantra.core.sessions as sessions
-from mantra.console import ConsoleSession, Style
+import core.agent.sessions as sessions
+from core.console import ConsoleSession, Style
 
-
-def _messages(count=2):
-    out = [{"role": "system", "content": "you are MANTRA"}]
-    for i in range(count):
-        out.append({"role": "user", "content": f"question {i}"})
-        out.append({"role": "assistant", "content": f"answer {i}"})
-    return out
+from _helpers import messages as _messages
 
 
 class StoreTest(unittest.TestCase):
@@ -105,6 +102,17 @@ class StoreTest(unittest.TestCase):
 
 
 class DeriveNameTest(unittest.TestCase):
+    def setUp(self):
+        # Isolate the session store: derive_name/save/list_sessions must
+        # not touch the operator's real ~/.mantra/sessions during tests.
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        prior = os.environ.get(sessions._OVERRIDE_ENV)
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, sessions._OVERRIDE_ENV, prior)
+        self.addCleanup(os.environ.pop, sessions._OVERRIDE_ENV, None)
+        os.environ[sessions._OVERRIDE_ENV] = os.path.join(self.tmp, "sessions")
+
     def test_a_workspace_gives_its_directory_name(self):
         name = sessions.derive_name("C:\\Users\\arif-\\K-CHAT")
         self.assertTrue(name.startswith("k-chat-"), name)
@@ -120,13 +128,17 @@ class DeriveNameTest(unittest.TestCase):
         self.assertTrue(sessions.derive_name("", "gpt-4o").startswith("gpt-4o-"))
 
     def test_two_sessions_in_one_directory_do_not_collide(self):
-        first = sessions.derive_name("C:\\work\\proj")
-        sessions.save(first, {"messages": _messages()})
-        # Same-second names must still diverge via the collision suffix.
+        # A session already saved under the exact same-second candidate
+        # must force the uuid-suffix branch, not merely differ by stamp.
         with mock.patch.object(sessions.time, "strftime", return_value="20260101-000000"):
+            first = sessions.derive_name("C:\\work\\proj")
+            sessions.save(first, {"messages": _messages()})
             second = sessions.derive_name("C:\\work\\proj")
             sessions.save(second, {"messages": _messages()})
         self.assertNotEqual(first, second)
+        self.assertRegex(second, r"^proj-20260101-000000-[0-9a-f]{4}$")
+        # The second save did not overwrite the first: both are listed.
+        self.assertEqual(len(sessions.list_sessions()), 2)
 
 
 class SessionTestBase(unittest.TestCase):
@@ -144,9 +156,9 @@ class SessionTestBase(unittest.TestCase):
         os.environ[sessions._OVERRIDE_ENV] = os.path.join(self.tmp, "sessions")
 
     def _session(self):
-        from mantra.config import merge_defaults
-        from mantra.core.context import ContextManager
-        from mantra.implementations.llm.mock_client import ScriptedLLMClient
+        from core.config import merge_defaults
+        from core.agent.context import ContextManager
+        from core.scripted import ScriptedLLMClient
 
         session = ConsoleSession(
             config=merge_defaults({}),
@@ -263,7 +275,7 @@ class ResumeTest(SessionTestBase):
         session.autosave()
         name = session.session_name
         session.context.messages = [{"role": "system", "content": "x"}]
-        with mock.patch("mantra.console._menu", return_value=name):
+        with mock.patch("core.console._menu", return_value=name):
             self.assertTrue(session.pick_session())
         self.assertEqual(len(session.context.messages), 5)
 
@@ -272,7 +284,7 @@ class ResumeTest(SessionTestBase):
         session.context.messages = _messages()
         session.autosave()
         before = list(session.context.messages)
-        with mock.patch("mantra.console._menu", return_value=""):
+        with mock.patch("core.console._menu", return_value=""):
             self.assertFalse(session.pick_session())
         self.assertEqual(session.context.messages, before)
 
@@ -286,14 +298,14 @@ class ResumeTest(SessionTestBase):
 class DispatchTest(SessionTestBase):
     def _dispatch(self, line):
         session = self._session()
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         return dispatch(session, line)
 
     def test_resume_with_no_args_opens_the_picker(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "pick_session") as picked:
-            from mantra.console import dispatch
+            from core.console import dispatch
 
             dispatch(session, "/resume")
         picked.assert_called_once()
@@ -301,7 +313,7 @@ class DispatchTest(SessionTestBase):
     def test_resume_list_shows_them(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "show_sessions") as shown:
-            from mantra.console import dispatch
+            from core.console import dispatch
 
             dispatch(session, "/resume list")
         shown.assert_called_once()
@@ -309,18 +321,18 @@ class DispatchTest(SessionTestBase):
     def test_resume_by_name_resumes(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "resume_session") as resumed:
-            from mantra.console import dispatch
+            from core.console import dispatch
 
             dispatch(session, "/resume k-chat-20260101-000000")
         resumed.assert_called_once_with("k-chat-20260101-000000")
 
     def test_resume_is_in_the_command_table(self):
-        from mantra.console import SLASH_COMMANDS
+        from core.console import SLASH_COMMANDS
 
         self.assertIn("/resume", [c for c, _ in SLASH_COMMANDS])
 
     def test_resume_is_in_the_help_text(self):
-        from mantra.console import HELP_TEXT
+        from core.console import HELP_TEXT
 
         self.assertIn("/resume", HELP_TEXT)
 

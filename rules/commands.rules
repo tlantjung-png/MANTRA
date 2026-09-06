@@ -1,8 +1,10 @@
 # Command rules. Format: decision|pattern tokens|justification
-# decisions: forbid > prompt > allow. "prompt" maps to allow-with-log because hooks cannot
-# show an interactive prompt; for real per-action prompts switch MANTRA's permission_mode to a
-# confirm-based mode. Compound commands are split and every segment is evaluated, and a rule
-# matches at any token position with quotes stripped.
+# Note: some entries duplicate the built-in approval screens (git reset --hard, git push --force, rm -rf, git diff, the AGENTS.md/MEMORY.md fences) and are kept as documentation.
+# decisions: forbid > prompt > allow. In the interactive approval policy a
+# "prompt" decision forces an explicit yes/no before the command runs; the
+# token rules are matched per command segment at any token position with
+# quotes stripped, and "allow" only relaxes an ordinary mutating verdict
+# (it can never approve something the destructive screen caught).
 # Regex rules: forbidre|<regex>|<justification> match the whole command text, so they catch
 # shapes that span segments or wrappers. Regex matching is case-insensitive.
 forbid|rm -rf|Destructive deletion; use careful targeted removal
@@ -20,5 +22,5 @@ allow|git log|Safe read-only log
 # Shell-layer writes are forbidden; deliberate updates go through the
 # instruction-audit / update-memory flows at session boundaries.
 forbidre|(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md|Mid-session AGENTS.md edits invalidate the provider prefix cache; defer to session boundaries
-forbidre|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md|Mid-session native-memory fence edits invalidate the provider prefix cache; memory-mirror handles this at close
+forbidre|(>|>>)\s*[^|\r\n]*MEMORY\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md|Mid-session native-memory fence edits invalidate the provider prefix cache; memory-mirror handles this at close
 

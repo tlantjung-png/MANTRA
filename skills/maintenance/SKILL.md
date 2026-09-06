@@ -22,8 +22,9 @@ suspected between full audits.
 
 1. Baseline: run the project's test suite (`pytest -q` or the repo's configured
    check) and `git status`/`git diff --check`; stop on failure.
-2. Integrity: run `python scripts/vault-verify.py` against the state directory to
-   confirm the `.mantra/vault` chain is clean and fresh.
+2. Integrity: this repo ships no vault verifier (integrity chains were
+   deliberately left behind - see docs/ADOPTION.md); rely on the tree and test
+   checks from step 1.
 3. Registry: probe the known-failure classes in `knowledge/known-failures.md`
    (see the known-failures skill); record each as CONFIRMED / NOT REPRODUCED /
    UNVERIFIED.

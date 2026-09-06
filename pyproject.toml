@@ -12,12 +12,19 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-mantra = "mantra.console:main"
-mantra-headless = "mantra.main:main"
+mantra = "core.console:main"
+mantra-headless = "core.main:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["core", "core.agent", "core.tools", "core.tui"]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"examples" = ["examples/*.json"]
+"knowledge" = ["knowledge/*.md"]
+"rules" = ["rules/*.rules"]
+"skills" = ["skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["."]

@@ -27,16 +27,16 @@ from unittest import mock
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
 # Bootstrap imports so the suite runs from a checkout without installation.
-for _path in (os.path.join(_PROJECT_ROOT, "src"), _PROJECT_ROOT, _TESTS_DIR):
+for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-import mantra.console as console
-import mantra.implementations.llm.openai_client as openai_module
-from mantra.config import REASONING_EFFORTS, merge_defaults
-from mantra.console import provider_needs_key
-from mantra.core.models import fetch_models, is_reasoning_model
-from test_console_session import make_session
-from mantra.core.keys import (
+import core.console as console
+import core.llm as openai_module
+from core.config import REASONING_EFFORTS, merge_defaults
+from core.console import provider_needs_key
+from core.agent.models import fetch_models, is_reasoning_model
+from _helpers import make_session
+from core.agent.keys import (
     credentials_path,
     has_stored,
     mask,
@@ -45,7 +45,7 @@ from mantra.core.keys import (
     store as store_key,
     stored_keys,
 )
-from mantra.core.settings import (
+from core.agent.settings import (
     active,
     add_endpoint,
     endpoint_name_for_url,
@@ -58,7 +58,7 @@ from mantra.core.settings import (
     settings_path,
     validate_endpoint,
 )
-from mantra.registry import build_llm
+from core.registry import build_llm
 
 
 class TempStorage:
@@ -413,7 +413,7 @@ class ReasoningEffortTest(unittest.TestCase):
         self.assertEqual(body["reasoning_effort"], "high")
 
     def test_invalid_level_is_rejected_by_config(self):
-        from mantra.config import ConfigError
+        from core.config import ConfigError
 
         with self.assertRaises(ConfigError):
             merge_defaults({"llm": {"reasoning_effort": "turbo"}})
@@ -439,7 +439,7 @@ class ReasoningEffortTest(unittest.TestCase):
         self.assertNotIn("a-tool-only-this-session-has", two["tools"])
 
     def test_the_module_defaults_survive_a_session(self):
-        from mantra.config import DEFAULTS
+        from core.config import DEFAULTS
 
         one = merge_defaults({})
         one["llm"]["model"] = "some-other-model"
@@ -535,7 +535,7 @@ class ModelDiscoveryTest(TempStorage, unittest.TestCase):
         self.assertEqual(sent["auth"], "Bearer sk-discovery-123456")
 
     def test_bad_key_gets_actionable_advice(self):
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         failure = urllib.error.HTTPError(
             "https://x/v1", 401, "err", {}, io.BytesIO(b'{"error":"nope"}')
@@ -547,7 +547,7 @@ class ModelDiscoveryTest(TempStorage, unittest.TestCase):
         self.assertIn("/connect", str(caught.exception))
 
     def test_missing_catalogue_suggests_typing_it(self):
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         failure = urllib.error.HTTPError(
             "https://x/v1", 404, "err", {}, io.BytesIO(b"not found")
@@ -558,7 +558,7 @@ class ModelDiscoveryTest(TempStorage, unittest.TestCase):
         self.assertIn("/model", str(caught.exception))
 
     def test_unreachable_host_is_reported_plainly(self):
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         with mock.patch.object(
             urllib.request, "urlopen", side_effect=TimeoutError("timed out")
@@ -592,9 +592,10 @@ class ModelMenuTest(TempStorage, unittest.TestCase):
     """Picking from the model menu should settle the effort too.
 
     Reasoning is a property of the chosen model, not a separate setting,
-    so one menu pass has to produce both. The menu itself is exercised in
-    ``test_menu.py``; here it is stubbed so these tests cover the wiring
-    around it - what gets listed, and what the choice does.
+    so one menu pass has to produce both. The menu itself is exercised
+    in the terminal-application layer (``core.tui.overlays.MenuOverlay``);
+    here it is stubbed so these tests cover the wiring around it - what
+    gets listed, and what the choice does.
     """
 
     def setUp(self):
@@ -694,7 +695,7 @@ class ModelMenuTest(TempStorage, unittest.TestCase):
     def test_an_unreachable_endpoint_falls_back_to_the_saved_list(self):
         # A dead endpoint must not block setup: the models recorded in
         # the settings file are still a perfectly good menu.
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         add_endpoint("x", "https://x/v1", models=["saved-model"])
         with mock.patch.object(
@@ -748,7 +749,7 @@ class ModelCompletionTest(unittest.TestCase):
             root = "."
 
         _Session.sandbox = _Sandbox()
-        from mantra.console import ConsoleCompleter
+        from core.console import ConsoleCompleter
 
         completer = ConsoleCompleter(_Session())
         result = completer.complete("/model gpt-4o", 12)
@@ -764,7 +765,7 @@ class ModelCompletionTest(unittest.TestCase):
             root = "."
 
         _Session.sandbox = _Sandbox()
-        from mantra.console import ConsoleCompleter
+        from core.console import ConsoleCompleter
 
         result = ConsoleCompleter(_Session()).complete("/model o3", 9)
         self.assertIn("reasons", result.labels[0])
@@ -777,7 +778,7 @@ class ModelCompletionTest(unittest.TestCase):
             root = "."
 
         _Session.sandbox = _Sandbox()
-        from mantra.console import ConsoleCompleter
+        from core.console import ConsoleCompleter
 
         self.assertIsNone(ConsoleCompleter(_Session()).complete("/model x", 8))
 
@@ -789,7 +790,7 @@ class ModelCompletionTest(unittest.TestCase):
             root = "."
 
         _Session.sandbox = _Sandbox()
-        from mantra.console import ConsoleCompleter
+        from core.console import ConsoleCompleter
 
         # A cursor past the end is clamped and returns None, not an error.
         self.assertIsNone(ConsoleCompleter(_Session()).complete("/model x", 99))

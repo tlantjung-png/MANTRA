@@ -4,7 +4,7 @@
 
 MANTRA is a modular harness that delegates coding and analysis tasks to an external language model. It provides a sandboxed workspace, a set of file and shell tools, and automated grading through a configurable test command. Two modes are available: an interactive console for turn-based work in a persistent workspace, and a headless runner that executes a single task from provisioning through evaluation and then exits.
 
-The interactive console maintains a persistent workspace across turns, retains conversation history within configurable bounds, and supports inline references to workspace files using an at-sign prefix. It also keeps durable per-workspace memory that is appended automatically after each turn.
+The interactive console maintains a persistent workspace across turns, retains conversation history within configurable bounds, and supports inline references to workspace files using an at-sign prefix. The console is an application-owned terminal surface: every frame is composed into a cell grid and diff-flushed, one input thread feeds a single event loop, and text selection, scrolling and the prompt box are all drawn by the application itself - so it behaves identically on every terminal. It also keeps durable per-workspace memory that is appended automatically after each turn.
 
 The headless runner executes one task from start to evaluation and records a structured event log, returning an exit status that reflects whether the automated grading passed.
 
@@ -29,7 +29,7 @@ For non-interactive use, the headless runner is invoked with a configuration doc
 
 ## Architecture Summary
 
-The system is organized into four layers. The core layer holds orchestration and state management and depends only on abstract contracts. The interface layer declares those contracts. The implementation layer supplies interchangeable concrete components for each contract. The outer layer provides assembly, configuration loading, and user-facing entry points.
+The system is organized into four layers. The core layer holds orchestration and state management and depends only on abstract contracts. The interface layer declares those contracts. The implementation layer supplies interchangeable concrete components for each contract. The outer layer provides assembly, configuration loading, and user-facing entry points. The layers are conceptual, not separate directory trees: the contracts live in `core/types.py`, and the implementations live in the concrete core modules beside it.
 
 The central orchestrator is the only stateful component in the core. It is constructed via dependency injection with fully built collaborators and does not import concrete implementations. Component assembly is performed by a registry that maps short names to concrete classes, validates unknown names and unknown keys at startup, and shares a single edit ledger across file tools.
 

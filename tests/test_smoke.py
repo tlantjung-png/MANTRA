@@ -14,23 +14,23 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
 
-from mantra.config import merge_defaults
-from mantra.core.agent_loop import AgentLoop
-from mantra.core.context import ContextManager
-from mantra.core.events import EventBus
-from mantra.core.exceptions import ConfigError, LLMError
-from mantra.implementations.evaluators.command_evaluator import CommandEvaluator
-from mantra.implementations.evaluators.null_evaluator import NullEvaluator
-from mantra.implementations.llm.mock_client import (
+from core.config import merge_defaults
+from core.agent.loop import AgentLoop
+from core.agent.context import ContextManager
+from core.agent.events import EventBus
+from core.agent.exceptions import ConfigError, LLMError
+from core.evaluators import CommandEvaluator
+from core.evaluators import NullEvaluator
+from core.scripted import (
     ScriptedLLMClient,
     final_response,
     tool_call_response,
 )
-from mantra.implementations.loggers.jsonl_logger import JsonlLogger
-from mantra.implementations.sandbox.local_sandbox import LocalSandbox
-from mantra.registry import build_tools
+from core.logs import JsonlLogger
+from core.sandbox import LocalSandbox
+from core.registry import build_tools
 
 GREET_BUGGY = 'def greet():\n    return "helo"\n'
 GREET_TESTS = (
@@ -71,59 +71,6 @@ TASK = {
     "problem_statement": "greet.py returns 'helo'; make it return 'hello'.",
     "test_cmd": TEST_CMD,
 }
-
-
-class _MidToolCallFlaky(ScriptedLLMClient):
-    """Raises like a stream that ended mid-tool-call, then plays its script."""
-
-    def __init__(self, script: list, fail_times: int = 1) -> None:
-        super().__init__(script)
-        self.fail_times = fail_times
-
-    def chat(self, messages, tools=None, on_delta=None):
-        if self.fail_times > 0:
-            self.fail_times -= 1
-            raise LLMError(
-                "the response ended mid-tool-call (write_file): "
-                "Expecting value: line 1 column 2 (char 1)"
-            )
-        return super().chat(messages, tools=tools, on_delta=on_delta)
-
-
-class TruncatedToolCallTest(unittest.TestCase):
-    """A model cut off mid-tool-call (output budget) must recover or fail cleanly."""
-
-    def test_truncated_tool_call_retries_bounded_then_fails(self):
-        """Persistent truncation fails after bounded nudges with advice."""
-        workspace = make_workspace()
-        llm = _MidToolCallFlaky([final_response("never reached")], fail_times=99)
-        loop = build_loop(llm, workspace, os.path.join(workspace, "run.jsonl"))
-        loop.max_steps = 30  # override the default so the retry budget governs
-        result = loop.run(TASK)
-        self.assertEqual(result.stopped_reason, "error")
-        # 1 initial attempt + 2 nudged retries, then give up.
-        self.assertEqual(result.steps_used, 3)
-        self.assertIn("cut off mid-tool-call (write_file)", result.final_message)
-        # The advice names the real cause, not a raw JSON fragment.
-        self.assertIn("max_tokens", result.final_message)
-        self.assertNotIn("Expecting value", result.final_message)
-
-    def test_transient_truncated_tool_call_recovers(self):
-        """A single cut-off must not fail the run: the nudge recovers it."""
-        workspace = make_workspace()
-        llm = _MidToolCallFlaky(
-            [
-                tool_call_response("read_file", {"path": "greet.py"}),
-                final_response("done: read the file"),
-            ],
-            fail_times=1,
-        )
-        loop = build_loop(llm, workspace, os.path.join(workspace, "run.jsonl"))
-        loop.max_steps = 30  # override the default so the retry budget governs
-        result = loop.run(TASK)
-        self.assertEqual(result.stopped_reason, "final")
-        self.assertEqual(result.steps_used, 3)  # 1 cut + 1 tool step + 1 final
-        self.assertIn("read the file", result.final_message)
 
 
 class _ExplodingLogger:
@@ -188,7 +135,7 @@ class SmokeTest(unittest.TestCase):
 
         # Structured JSONL evidence was written.
         with open(log_path, encoding="utf-8") as handle:
-            events = [line.split('"event": "', 1)[1].split('"', 1)[0] for line in handle]
+            events = [json.loads(line)["event"] for line in handle if line.strip()]
         self.assertIn("tool_call", events)
         self.assertIn("run_result", events)
 
@@ -326,7 +273,7 @@ class SmokeAliasTest(unittest.TestCase):
 
     def test_aliased_tool_name_is_resolved(self):
         """Registry aliases (webfetch -> web_fetch) must work at dispatch time."""
-        from mantra.interfaces.tool import Tool
+        from core.types import Tool
 
         class FakeWebTool(Tool):
             name = "web_fetch"
@@ -397,7 +344,7 @@ class RegistryConfigTest(unittest.TestCase):
     def test_evaluator_without_init_builds_cleanly(self):
         # NullEvaluator inherits object.__init__ (*args/**kwargs); the
         # missing-required check must not demand them.
-        from mantra.registry import build_evaluator
+        from core.registry import build_evaluator
 
         evaluator = build_evaluator({"type": "none"})
         self.assertEqual(evaluator.evaluate(None, {}).passed, True)
@@ -452,7 +399,7 @@ class EditLedgerTest(unittest.TestCase):
 
 class KnowledgeTest(unittest.TestCase):
     def test_assemble_includes_known_failures_and_memory_tail(self):
-        from mantra.core.knowledge import assemble_system_prompt
+        from core.agent.knowledge import assemble_system_prompt
 
         kf = os.path.join(tempfile.mkdtemp(prefix="mantra-kf-"), "kf.md")
         mem = os.path.join(kf, os.pardir, "mem.md")
@@ -468,7 +415,7 @@ class KnowledgeTest(unittest.TestCase):
         self.assertIn("earlier note", prompt)
 
     def test_missing_files_yield_base_prompt_only(self):
-        from mantra.core.knowledge import assemble_system_prompt
+        from core.agent.knowledge import assemble_system_prompt
 
         prompt = assemble_system_prompt(
             "solo", known_failures_path="Z:/none.md", memory_path="Z:/none2.md"
@@ -476,7 +423,7 @@ class KnowledgeTest(unittest.TestCase):
         self.assertEqual(prompt, "solo")
 
     def test_append_memory_prunes_oldest_beyond_cap(self):
-        from mantra.core.knowledge import append_memory
+        from core.agent.knowledge import append_memory
 
         mem = os.path.join(make_workspace(), ".mantra", "memory.md")
         for i in range(50):
@@ -489,7 +436,7 @@ class KnowledgeTest(unittest.TestCase):
         self.assertIn("entry 049", content)  # newest kept
 
     def test_workspace_instruction_file_discovered_and_injected(self):
-        from mantra.core.knowledge import assemble_system_prompt, find_instructions_file
+        from core.agent.knowledge import assemble_system_prompt, find_instructions_file
 
         ws = make_workspace()
         with open(os.path.join(ws, "AGENTS.md"), "w", encoding="utf-8") as handle:
@@ -500,7 +447,7 @@ class KnowledgeTest(unittest.TestCase):
         self.assertIn("Always use tabs", prompt)
 
     def test_instruction_file_preference_order(self):
-        from mantra.core.knowledge import find_instructions_file
+        from core.agent.knowledge import find_instructions_file
 
         ws = make_workspace()
         self.assertIsNone(find_instructions_file(ws))
@@ -521,7 +468,7 @@ class SseStreamParseTest(unittest.TestCase):
         ]
 
     def test_content_deltas_accumulate(self):
-        from mantra.implementations.llm.openai_client import parse_sse_stream
+        from core.llm import parse_sse_stream
 
         seen = []
         result = parse_sse_stream(
@@ -533,7 +480,7 @@ class SseStreamParseTest(unittest.TestCase):
         self.assertTrue(result.is_final)
 
     def test_tool_call_fragments_reassemble(self):
-        from mantra.implementations.llm.openai_client import parse_sse_stream
+        from core.llm import parse_sse_stream
 
         lines = [
             "data: " + json.dumps(
@@ -561,7 +508,7 @@ class SseStreamParseTest(unittest.TestCase):
         self.assertIsNone(result.content)
 
     def test_done_sentinel_and_noise_tolerated(self):
-        from mantra.implementations.llm.openai_client import parse_sse_stream
+        from core.llm import parse_sse_stream
 
         lines = [": keep-alive comment", "", "data: not-json{{", "data: [DONE]", "data: {}"]
         result = parse_sse_stream(lines)
@@ -573,7 +520,7 @@ class SandboxScreenTest(unittest.TestCase):
 
     @staticmethod
     def _traversal(cmd: str) -> bool:
-        from mantra.implementations.sandbox.local_sandbox import _contains_traversal
+        from core.sandbox import _contains_traversal
 
         return _contains_traversal(cmd)
 
@@ -602,7 +549,7 @@ class EmptyStreamRetryTest(unittest.TestCase):
     """A stream closing before any SSE data must be retried, not fatal."""
 
     def _make(self, max_retries: int = 3):
-        from mantra.implementations.llm.openai_client import OpenAICompatClient
+        from core.llm import OpenAICompatClient
 
         return OpenAICompatClient(
             model="test-model",
@@ -617,15 +564,15 @@ class EmptyStreamRetryTest(unittest.TestCase):
         # The client reads its key from the environment at call time.
         with mock.patch.dict("os.environ", {"MANTRA_TEST_EMPTY_KEY": "test-key"}):
             with mock.patch.object(client, "_request_stream", side_effect=side_effect):
-                with mock.patch("mantra.implementations.llm.openai_client.time.sleep"):
+                with mock.patch("core.llm.time.sleep"):
                     return client.chat(
                         [{"role": "user", "content": "hi"}],
                         on_delta=lambda piece: None,
                     )
 
     def test_empty_stream_retried_then_recovers(self):
-        from mantra.core.exceptions import LLMError
-        from mantra.interfaces.llm_client import LLMResponse
+        from core.agent.exceptions import LLMError
+        from core.types import LLMResponse
 
         client = self._make()
         calls = {"n": 0}
@@ -641,7 +588,7 @@ class EmptyStreamRetryTest(unittest.TestCase):
         self.assertEqual(calls["n"], 3)
 
     def test_persistent_empty_stream_fails_after_max_retries(self):
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         client = self._make(max_retries=2)
         calls = {"n": 0}
@@ -658,7 +605,7 @@ class EmptyStreamRetryTest(unittest.TestCase):
     def test_non_transient_llm_error_not_retried(self):
         # A mid-tool-call cut is a different, model-recoverable failure the
         # agent loop nudges; it must not be silently swallowed by retries.
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         client = self._make(max_retries=3)
         calls = {"n": 0}

@@ -13,18 +13,15 @@ import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
 
-import mantra.core.sessions as sessions
-from mantra.console import ConsoleSession, Style, _goal, _todo
+import core.agent.sessions as sessions
+from core.console import ConsoleSession, Style, _goal, _todo
 
-
-def _messages(count=2):
-    out = [{"role": "system", "content": "you are MANTRA"}]
-    for i in range(count):
-        out.append({"role": "user", "content": f"question {i}"})
-        out.append({"role": "assistant", "content": f"answer {i}"})
-    return out
+from _helpers import messages as _messages
 
 
 class _IsolatedSessionTest(unittest.TestCase):
@@ -45,8 +42,8 @@ class _IsolatedSessionTest(unittest.TestCase):
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
         os.environ[sessions._OVERRIDE_ENV] = os.path.join(self.tmp, "sessions")
 
-        from mantra.config import merge_defaults
-        from mantra.implementations.llm.mock_client import ScriptedLLMClient
+        from core.config import merge_defaults
+        from core.scripted import ScriptedLLMClient
 
         self.session = ConsoleSession(
             config=merge_defaults({}),
@@ -101,10 +98,18 @@ class GoalTest(_IsolatedSessionTest):
 
     def test_the_goal_outlives_individual_turns(self):
         # The whole reason this exists: turn ten must still be aiming at
-        # what turn one was told to do.
+        # what turn one was told to do. Run two real turns, not a faked
+        # message_count bump.
+        from core.logs import JsonlLogger
+        from core.scripted import ScriptedLLMClient, final_response
+
+        self.session.logger = JsonlLogger(os.path.join(self.tmp, "session.jsonl"))
         _goal(self.session, "ship the dashboard")
-        for _ in range(9):
-            self.session.message_count += 1
+        self.session.llm = ScriptedLLMClient(
+            [final_response("turn one done"), final_response("turn two done")]
+        )
+        self.session.handle("turn one")
+        self.session.handle("turn two")
         self.assertIn("ship the dashboard", self.session._effective_system_prompt())
 
     def test_the_prompt_tells_the_agent_to_say_when_it_is_done(self):
@@ -249,19 +254,19 @@ class GoalTest(_IsolatedSessionTest):
     # ---- dispatch ------------------------------------------------------
 
     def test_goal_is_in_the_command_table(self):
-        from mantra.console import SLASH_COMMANDS
+        from core.console import SLASH_COMMANDS
 
         self.assertIn("/goal", [c for c, _ in SLASH_COMMANDS])
 
     def test_goal_is_in_the_help_text(self):
-        from mantra.console import HELP_TEXT
+        from core.console import HELP_TEXT
 
         self.assertIn("/goal", HELP_TEXT)
 
     def test_dispatch_routes_to_the_goal_handler(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
-        with mock.patch("mantra.console._goal") as handled:
+        with mock.patch("core.console._goal") as handled:
             dispatch(self.session, "/goal do the thing")
         handled.assert_called_once_with(self.session, "do the thing")
 
@@ -581,19 +586,19 @@ class TodoListTest(_IsolatedSessionTest):
     # ---- dispatch ------------------------------------------------------
 
     def test_todo_is_in_the_command_table(self):
-        from mantra.console import SLASH_COMMANDS
+        from core.console import SLASH_COMMANDS
 
         self.assertIn("/todo", [c for c, _ in SLASH_COMMANDS])
 
     def test_todo_is_in_the_help_text(self):
-        from mantra.console import HELP_TEXT
+        from core.console import HELP_TEXT
 
         self.assertIn("/todo", HELP_TEXT)
 
     def test_dispatch_routes_to_the_todo_handler(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
-        with mock.patch("mantra.console._todo") as handled:
+        with mock.patch("core.console._todo") as handled:
             dispatch(self.session, "/todo add fix the header")
         handled.assert_called_once_with(self.session, "add fix the header")
 

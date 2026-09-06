@@ -23,13 +23,13 @@ from unittest import mock
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
-for _path in (os.path.join(_PROJECT_ROOT, "src"), _PROJECT_ROOT, _TESTS_DIR):
+for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-import mantra.console as console
-from mantra.console import SLASH_COMMANDS, dispatch
-from mantra.core.settings import add_endpoint, settings_path
-from test_console_session import make_session
+import core.console as console
+from core.console import SLASH_COMMANDS, dispatch
+from core.agent.settings import add_endpoint, settings_path
+from _helpers import make_session
 
 
 class TempSettings:
@@ -59,7 +59,7 @@ class NoBuiltinsTest(unittest.TestCase):
 
     def test_the_provider_registry_module_is_gone(self):
         with self.assertRaises(ImportError):
-            import mantra.core.providers  # noqa: F401
+            import core.agent.providers  # noqa: F401
 
     def test_provider_is_an_unknown_command(self):
         workspace = tempfile.mkdtemp(prefix="mantra-cmd-")
@@ -139,7 +139,7 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
         # With zero saved endpoints, /connect jumps straight into the
         # add-endpoint flow, so no menu is shown.
         for name in ("first", "second"):
-            from mantra.core.settings import remove_endpoint
+            from core.agent.settings import remove_endpoint
 
             remove_endpoint(name)
         menu, _ = self._run("/connect")
@@ -298,6 +298,65 @@ class HandEditableConfigTest(TempSettings, unittest.TestCase):
             self.assertTrue(dispatch(self.session, "/connect mine"))
         self.assertEqual(self.session.config["llm"]["base_url"], "https://mine.test/v1")
         self.assertEqual(self.session.config["llm"]["model"], "m1")
+
+
+class RedundantCommandCleanupTest(unittest.TestCase):
+    """Merged and removed commands stay merged and removed.
+
+    /clear and /reset were two bodies for one action; /paste was
+    superseded by the multiline composer (Shift+Enter, bracketed paste);
+    /skill is a hidden alias of /skills like /quit is of /exit.
+    """
+
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="mantra-clean-")
+        self.addCleanup(__import__("shutil").rmtree, self.workspace, True)
+        self.session = _session(self.workspace)
+
+    def test_reset_still_works_as_a_hidden_alias(self):
+        self.session.context.seed("sys", "task")
+        self.session.context.append({"role": "user", "content": "hi"})
+        self.session.goal = "remember this"
+        self.assertEqual(len(self.session.context.messages), 3)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            dispatch(self.session, "/reset")
+        # Same semantics as /clear: system prompt only, goal gone.
+        self.assertEqual(len(self.session.context.messages), 1)
+        self.assertEqual(self.session.context.messages[0]["role"], "system")
+        self.assertEqual(self.session.goal, "")
+        self.assertIn("cleared", buf.getvalue())
+
+    def test_reset_is_not_advertised(self):
+        self.assertFalse(any(c == "/reset" for c, _ in SLASH_COMMANDS))
+        # No help line of its own (an alias mention inside /clear is fine).
+        self.assertFalse(any(line.strip().startswith("/reset") for line in console.HELP_TEXT.splitlines()))
+
+    def test_paste_is_gone(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            dispatch(self.session, "/paste")
+        self.assertIn("unknown command", buf.getvalue())
+        self.assertFalse(any(c == "/paste" for c, _ in SLASH_COMMANDS))
+        self.assertNotIn("/paste", console.HELP_TEXT)
+
+    def test_skill_alias_is_hidden_but_works(self):
+        with mock.patch.object(console, "_skills") as skills:
+            with redirect_stdout(io.StringIO()):
+                dispatch(self.session, "/skill tdd")
+        skills.assert_called_once_with(self.session, "tdd")
+        self.assertFalse(any(c == "/skill" for c, _ in SLASH_COMMANDS))
+
+    def test_dashboard_steps_and_tools_are_gone(self):
+        for cmd in ("/dashboard", "/dash", "/steps", "/tools"):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                dispatch(self.session, cmd)
+            self.assertIn("unknown command", buf.getvalue(), cmd)
+            self.assertFalse(any(c == cmd for c, _ in SLASH_COMMANDS), cmd)
+        help_lines = [ln.strip() for ln in console.HELP_TEXT.splitlines()]
+        for cmd in ("/dashboard", "/steps", "/tools"):
+            self.assertFalse(any(ln.startswith(cmd) for ln in help_lines), cmd)
 
 
 if __name__ == "__main__":

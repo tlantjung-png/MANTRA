@@ -10,7 +10,7 @@ The interface layer declares those abstractions: language model clients, sandbox
 
 The implementation layer provides interchangeable concrete components for each abstraction. There are two language model clients, two sandboxes, a set of file, command, search, and web tools, two evaluators, and one structured logger.
 
-The outer layer provides assembly, configuration loading, and the user-facing entry points for interactive and headless operation. The registry maps configuration names to implementation classes.
+The outer layer provides assembly, configuration loading, and the user-facing entry points for interactive and headless operation. The registry maps configuration names to implementation classes. The layers are conceptual rather than separate directories: the contracts are declared in `core/types.py`, the concrete components live in the modules under `core/`, and the entry points are `core/main.py` and `core/console.py`.
 
 The central orchestrator is the only stateful component in the core. It is built via dependency injection with fully constructed collaborators and does not import concrete implementations. New clients, sandboxes, tools, evaluators, or loggers can be added by implementing an interface and registering the implementation, without modifying the core.
 

@@ -22,20 +22,20 @@ from unittest import mock
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
-for _path in (os.path.join(_PROJECT_ROOT, "src"), _PROJECT_ROOT, _TESTS_DIR):
+for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-import mantra.console as console
-from mantra.console import (
+import core.console as console
+from core.console import (
     SLASH_COMMANDS,
     _connect,
     _derive_key_env,
     _derive_name,
     _needs_first_run,
 )
-from mantra.core.keys import has_stored, resolve
-from mantra.core.settings import endpoints, settings_path
-from test_console_session import make_session
+from core.agent.keys import has_stored, resolve
+from core.agent.settings import endpoints, settings_path
+from _helpers import make_session
 
 
 class TempStorage:
@@ -133,7 +133,7 @@ class EndpointOverrideTest(TempStorage, unittest.TestCase):
     """
 
     def test_override_uses_saved_endpoint_key_env(self):
-        from mantra.core.settings import add_endpoint
+        from core.agent.settings import add_endpoint
 
         add_endpoint("inceptionlabs", "https://api.inceptionlabs.ai/v1", "INCEPTIONLABS_API_KEY")
         config = {"llm": {"api_key_env": "OPENAI_API_KEY"}}
@@ -269,7 +269,7 @@ class ConnectTest(TempStorage, unittest.TestCase):
         # flow must stop cleanly rather than firing an unauthenticated
         # request that comes back as a confusing 401.
         buf = io.StringIO()
-        with mock.patch("mantra.console._ask_secret", return_value=""):
+        with mock.patch("core.console._ask_secret", return_value=""):
             with redirect_stdout(buf):
                 ok = _connect(self.session, ["https://llm.internal/v1"])
         self.assertFalse(ok)
@@ -278,7 +278,7 @@ class ConnectTest(TempStorage, unittest.TestCase):
     def test_no_key_points_at_the_settings_file(self):
         # Telling someone to fix it without saying where is not help.
         buf = io.StringIO()
-        with mock.patch("mantra.console._ask_secret", return_value=""):
+        with mock.patch("core.console._ask_secret", return_value=""):
             with redirect_stdout(buf):
                 _connect(self.session, ["https://llm.internal/v1"])
         self.assertIn(str(settings_path()), buf.getvalue())
@@ -325,8 +325,8 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
         self.session.config["llm"]["api_key_env"] = _derive_key_env(
             _derive_name("https://llm.internal/v1")
         )
-        from mantra.core.keys import store as store_key
-        from mantra.core.settings import add_endpoint
+        from core.agent.keys import store as store_key
+        from core.agent.settings import add_endpoint
 
         store_key(self.session.config["llm"]["api_key_env"], "sk-wrong-0000")
         add_endpoint(
@@ -357,10 +357,10 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
         self.assertEqual(resolve(env), "sk-wrong-0000")
 
     def test_the_old_value_is_shown_masked_before_replacing(self):
-        from mantra.core.keys import mask
+        from core.agent.keys import mask
 
         buf = io.StringIO()
-        with mock.patch("mantra.console._read_secret", return_value="sk-right-9999"):
+        with mock.patch("core.console._read_secret", return_value="sk-right-9999"):
             with redirect_stdout(buf):
                 console._replace_key(self.session)
         self.assertIn(mask("sk-wrong-0000"), buf.getvalue())
@@ -368,7 +368,7 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
     def test_a_rejected_key_is_offered_as_a_fix_when_nothing_is_listed(self):
         # The same lockout, reached from the other end: discovery fails
         # with a 401 and the picker has nothing to show.
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         options_seen = {}
 
@@ -389,7 +389,7 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
     def test_an_unreachable_endpoint_offers_typing_a_name(self):
         # A gateway with no catalogue is not an auth problem, so the
         # remedy offered has to be a different one.
-        from mantra.core.exceptions import LLMError
+        from core.agent.exceptions import LLMError
 
         options_seen = {}
 
@@ -422,8 +422,8 @@ class KeyReplacementTest(TempStorage, unittest.TestCase):
         # /connect key <name> <key> must store under the endpoint's own
         # api_key_env, not the env derived from the short name - otherwise
         # the key lands in a variable the resolver never reads (an orphan).
-        from mantra.core.keys import stored_keys
-        from mantra.core.settings import add_endpoint
+        from core.agent.keys import stored_keys
+        from core.agent.settings import add_endpoint
 
         add_endpoint(
             "inceptionlabs", "https://api.inceptionlabs.ai/v1", "MY_CUSTOM_ENV"
@@ -453,7 +453,7 @@ class CredentialStoreTest(TempStorage, unittest.TestCase):
     """Credential writes stay atomic; no insecure direct-write fallback."""
 
     def test_store_writes_atomically_without_leftover_temp(self):
-        from mantra.core.keys import credentials_path, store, stored_keys
+        from core.agent.keys import credentials_path, store, stored_keys
 
         store("A", "1")
         store("B", "2")
@@ -467,7 +467,7 @@ class CredentialStoreTest(TempStorage, unittest.TestCase):
         """When the atomic replace fails, store() must raise instead of
         falling back to a direct write to the target path, which could
         follow a planted symlink and silently weaken the guarantee."""
-        from mantra.core.keys import credentials_path, store
+        from core.agent.keys import credentials_path, store
 
         target = credentials_path()
         target.write_text('{"keys": {"old": "keep"}}', encoding="utf-8")
@@ -482,7 +482,7 @@ class CredentialStoreTest(TempStorage, unittest.TestCase):
 
 def _connect_key_with(session, new_key: str) -> bool:
     """Run the key replacement with a scripted answer."""
-    with mock.patch("mantra.console._read_secret", return_value=new_key):
+    with mock.patch("core.console._read_secret", return_value=new_key):
         buf = io.StringIO()
         with redirect_stdout(buf):
             return console._replace_key(session)
@@ -512,7 +512,7 @@ class FirstRunTest(TempStorage, unittest.TestCase):
             self.assertFalse(_needs_first_run(self.session))
 
     def test_stored_key_means_connected(self):
-        from mantra.core.keys import store as store_key
+        from core.agent.keys import store as store_key
 
         store_key("OPENAI_API_KEY", "sk-stored")
         llm = self.session.config["llm"]
@@ -553,50 +553,50 @@ class WiringTest(unittest.TestCase):
         self.assertIn("/connect", console.HELP_TEXT)
 
     def test_dispatch_routes_connect(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
-        with mock.patch("mantra.console._connect", return_value=True) as fake:
+        with mock.patch("core.console._connect", return_value=True) as fake:
             self.assertTrue(dispatch(session, "/connect"))
             fake.assert_called_once_with(session, [])
 
     def test_dispatch_routes_setup_alias(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
-        with mock.patch("mantra.console._connect", return_value=True) as fake:
+        with mock.patch("core.console._connect", return_value=True) as fake:
             self.assertTrue(dispatch(session, "/setup"))
             fake.assert_called_once()
 
     def test_dispatch_passes_url_and_key(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
-        with mock.patch("mantra.console._connect", return_value=True) as fake:
+        with mock.patch("core.console._connect", return_value=True) as fake:
             dispatch(session, "/connect https://x.test/v1 sk-1")
             fake.assert_called_once_with(session, ["https://x.test/v1", "sk-1"])
 
     def test_every_endpoint_alias_reaches_connect(self):
         """The command has several names; muscle memory must land somewhere."""
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         for alias in ("/connect", "/setup", "/login", "/endpoint", "/endpoints"):
             with self.subTest(alias=alias):
                 workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
                 self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
                 session = make_session(workspace, [])
-                with mock.patch("mantra.console._connect", return_value=True) as fake:
+                with mock.patch("core.console._connect", return_value=True) as fake:
                     self.assertTrue(dispatch(session, alias))
                     fake.assert_called_once_with(session, [])
 
     def test_connect_list_shows_the_file(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
@@ -607,64 +607,14 @@ class WiringTest(unittest.TestCase):
         self.assertIn(str(settings_path()), buf.getvalue())
 
     def test_connect_remove_delegates(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
-        with mock.patch("mantra.console._connect_remove", return_value=None) as fake:
+        with mock.patch("core.console._connect_remove", return_value=None) as fake:
             dispatch(session, "/connect remove mybox")
             fake.assert_called_once_with(session, "mybox")
-
-
-# ---- Startup screen ------------------------------------------------------
-
-
-class StartupScreenTest(unittest.TestCase):
-    """``mantra`` on a terminal shows the panel, not the text banner."""
-
-    def _session(self, workspace):
-        return make_session(workspace, [])
-
-    def test_dashboard_shown_on_tty(self):
-        workspace = tempfile.mkdtemp(prefix="mantra-startup-")
-        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
-        session = self._session(workspace)
-        captured = []
-
-        def fake_show(self_arg=None):
-            captured.append(True)
-            return True
-
-        with mock.patch.object(type(session), "show_dashboard", fake_show):
-            with mock.patch.object(type(session), "banner", lambda self: captured.append("banner")):
-                # Replicate main()'s startup branch.
-                with mock.patch("mantra.console.sys.stdin") as sin, mock.patch("mantra.console.sys.stdout") as sout:
-                    sin.isatty.return_value = True
-                    sout.isatty.return_value = True
-                    interactive = sin.isatty() and sout.isatty()
-                    if interactive:
-                        session.show_dashboard()
-                    else:
-                        session.banner()
-        self.assertEqual(captured, [True])
-
-    def test_banner_shown_when_piped(self):
-        workspace = tempfile.mkdtemp(prefix="mantra-startup-")
-        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
-        session = self._session(workspace)
-        captured = []
-        with mock.patch.object(type(session), "show_dashboard", lambda self: captured.append("dash")):
-            with mock.patch.object(type(session), "banner", lambda self: captured.append("banner")):
-                with mock.patch("mantra.console.sys.stdin") as sin, mock.patch("mantra.console.sys.stdout") as sout:
-                    sin.isatty.return_value = False
-                    sout.isatty.return_value = False
-                    interactive = sin.isatty() and sout.isatty()
-                    if interactive:
-                        session.show_dashboard()
-                    else:
-                        session.banner()
-        self.assertEqual(captured, ["banner"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,701 @@
+"""Terminal backend: lifecycle, raw input decoding, event queue.
+
+One reader thread owns the terminal input and translates it into data
+events; the UI loop consumes the queue. Nothing here ever draws.
+
+Events:
+    Key(key, mods)      - "enter", "esc", "tab", "backspace", "delete",
+                          "up"/"down"/"left"/"right", "home", "end",
+                          "pageup", "pagedown", "ctrl+left", "ctrl+right",
+                          "newline" (insert line break), "ctrl+<letter>",
+                          or a single printable character.
+    Mouse(kind, button, x, y, mods) - kind: "press"|"drag"|"release"|"wheel";
+                          button: 0 left, 1 middle, 2 right, 64/65 wheel
+                          up/down; x/y are 0-based screen cells.
+    Paste(text)         - bracketed paste body (newlines preserved).
+    Resize(cols, rows)  - terminal geometry changed.
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import re
+import signal
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from core.term import term_size
+
+# How long the reader waits between size polls / stop checks.
+_POLL = 0.02
+
+_WHEEL_UP = 64
+_WHEEL_DOWN = 65
+
+
+@dataclass
+class Key:
+    key: str
+    mods: frozenset = field(default_factory=frozenset)
+
+
+@dataclass
+class Mouse:
+    kind: str  # press | drag | release | wheel
+    button: int
+    x: int
+    y: int
+    mods: frozenset = field(default_factory=frozenset)
+
+
+@dataclass
+class Paste:
+    text: str
+
+
+@dataclass
+class Resize:
+    cols: int
+    rows: int
+
+
+Event = Any
+
+# POSIX CSI final-byte tables (shared shape with the historical editor).
+_SPECIALS = {
+    "A": "up",
+    "B": "down",
+    "C": "right",
+    "D": "left",
+    "H": "home",
+    "F": "end",
+    "Z": "shift+tab",
+}
+_TILDES = {
+    "1": "home",
+    "2": "insert",
+    "3": "delete",
+    "4": "end",
+    "5": "pageup",
+    "6": "pagedown",
+    "7": "home",
+    "8": "end",
+}
+_CTRL_NAMES = {
+    0: "ctrl+space", 3: "ctrl+c", 4: "ctrl+d", 5: "ctrl+e", 6: "ctrl+f",
+    7: "ctrl+g", 8: "backspace", 9: "tab", 10: "newline", 11: "ctrl+k",
+    12: "ctrl+l", 13: "enter", 14: "ctrl+n", 15: "ctrl+o", 16: "ctrl+p",
+    17: "ctrl+q", 18: "ctrl+r", 19: "ctrl+s", 20: "ctrl+t", 21: "ctrl+u",
+    22: "ctrl+v", 23: "ctrl+w", 24: "ctrl+x", 25: "ctrl+y", 26: "ctrl+z",
+}
+
+_SGR_MOUSE = re.compile(r"^<(-?\d+);(\d+);(\d+)([Mm])")
+
+
+class Backend:
+    """Owns the terminal: raw mode, event decoding, frame writes."""
+
+    def __init__(self) -> None:
+        self.events: "queue.Queue[Event]" = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+        self._size: tuple[int, int] = (0, 0)
+        # POSIX self-pipe: a SIGWINCH handler writes one byte so the
+        # reader's select() wakes up and emits a Resize event.
+        self._winch_r = self._winch_w = -1
+        # Windows console mode to restore on exit.
+        self._saved_in_mode: int | None = None
+        self._saved_out_mode: int | None = None
+        self._stopped = False
+
+    # ── lifecycle ─────────────────────────────────────────────
+
+    # Mouse tracking (SGR) so reports arrive as structured records
+    # instead of being decomposed into keystrokes, plus bracketed paste
+    # for multi-line input. Mode 1002 (button-event tracking) is what
+    # delivers motion while a button is held - without it a terminal
+    # reports only press/release and drag selection can never start.
+    _MOUSE_ON = "\033[?1000h\033[?1002h\033[?1006h"
+    _MOUSE_OFF = "\033[?1000l\033[?1002l\033[?1003l\033[?1006l"
+    _PASTE_OFF = "\033[?2004l"
+
+    def start(self) -> None:
+        self._stopped = False
+        self._stop.clear()
+        self._size = term_size()
+        self._enter()
+        # Clear any tracking modes a crashed previous session may have
+        # left armed, then claim the modes this application services.
+        # Without the claim, mouse reports arrive decomposed into raw
+        # keystrokes and get typed into the prompt as literal text.
+        self.write(
+            "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1004l"
+            + self._MOUSE_ON
+            + "\033[?2004h"
+        )
+        # Alternate screen: the application owns the whole surface and
+        # restores the shell's screen on exit.
+        self.write("\033[?1049h\033[2J\033[H\033[?25h")
+        # Crash safety: a traceback must still restore the terminal.
+        import atexit
+
+        self._atexit = atexit.register(self.stop)
+        self._thread = threading.Thread(
+            target=self._read_loop, name="tui-input", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
+        self.write(self._MOUSE_OFF + self._PASTE_OFF + "\033[?25h\033[r\033[?1049l")
+        self._leave()
+        try:
+            import atexit
+
+            atexit.unregister(self.stop)
+        except Exception:
+            pass
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self._size
+
+    def write(self, text: str) -> None:
+        if os.name == "nt":
+            # Frames are pure escape sequences: if anything in the process
+            # tree cleared virtual-terminal processing, the next frame
+            # would paint as literal text. Verify on every frame (one
+            # syscall) and restore immediately when lost.
+            self._ensure_vt()
+        with self._write_lock:
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except UnicodeEncodeError:
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                sys.stdout.write(
+                    text.encode(enc, errors="replace").decode(enc, errors="replace")
+                )
+                sys.stdout.flush()
+
+    def _ensure_vt(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = wintypes.DWORD()
+            if (
+                handle in (None, 0, -1)
+                or not kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            ):
+                return
+            if not mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass
+
+    def current_size(self) -> tuple[int, int]:
+        """Poll the true size now (used for resize verification)."""
+        return term_size()
+
+    def emit_resize_if_changed(self) -> None:
+        cols, rows = self.current_size()
+        if (cols, rows) != self._size and rows > 0 and cols > 0:
+            self._size = (cols, rows)
+            self.events.put(Resize(cols, rows))
+
+    # ── platform setup ────────────────────────────────────────
+
+    def _enter(self) -> None:
+        if os.name == "nt":
+            self._enter_windows()
+        else:
+            self._enter_posix()
+
+    def _leave(self) -> None:
+        if os.name == "nt":
+            self._leave_windows()
+        else:
+            self._leave_posix()
+
+    def _enter_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        self._stdin_handle = kernel32.GetStdHandle(-10)
+        self._stdout_handle = kernel32.GetStdHandle(-11)
+        # VT output so escape sequences are interpreted.
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(self._stdout_handle, ctypes.byref(mode)):
+            self._saved_out_mode = mode.value
+            kernel32.SetConsoleMode(self._stdout_handle, mode.value | 0x0004)
+        # Input: mouse + window (resize) events; quick-edit selection is
+        # disabled because the application draws its own. VT-input mode
+        # (0x0200) is deliberately NOT enabled: it makes the pseudoconsole
+        # deliver the whole input as a raw VT byte stream — arrow keys
+        # decompose into escape garbage and backspace arrives as an
+        # invisible DEL character. Without it every key arrives as a
+        # proper virtual-key record, which is exactly what the decoder
+        # below consumes.
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(self._stdin_handle, ctypes.byref(mode)):
+            self._saved_in_mode = mode.value
+            new = mode.value | 0x0010 | 0x0008 | 0x0080
+            new &= ~0x0040  # ENABLE_QUICK_EDIT_MODE
+            new &= ~0x0200  # ENABLE_VIRTUAL_TERMINAL_INPUT
+            kernel32.SetConsoleMode(self._stdin_handle, new)
+
+    def _leave_windows(self) -> None:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        if self._saved_out_mode is not None:
+            kernel32.SetConsoleMode(self._stdout_handle, self._saved_out_mode)
+        if self._saved_in_mode is not None:
+            kernel32.SetConsoleMode(self._stdin_handle, self._saved_in_mode)
+
+    def _enter_posix(self) -> None:
+        import termios
+        import tty
+
+        try:
+            self._fd = sys.stdin.fileno()
+            self._saved_attr = termios.tcgetattr(self._fd)
+            tty.setraw(self._fd)
+        except (OSError, ValueError, termios.error):  # type: ignore[attr-defined]
+            self._fd = -1
+            self._saved_attr = None
+        # Self-pipe for SIGWINCH so resize wakes the reader immediately.
+        try:
+            self._winch_r, self._winch_w = os.pipe()
+            signal.signal(signal.SIGWINCH, self._on_winch)
+        except (OSError, ValueError):
+            self._winch_r = self._winch_w = -1
+
+    def _leave_posix(self) -> None:
+        import termios
+
+        if getattr(self, "_saved_attr", None) is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attr)
+            except Exception:
+                pass
+        try:
+            signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+        except (OSError, ValueError):
+            pass
+        for fd in (self._winch_r, self._winch_w):
+            if fd is not None and fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._winch_r = self._winch_w = -1
+
+    def _on_winch(self, signum: int, frame: Any) -> None:
+        try:
+            if self._winch_w >= 0:
+                os.write(self._winch_w, b"w")
+        except OSError:
+            pass
+
+    # ── reader thread ─────────────────────────────────────────
+
+    def _read_loop(self) -> None:
+        if os.name == "nt":
+            self._read_loop_windows()
+        else:
+            self._read_loop_posix()
+
+    # ── Windows: console input records ────────────────────────
+
+    def _read_loop_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = self._stdin_handle
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class KEY_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", wintypes.BOOL),
+                ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD),
+                ("wVirtualScanCode", wintypes.WORD),
+                ("uChar", ctypes.c_wchar),
+                ("dwControlKeyState", wintypes.DWORD),
+            ]
+
+        class MOUSE_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("dwMousePosition", COORD),
+                ("dwButtonState", wintypes.DWORD),
+                ("dwControlKeyState", wintypes.DWORD),
+                ("dwEventFlags", wintypes.DWORD),
+            ]
+
+        class WINDOW_RECORD(ctypes.Structure):
+            _fields_ = [("dwSize", COORD)]
+
+        class EVENT_UNION(ctypes.Union):
+            _fields_ = [("KeyEvent", KEY_RECORD), ("MouseEvent", MOUSE_RECORD), ("WindowEvent", WINDOW_RECORD)]
+
+        class INPUT_RECORD(ctypes.Structure):
+            _fields_ = [("EventType", wintypes.WORD), ("Event", EVENT_UNION)]
+
+        KEY_EVENT = 0x0001
+        MOUSE_EVENT = 0x0002
+        WINDOW_BUFFER_SIZE_EVENT = 0x0004
+        SHIFT = 0x0010
+        LEFT_CTRL = 0x0008
+        RIGHT_CTRL = 0x0004
+        LEFT_ALT = 0x0002
+        RIGHT_ALT = 0x0001
+
+        def mods_of(state: int) -> frozenset:
+            mods = set()
+            if state & SHIFT:
+                mods.add("shift")
+            if (state & LEFT_CTRL) or (state & RIGHT_CTRL):
+                mods.add("ctrl")
+            if (state & LEFT_ALT) or (state & RIGHT_ALT):
+                mods.add("alt")
+            return frozenset(mods)
+
+        last_buttons = 0
+        # ConPTY sometimes decomposes terminal control sequences (most
+        # importantly SGR mouse reports) into individual KEY_EVENTs. A
+        # sequence started by escape is accumulated here and either parsed
+        # back into a proper event or, when it turns out to be a plain
+        # escape press, handed through as one.
+        pending = ""
+        pending_at = 0.0
+        last_size_poll = 0.0
+        mouse_re = re.compile(r"\x1b\[<(-?\d+);(\d+);(\d+)([Mm])")
+
+        def flush_pending() -> None:
+            nonlocal pending
+            if pending:
+                for ch in pending:
+                    if ch == "\x1b":
+                        self.events.put(Key("esc"))
+                    elif ch >= " ":
+                        self.events.put(Key(ch))
+                pending = ""
+
+        while not self._stop.is_set():
+            # Resizes are not reliably delivered as records through a
+            # pseudoconsole, so the size is polled on a timer regardless
+            # of how busy the input stream is.
+            now = time.monotonic()
+            if now - last_size_poll >= 0.2:
+                last_size_poll = now
+                self.emit_resize_if_changed()
+            if pending and now - pending_at > 0.1:
+                flush_pending()
+            count = wintypes.DWORD()
+            if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
+                time.sleep(_POLL)
+                continue
+            if not count.value:
+                # Nothing queued: still watch for resizes that arrive
+                # without input records.
+                self.emit_resize_if_changed()
+                time.sleep(_POLL)
+                continue
+            records = (INPUT_RECORD * min(count.value, 64))()
+            read = wintypes.DWORD()
+            if not kernel32.ReadConsoleInputW(handle, records, len(records), ctypes.byref(read)):
+                time.sleep(_POLL)
+                continue
+            for i in range(read.value):
+                rec = records[i]
+                etype = rec.EventType
+                if etype == WINDOW_BUFFER_SIZE_EVENT:
+                    self.emit_resize_if_changed()
+                    continue
+                if etype == KEY_EVENT:
+                    key = rec.Event.KeyEvent
+                    if not key.bKeyDown:
+                        continue
+                    mods = mods_of(key.dwControlKeyState)
+                    ch = key.uChar
+                    # Sequence reassembly: an escape character opens a
+                    # possible control sequence; when the accumulated
+                    # text starts with an SGR mouse report it becomes a
+                    # Mouse event (prefix-matched so a burst of reports
+                    # in one buffer is consumed one report at a time).
+                    if pending:
+                        pending += ch
+                        m = mouse_re.match(pending)
+                        if m:
+                            button, col, row = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                            if button in (_WHEEL_UP, _WHEEL_DOWN):
+                                kind = "wheel"
+                            elif button & 32:  # SGR drag bit: motion with a button held
+                                kind = "drag"
+                                button = 0
+                            else:
+                                kind = "press" if m.group(4) == "M" else "release"
+                            self.events.put(
+                                Mouse(kind, button, max(0, col - 1), max(0, row - 1), mods)
+                            )
+                            # Consume only the matched report: a drag burst
+                            # can pack several reports into one buffer and
+                            # the ones before the tail must not be lost.
+                            pending = pending[len(m.group(0)):]
+                        elif len(pending) > 32:
+                            flush_pending()
+                        pending_at = time.monotonic()
+                        continue
+                    if ch == "\x1b":
+                        if pending:
+                            flush_pending()
+                        pending = ch
+                        pending_at = time.monotonic()
+                        continue
+                    for ev in self._win_key_to_event(key, mods):
+                        self.events.put(ev)
+                    continue
+                if etype == MOUSE_EVENT:
+                    m = rec.Event.MouseEvent
+                    x = max(0, int(m.dwMousePosition.X))
+                    y = max(0, int(m.dwMousePosition.Y))
+                    flags = m.dwEventFlags
+                    buttons = m.dwButtonState & 0xFFFF
+                    if flags & 0x0004:  # wheel
+                        delta = (m.dwButtonState >> 16) & 0xFFFF
+                        direction = -1 if delta & 0x8000 else 1
+                        if delta == 0:
+                            continue
+                        self.events.put(
+                            Mouse(
+                                "wheel",
+                                _WHEEL_UP if direction > 0 else _WHEEL_DOWN,
+                                x,
+                                y,
+                                mods_of(m.dwControlKeyState),
+                            )
+                        )
+                        continue
+                    if flags & 0x0001:  # move
+                        if buttons:
+                            self.events.put(Mouse("drag", self._primary_button(buttons, last_buttons), x, y, frozenset()))
+                        continue
+                    # Click press/release (flags == 0 or double-click flag)
+                    changed = buttons ^ last_buttons
+                    last_buttons = buttons
+                    if changed & 0x0001:
+                        kind = "press" if buttons & 0x0001 else "release"
+                        self.events.put(Mouse(kind, 0, x, y, mods_of(m.dwControlKeyState)))
+                    if changed & 0x0002 and buttons & 0x0002:
+                        self.events.put(Mouse("press", 2, x, y, mods_of(m.dwControlKeyState)))
+                    continue
+
+    @staticmethod
+    def _primary_button(current: int, previous: int) -> int:
+        for bit, name in ((0x0001, 0), (0x0002, 2), (0x0004, 1)):
+            if current & bit and previous & bit:
+                return name
+        return 0
+
+    def _win_key_to_event(self, key: Any, mods: frozenset) -> list[Event]:
+        vk = key.wVirtualKeyCode
+        ch = key.uChar
+        ctrl = "ctrl" in mods
+        # Escape and a few others are identified by virtual key: their
+        # character form is ambiguous with control codes.
+        if vk == 0x1B:
+            return [Key("esc", mods)]
+        # Control characters arrive as their control code in uChar. A NUL
+        # uChar means the key carries no character at all (arrows, function
+        # keys): it must fall through to the virtual-key lookup below
+        # instead of being misread as Ctrl+Space.
+        if ch and ord(ch) < 32 and ch != "\x00":
+            name = _CTRL_NAMES.get(ord(ch))
+            if name == "enter" and "shift" in mods:
+                return [Key("newline", mods)]
+            return [Key(name or ch, mods)] if name else []
+        if ch and ord(ch) >= 32:
+            if ctrl and ch.isalpha():
+                return [Key("ctrl+" + ch.lower(), mods)]
+            if "shift" in mods and vk == 0x0D:
+                return [Key("newline", mods)]
+            if vk == 0x0D:
+                return [Key("enter", mods)]
+            if vk == 0x09:
+                return [Key("shift+tab" if "shift" in mods else "tab", mods)]
+            return [Key(ch, mods)]
+        named = {
+            0x21: "pageup", 0x22: "pagedown", 0x23: "end", 0x24: "home",
+            0x25: "left", 0x26: "up", 0x27: "right", 0x28: "down",
+            0x2D: "insert", 0x2E: "delete", 0x0D: "enter", 0x09: "tab",
+            0x08: "backspace", 0x20: " ",
+        }
+        name = named.get(vk)
+        if name is None:
+            return []
+        if ctrl and vk == 0x20:  # Ctrl+Space (NUL) keeps its control identity
+            return [Key("ctrl+space", mods)]
+        if ctrl and name in ("left", "right"):
+            return [Key("ctrl+" + name, mods)]
+        if name == "enter" and "shift" in mods:
+            return [Key("newline", mods)]
+        return [Key(name, mods)]
+
+    # ── POSIX: byte stream parser ─────────────────────────────
+
+    def _read_loop_posix(self) -> None:
+        import select
+
+        fd = getattr(self, "_fd", -1)
+        if fd < 0:
+            return
+        pending = ""
+        last_buttons = 0
+        while not self._stop.is_set():
+            timeout = 0.05 if pending else 0.2
+            watch = [fd]
+            if self._winch_r >= 0:
+                watch.append(self._winch_r)
+            try:
+                ready, _, _ = select.select(watch, [], [], timeout)
+            except (OSError, ValueError):
+                ready = [fd]
+            if self._winch_r >= 0 and self._winch_r in ready:
+                try:
+                    os.read(self._winch_r, 64)
+                except OSError:
+                    pass
+                self.emit_resize_if_changed()
+                continue
+            if fd not in ready:
+                if pending and time.monotonic() - getattr(self, "_pending_at", 0.0) > 0.05:
+                    # An unterminated sequence: hand the escape back.
+                    for ch in pending:
+                        self._feed_char(ch)
+                    pending = ""
+                continue
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                continue
+            if not data:
+                continue
+            pending += data.decode("utf-8", errors="replace")
+            pending, last_buttons = self._parse_stream(pending, last_buttons)
+            if pending:
+                self._pending_at = time.monotonic()
+
+    def _parse_stream(self, buf: str, last_buttons: int) -> tuple[str, int]:
+        """Consume complete events from ``buf``; return the remainder."""
+        i = 0
+        n = len(buf)
+        while i < n:
+            ch = buf[i]
+            if ch == "\x1b":
+                consumed, event, last_buttons = self._parse_escape(
+                    buf[i:], last_buttons
+                )
+                if consumed == 0:
+                    break  # incomplete; wait for more bytes
+                if event is not None:
+                    self.events.put(event)
+                i += consumed
+                continue
+            name = _CTRL_NAMES.get(ord(ch)) if ord(ch) < 32 else None
+            if name is not None:
+                self.events.put(Key(name))
+                i += 1
+                continue
+            if ord(ch) >= 32 or ch == " ":
+                self.events.put(Key(ch))
+            i += 1
+        return buf[i:], last_buttons
+
+    def _parse_escape(self, seq: str, last_buttons: int) -> tuple[int, Event | None, int]:
+        """Parse one escape sequence at the start of ``seq``.
+
+        Returns (bytes consumed, event or None, new button state).
+        Zero consumption means the sequence is incomplete.
+        """
+        if len(seq) < 2:
+            return 0, None, last_buttons
+        if seq[1] == "[":
+            body = seq[2:]
+            if not body:
+                return 0, None, last_buttons
+            # Bracketed paste start: 200~ ... 201~
+            if body.startswith("200"):
+                idx = seq.find("\x1b[201~")
+                if idx < 0:
+                    return 0, None, last_buttons
+                text = seq[5:idx]
+                return idx + 6, Paste(text), last_buttons
+            # SGR mouse: < button ; col ; row M|m
+            if body.startswith("<"):
+                m = _SGR_MOUSE.match(body)
+                if not m:
+                    return (1, None, last_buttons) if len(body) >= 32 else (0, None, last_buttons)
+                button = int(m.group(1))
+                col = max(0, int(m.group(2)) - 1)
+                row = max(0, int(m.group(3)) - 1)
+                pressed = m.group(4) == "M"
+                if button in (_WHEEL_UP, _WHEEL_DOWN):
+                    return len(m.group(0)) + 2, Mouse("wheel", button, col, row), last_buttons
+                if button & 32:  # motion bit: drag with a button held
+                    return len(m.group(0)) + 2, Mouse("drag", 0, col, row), last_buttons
+                kind = "press" if pressed else "release"
+                return len(m.group(0)) + 2, Mouse(kind, 0, col, row), last_buttons
+            # Ordinary CSI: parameters then final byte.
+            m = re.match(r"^([0-9;]*)([A-Za-z~])", body)
+            if not m:
+                if len(body) > 32:
+                    return 2, None, last_buttons
+                return 0, None, last_buttons
+            params, final = m.group(1), m.group(2)
+            consumed = 2 + len(m.group(0))
+            if final == "~":
+                name = _TILDES.get(params or final)
+                return consumed, (Key(name) if name else None), last_buttons
+            if params in ("1;5", "1;2"):
+                if final in ("C", "D"):
+                    name = ("ctrl+" if params == "1;5" else "alt+") + ("right" if final == "C" else "left")
+                    return consumed, Key(name), last_buttons
+                if final in ("A", "B"):
+                    return consumed, None, last_buttons
+            if final in ("u",) and params in ("13;2", "13"):
+                return consumed, Key("newline" if params == "13;2" else "enter"), last_buttons
+            name = _SPECIALS.get(final)
+            if name:
+                return consumed, Key(name), last_buttons
+            return consumed, None, last_buttons
+        if seq[1] == "O":
+            if len(seq) < 3:
+                return 0, None, last_buttons
+            name = _SPECIALS.get(seq[2])
+            return 3, (Key(name) if name else None), last_buttons
+        # Alt+key or bare escape.
+        if seq[1] >= " ":
+            return 2, None, last_buttons
+        return 1, Key("esc"), last_buttons
+
+    def _feed_char(self, ch: str) -> None:
+        name = _CTRL_NAMES.get(ord(ch)) if ord(ch) < 32 else None
+        self.events.put(Key(name or ch))

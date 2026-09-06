@@ -14,10 +14,10 @@ import unittest
 from unittest import mock
 
 # Bootstrap imports so the suite runs from a checkout without installation.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
 
-import mantra.core.skills as skills
-from mantra.console import ConsoleSession, Style, _skills
+import core.agent.skills as skills
+from core.console import ConsoleSession, Style, _skills
 
 FIXTURE_SKILL = """---
 name: {name}
@@ -236,8 +236,8 @@ class CommandTest(unittest.TestCase):
         _write(os.path.join(self.root, "INDEX.md"), INDEX)
         _write(os.path.join(self.root, "BUNDLES.md"), BUNDLES)
 
-        from mantra.config import merge_defaults
-        from mantra.implementations.llm.mock_client import ScriptedLLMClient
+        from core.config import merge_defaults
+        from core.scripted import ScriptedLLMClient
 
         self.session = ConsoleSession(
             config=merge_defaults({}),
@@ -384,19 +384,19 @@ class CommandTest(unittest.TestCase):
         self.assertIn(skills._OVERRIDE_ENV, self._shown())
 
     def test_skills_is_in_the_command_table(self):
-        from mantra.console import SLASH_COMMANDS
+        from core.console import SLASH_COMMANDS
 
         self.assertIn("/skills", [c for c, _ in SLASH_COMMANDS])
 
     def test_skills_is_in_the_help_text(self):
-        from mantra.console import HELP_TEXT
+        from core.console import HELP_TEXT
 
         self.assertIn("/skills", HELP_TEXT)
 
     def test_dispatch_routes_to_the_skills_handler(self):
-        from mantra.console import dispatch
+        from core.console import dispatch
 
-        with mock.patch("mantra.console._skills") as handled:
+        with mock.patch("core.console._skills") as handled:
             dispatch(self.session, "/skills show tdd")
         handled.assert_called_once_with(self.session, "show tdd")
 
@@ -488,8 +488,8 @@ class AutoRouteTest(SkillsFixtureTest):
             self.addCleanup(os.environ.pop, var, None)
         self.settings_file = os.path.join(self.tmp, "config.json")
         os.environ["MANTRA_SETTINGS"] = self.settings_file
-        from mantra.config import merge_defaults
-        from mantra.implementations.llm.mock_client import ScriptedLLMClient
+        from core.config import merge_defaults
+        from core.scripted import ScriptedLLMClient
 
         self.session = ConsoleSession(
             config=merge_defaults({}),
@@ -557,7 +557,7 @@ class AutoRouteTest(SkillsFixtureTest):
         self.assertEqual(self.session.active_skills, [])
 
     def test_a_stored_preference_beats_the_config_file(self):
-        from mantra.core import settings as settings_module
+        from core.agent import settings as settings_module
 
         settings_module.set_skills_prefs(auto=False)
         self.session.config["skills"]["auto"] = True
@@ -586,7 +586,7 @@ class AutoRouteTest(SkillsFixtureTest):
         # Routing reads one request; leaving its guess attached would
         # saddle every later turn with a procedure nobody asked for.
         with mock.patch.object(self.session, "_install_sigint"):
-            with mock.patch("mantra.console.AgentLoop") as loop:
+            with mock.patch("core.console.AgentLoop") as loop:
                 loop.return_value.run.return_value = None
                 self.session.handle("reproduce a failure")
         self.assertEqual(self.session.active_skills, [])
@@ -600,8 +600,8 @@ class AutoCommandTest(SkillsFixtureTest):
         super().setUp()
         self.addCleanup(os.environ.pop, "MANTRA_SETTINGS", None)
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
-        from mantra.config import merge_defaults
-        from mantra.implementations.llm.mock_client import ScriptedLLMClient
+        from core.config import merge_defaults
+        from core.scripted import ScriptedLLMClient
 
         self.session = ConsoleSession(
             config=merge_defaults({}),
@@ -622,26 +622,26 @@ class AutoCommandTest(SkillsFixtureTest):
         self.assertIn("on", self._shown())
 
     def test_turning_it_off_is_recorded(self):
-        from mantra.core import settings as settings_module
+        from core.agent import settings as settings_module
 
         _skills(self.session, "auto off")
         self.assertFalse(settings_module.skills_prefs()["auto"])
 
     def test_turning_it_back_on_is_recorded(self):
-        from mantra.core import settings as settings_module
+        from core.agent import settings as settings_module
 
         _skills(self.session, "auto off")
         _skills(self.session, "auto on")
         self.assertTrue(settings_module.skills_prefs()["auto"])
 
     def test_bundles_are_off_until_asked_for(self):
-        from mantra.core import settings as settings_module
+        from core.agent import settings as settings_module
 
         _skills(self.session, "auto bundle on")
         self.assertTrue(settings_module.skills_prefs()["auto_bundle"])
 
     def test_turning_bundles_off_again(self):
-        from mantra.core import settings as settings_module
+        from core.agent import settings as settings_module
 
         _skills(self.session, "auto bundle on")
         _skills(self.session, "auto bundle off")

@@ -27,9 +27,9 @@ project state (memory, known failures) instead of staying stateless.
 3. Seed the registry: if the repo's `knowledge/known-failures.md` exists, use its
    format as the template; keep only the header/format, not the incident history.
    Record workspace-specific failure classes there or in the workspace memory.
-4. Optional integrity chain: the repo ships `scripts/vault-verify.py` for checking
-   an existing `.mantra/vault` chain. Verification is read-only; initialization is
-   out of scope for this skill.
+4. Optional integrity chain: this repo does not ship vault tooling (integrity
+   chains were deliberately left behind - see docs/ADOPTION.md); skip this step
+   unless the target project already owns a chain and an external verifier.
 5. Record the adoption: add a Progress bullet to the memory ledger.
 
 ## Verification

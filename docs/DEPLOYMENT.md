@@ -12,7 +12,7 @@ The test-runner configuration points to a dedicated test directory and adjusts t
 
 The offline suite exercises the orchestration loop including final-answer handling, step-limit termination, unknown-tool resilience, empty-final and truncated-call retry budgets, and error paths. It covers context truncation with pinned messages, orphan avoidance, and looping-budget enforcement; configuration validation including context limits and unknown-key rejection; the read-before-edit contract including unread and stale-content rejection and partial-view handling; memory capping including single-line truncation; instruction-file discovery and preference order; the streaming parser including content accumulation, tool-call reassembly, and consecutive and total malformed-chunk limits; model discovery filtering and ranking; approval classification including wrapper handling; session persistence with size caps and legacy-name fallback; and file-tool safety checks including binary sampling and bulk limits.
 
-Interactive-layer tests cover the compact layout, the line editor, the completion popup, mouse and paste handling, workspace persistence, conversation continuity, turn-aware truncation, approval prompts, abort handling, and prompt forwarding, with explicit background opt-in. The suite is expected to pass without network access aside from the optional live probes, and the container-sandbox tests require a container runtime on the host.
+Interactive-layer tests cover the composer, the completion popup, mouse and paste handling, workspace persistence, conversation continuity, turn-aware truncation, approval prompts, abort handling, and prompt forwarding, with explicit background opt-in. The suite is expected to pass without network access aside from the optional live probes, and the container-sandbox tests require a container runtime on the host.
 
 ## Environment Promotion
 
@@ -36,7 +36,7 @@ The container sandbox runs every command inside an ephemeral container with memo
 
 The system writes one structured record per event to an append-only file. Records include a timestamp, event name, and payload with task identifier, step, tool name, and result status including elapsed time and success flag. Monitoring consists of tailing this file and aggregating pass rates, step counts, tool error rates, and token usage including cache-hit metrics.
 
-The console also maintains per-turn totals and displays them in the status area, and the streaming path maintains a live token counter. An approval audit log records each tool decision with redacted arguments and rotates at a fixed size. A vault verification script replays the integrity chain of persisted ledgers and reports a tamper, missing-reference, or corrupt-chain verdict with a distinct exit code.
+The console also maintains per-turn totals and displays them in the status area, and the streaming path maintains a live token counter. An approval audit log records each tool decision with redacted arguments and rotates at a fixed size. A vault verification script is not shipped: integrity chains for persisted ledgers were deliberately left behind (see docs/ADOPTION.md).
 
 ### Backup
 
