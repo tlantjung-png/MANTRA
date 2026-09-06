@@ -31,6 +31,33 @@ def _char_width(ch: str) -> int:
     return 1
 
 
+def enable_vt() -> None:
+    """Enable virtual-terminal processing on the Windows console.
+
+    ``os.system("")`` is the classic hack but depends on a cmd.exe child
+    initialising the shared console; setting the mode on the process's
+    own stdout handle is direct and works where the hack does not
+    (hosts that keep conhost in legacy mode). No-op elsewhere.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        if handle in (None, 0, -1):
+            return
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        if not mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
 def visible_len(text: str) -> int:
     """Printed width ignoring escapes; wide chars count as 2."""
     return sum(_char_width(c) for c in _ANSI_RE.sub("", text))

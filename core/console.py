@@ -57,7 +57,13 @@ from core.tui.overlays import Option
 from core.tui.composer import Completion
 from core.registry import build_llm, build_tools
 
-from core.term import force_utf8_output, safe_write, selection_in_progress, visible_len  # shared wide-aware impl
+from core.term import (
+    enable_vt,
+    force_utf8_output,
+    safe_write,
+    selection_in_progress,
+    visible_len,
+)  # shared wide-aware impl
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -125,7 +131,7 @@ class Style:
 
     def __init__(self, enabled: bool = True) -> None:
         if enabled and os.name == "nt":
-            os.system("")  # enable VT processing on Windows consoles
+            enable_vt()
         self.enabled = enabled
 
     def _wrap(self, code: str, text: str) -> str:
@@ -490,7 +496,7 @@ def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
             return style._wrap(theme.BONE_BOLD, heading) + chr(10) + style._wrap(theme.HAIR, chr(0x2500) * 40)
         if level == 2:
             return style._wrap(theme.BONE_BOLD, heading) + chr(10) + style._wrap(theme.HAIR, chr(0x2500) * 40)
-        return style._wrap(theme.ASH, heading)
+        return style._wrap(theme.BONE_BOLD, heading)
 
     # horizontal rule: hairline
     if stripped in ("---", "***", "___") and len(stripped) >= 3:
@@ -553,16 +559,11 @@ def render_markdown(text: str, style: Style) -> str:
                 _flush_table_buf()
             continue
         _flush_table_buf()
-        # Headings — bone bold; hairline under H1, ash for H3.
+        # Headings — bone bold; hairline under H1 and H2.
         if stripped.startswith("#"):
             level = len(stripped) - len(stripped.lstrip("#"))
             heading = stripped.lstrip("# ").rstrip()
-            if level == 1:
-                out_lines.append(style._wrap(theme.BONE_BOLD, heading))
-            elif level == 2:
-                out_lines.append(style._wrap(theme.BONE_BOLD, heading))
-            else:
-                out_lines.append(style._wrap(theme.ASH, heading))
+            out_lines.append(style._wrap(theme.BONE_BOLD, heading))
             if level <= 2:
                 out_lines.append(style._wrap(theme.HAIR, chr(0x2500) * 40))
             continue
@@ -5151,7 +5152,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.approve:
         config["approvals"] = args.approve
 
-    style = Style(enabled=not args.plain)
+    # Color follows the stream: a real terminal gets ANSI, a pipe or
+    # redirect gets clean text unless the operator forces color.
+    force_color = os.environ.get("MANTRA_FORCE_COLOR", "").lower() in ("1", "true", "yes")
+    style = Style(enabled=not args.plain and (sys.stdout.isatty() or force_color))
     workspace = args.workspace or _infer_workspace()
     session = ConsoleSession(config, workspace, style)
 
