@@ -94,6 +94,7 @@ HELP_TEXT = """Commands:
   /model                provider & model — add endpoint, pick a model
   /model key [name]     replace stored key
   /fix                  send the last failure to the agent for a fix
+  /sessions             saved conversations — list and resume
   /help                 show help
   /workspace            show workspace path + files
   /memory               show memory file
@@ -3269,6 +3270,7 @@ SLASH_COMMANDS = [
     ("/model", "provider & model — add endpoint, pick a model"),
     ("/model key", "replace stored key"),
     ("/fix", "send the last failure to the agent for a fix"),
+    ("/sessions", "saved conversations — list and resume (/resume)"),
     ("/help", "show help"),
     ("/workspace", "show workspace"),
     ("/memory", "show memory"),
@@ -5186,11 +5188,25 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     elif command == "/resume":
         parts = argument.split() if argument else []
         if not parts:
-            session.pick_session()
+            # In the TUI the bare form opens the navigable session
+            # panel; elsewhere it stays the text picker.
+            layout = session.layout
+            if layout is not None and layout.active and getattr(layout, "open_sessions", None):
+                layout.open_sessions()
+            else:
+                session.pick_session()
         elif parts[0] in ("list", "show"):
             session.show_sessions()
         else:
             session.resume_session(parts[0])
+    elif command == "/sessions":
+        # The session manager: the navigable panel in the TUI, the text
+        # picker elsewhere.
+        layout = session.layout
+        if layout is not None and layout.active and getattr(layout, "open_sessions", None):
+            layout.open_sessions()
+        else:
+            session.pick_session()
     elif command == "/goal":
         _goal(session, argument)
     elif command == "/todo":

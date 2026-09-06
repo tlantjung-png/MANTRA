@@ -18,8 +18,10 @@ from typing import Any
 
 from core import theme
 from core.term import visible_len
+from core.agent import sessions
 from core.diffparse import parse_diff
 from core.tui.review import ReviewState, render_review
+from core.tui.sessionpanel import SessionEntry, SessionPanelState, render_session_panel
 
 # style keys emitted by the review renderer -> theme SGR parameters
 _REVIEW_STYLE_SGR = {
@@ -87,6 +89,24 @@ class LayoutBridge:
         if files:
             self.app.review = ReviewState(files=files)
             self.app.mark_dirty()
+
+    def open_sessions(self) -> None:
+        """Open the session manager panel from the saved sessions."""
+        entries = [
+            SessionEntry(
+                name=e.get("name") or "?",
+                workspace=e.get("workspace") or "",
+                model=e.get("model") or "",
+                turns=int(e.get("turns", 0) or 0),
+                saved_at=e.get("saved_at") or "",
+                mtime=float(e.get("mtime") or 0),
+                summary=e.get("summary") or "",
+            )
+            for e in sessions.list_sessions()
+        ]
+        self.app.session_panel = SessionPanelState(entries=entries)
+        self.app.session_panel_on_enter = self.app.session.resume_session
+        self.app.mark_dirty()
 
     @property
     def app_scrolls(self) -> bool:
@@ -252,6 +272,8 @@ class TuiApp:
         self._history: list[str] = []      # submitted prompts, newest last
         self._history_idx = 0              # len() = the fresh (empty) slot
         self.review: ReviewState | None = None  # full-screen diff review, if open
+        self.session_panel: SessionPanelState | None = None  # session manager, if open
+        self.session_panel_on_enter = None  # callable(name) -> resume a session
 
         self.busy = False
         self.busy_label = "Channeling"
@@ -557,6 +579,10 @@ class TuiApp:
             if isinstance(event, Key):
                 self._handle_review_key(event.key, event.mods)
             return
+        if self.session_panel is not None:
+            if isinstance(event, Key):
+                self._handle_session_panel_key(event.key, event.mods)
+            return
         if isinstance(event, Paste):
             if isinstance(self.overlay, LinePrompt):
                 self.overlay.insert(event.text)
@@ -832,6 +858,12 @@ class TuiApp:
         # Full-screen diff review replaces the whole chrome.
         if self.review is not None:
             self._render_review_frame(buf, styles, cols, rows)
+            renderer.flush()
+            return
+        # Session manager panel replaces the whole chrome too.
+        if self.session_panel is not None:
+            self._render_session_panel_frame(buf, styles, cols, rows)
+            renderer.flush()
             return
 
         composer_height = self._composer_height(rows)
@@ -1015,6 +1047,56 @@ class TuiApp:
             review.next_file(-1 if key == "h" or (key == "tab" and "shift" in mods) else 1)
         elif key == "s":
             review.split = not review.split
+        self.mark_dirty()
+
+    # ── session manager panel ────────────────────────────────
+
+    def _render_session_panel_frame(self, buf, styles, cols: int, rows: int) -> None:
+        panel = self.session_panel
+        frame = render_session_panel(panel, cols, rows)
+        panel.clamp(frame.total, max(1, rows - 2))
+        buf.set_styled_line(0, 0, _styled(frame.header[:cols], theme.BONE_BOLD), styles, cols)
+        body_top = 1
+        body_bottom = rows - 2
+        for y, row in enumerate(frame.rows):
+            if body_top + y > body_bottom:
+                break
+            buf.set_styled_line(0, body_top + y, _styled(row.text, _REVIEW_STYLE_SGR.get(row.style)), styles, cols)
+        buf.set_styled_line(0, rows - 1, _styled(frame.footer[:cols], theme.FAINT), styles, cols)
+
+    def _handle_session_panel_key(self, key: str, mods: frozenset) -> None:
+        panel = self.session_panel
+        if panel is None:
+            return
+        total = len(panel.entries)
+        viewport = max(1, self.rows - 2)
+        if key in ("q", "esc"):
+            self.session_panel = None
+        elif key in ("up", "k"):
+            panel.next(-1, total)
+            panel.offset = min(panel.offset, panel.index)
+        elif key in ("down", "j"):
+            panel.next(1, total)
+            if panel.index >= panel.offset + viewport:
+                panel.offset = panel.index - viewport + 1
+        elif key in ("pageup", "pagedown"):
+            step = max(3, viewport - 2)
+            panel.next(-step if key == "pageup" else step, total)
+            panel.offset = max(0, min(total - viewport, panel.index))
+        elif key in ("home", "end"):
+            panel.index = 0 if key == "home" else max(0, total - 1)
+            panel.offset = max(0, panel.index - viewport + 1) if key == "end" else 0
+        elif key in ("enter", "return"):
+            entry = panel.entry
+            self.session_panel = None
+            if entry is not None and self.session_panel_on_enter is not None:
+                # Resume on a worker thread: it restores state and
+                # prints into the transcript through the layout bridge.
+                import threading
+
+                threading.Thread(
+                    target=self.session_panel_on_enter, args=(entry.name,), daemon=True
+                ).start()
         self.mark_dirty()
 
     def _border_text(self) -> str:

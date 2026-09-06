@@ -1,6 +1,9 @@
 """Tests for the full-screen diff review surface (renderer + state)."""
 
+import os
 import re
+import tempfile
+import time
 import unittest
 
 from core.diffparse import parse_diff
@@ -98,6 +101,70 @@ class ReviewAppIntegrationTest(unittest.TestCase):
         self.assertEqual(app.review.index, 0)
         app.handle_event(Key("q"))
         self.assertIsNone(app.review)
+
+
+class SessionPanelTest(unittest.TestCase):
+    """The session manager panel lists, renders, navigates and resumes."""
+
+    def _isolate(self):
+        store = tempfile.mkdtemp(prefix="mantra-sessions-")
+        prior = os.environ.get("MANTRA_SESSIONS")
+        os.environ["MANTRA_SESSIONS"] = store
+        self.addCleanup(os.environ.pop, "MANTRA_SESSIONS", None)
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, "MANTRA_SESSIONS", prior)
+        return store
+
+    def test_bridge_opens_and_lists_saved_sessions(self):
+        from core.agent import sessions
+        from tests.test_tui import _make_app
+
+        self._isolate()
+        sessions.save("alpha", {"workspace": "C:/x/a", "model": "gpt-4o",
+                                "messages": [{"role": "user", "content": "hi"}]})
+        app, session, _ = _make_app([])
+        session.layout.open_sessions()
+        self.assertIsNotNone(app.session_panel)
+        self.assertTrue(any(e.name == "alpha" for e in app.session_panel.entries))
+
+    def test_panel_renders_rows_and_closes_on_escape(self):
+        import re
+
+        from core.agent import sessions
+        from core.tui.app import Key
+        from tests.test_tui import _make_app
+
+        self._isolate()
+        sessions.save("alpha", {"workspace": "C:/x/a", "model": "gpt-4o",
+                                "messages": [{"role": "user", "content": "fix the build"}]})
+        app, session, backend = _make_app([])
+        session.layout.open_sessions()
+        app.render_frame()
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", "".join(backend.writes))
+        self.assertIn("sessions (1)", plain)
+        self.assertIn("alpha", plain)
+        self.assertIn("Enter resume", plain)
+        app.handle_event(Key("esc"))
+        self.assertIsNone(app.session_panel)
+
+    def test_enter_resumes_the_selected_session(self):
+        from core.agent import sessions
+        from core.tui.app import Key
+        from tests.test_tui import _make_app
+
+        self._isolate()
+        sessions.save("alpha", {"workspace": "C:/x/a", "model": "gpt-4o",
+                                "messages": [{"role": "user", "content": "hi"}]})
+        app, session, _ = _make_app([])
+        session.layout.open_sessions()
+        captured = []
+        app.session_panel_on_enter = lambda name: captured.append(name)
+        app.handle_event(Key("enter"))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not captured:
+            time.sleep(0.02)
+        self.assertEqual(captured, ["alpha"])
+        self.assertIsNone(app.session_panel)
 
 
 if __name__ == "__main__":
