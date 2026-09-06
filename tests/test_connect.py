@@ -198,6 +198,25 @@ class ConnectTest(TempStorage, unittest.TestCase):
             self.session.known_models, ["my-model-a", "my-model-b"]
         )
 
+    def test_large_catalogue_offers_a_model_choice_first(self):
+        # OpenRouter-style: hundreds of models must not dump straight
+        # into the menu; the operator picks how to find a model first.
+        from core.agent.settings import add_endpoint
+
+        add_endpoint("mine", "https://big.test/v1", "", [])
+        self.assertTrue(self.session.use_endpoint("mine"))
+        with mock.patch.object(console, "fetch_models",
+                               return_value=[f"model-{i}" for i in range(80)]), \
+             mock.patch.object(console, "_menu",
+                               side_effect=[console.SHOW_FIRST_MODELS, "model-3", None]) as menu:
+            with redirect_stdout(io.StringIO()):
+                ok = console._choose_model(self.session)
+        self.assertTrue(ok)
+        first_options = [o.value for o in menu.call_args_list[0][0][2]]
+        self.assertIn(console.SHOW_ALL_MODELS, first_options)
+        self.assertIn(console.SHOW_FIRST_MODELS, first_options)
+        self.assertEqual(self.session.config["llm"]["model"], "model-3")
+
     def test_the_menu_is_offered_every_model_the_endpoint_serves(self):
         with mock.patch.object(console, "_menu", return_value=None) as menu:
             with mock.patch("urllib.request.urlopen", return_value=_Resp(CATALOGUE)):
@@ -546,11 +565,11 @@ class FirstRunTest(TempStorage, unittest.TestCase):
 class WiringTest(unittest.TestCase):
     """The command is reachable from everywhere the operator might try."""
 
-    def test_connect_in_slash_commands(self):
-        self.assertTrue(any(c == "/connect" for c, _ in SLASH_COMMANDS))
+    def test_model_in_slash_commands(self):
+        self.assertTrue(any(c == "/model" for c, _ in SLASH_COMMANDS))
 
-    def test_connect_in_help_text(self):
-        self.assertIn("/connect", console.HELP_TEXT)
+    def test_model_in_help_text(self):
+        self.assertIn("/model", console.HELP_TEXT)
 
     def test_dispatch_routes_connect(self):
         from core.console import dispatch
@@ -558,7 +577,7 @@ class WiringTest(unittest.TestCase):
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
-        with mock.patch("core.console._connect", return_value=True) as fake:
+        with mock.patch("core.console._model_command", return_value=True) as fake:
             self.assertTrue(dispatch(session, "/connect"))
             fake.assert_called_once_with(session, [])
 
@@ -568,7 +587,7 @@ class WiringTest(unittest.TestCase):
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
-        with mock.patch("core.console._connect", return_value=True) as fake:
+        with mock.patch("core.console._model_command", return_value=True) as fake:
             self.assertTrue(dispatch(session, "/setup"))
             fake.assert_called_once()
 
@@ -582,7 +601,7 @@ class WiringTest(unittest.TestCase):
             dispatch(session, "/connect https://x.test/v1 sk-1")
             fake.assert_called_once_with(session, ["https://x.test/v1", "sk-1"])
 
-    def test_every_endpoint_alias_reaches_connect(self):
+    def test_every_endpoint_alias_reaches_the_merged_command(self):
         """The command has several names; muscle memory must land somewhere."""
         from core.console import dispatch
 
@@ -591,7 +610,7 @@ class WiringTest(unittest.TestCase):
                 workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
                 self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
                 session = make_session(workspace, [])
-                with mock.patch("core.console._connect", return_value=True) as fake:
+                with mock.patch("core.console._model_command", return_value=True) as fake:
                     self.assertTrue(dispatch(session, alias))
                     fake.assert_called_once_with(session, [])
 

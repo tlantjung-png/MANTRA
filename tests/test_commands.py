@@ -80,15 +80,18 @@ class NoBuiltinsTest(unittest.TestCase):
         # advertising two commands for one choice is how they drift.
         self.assertFalse(any(c == "/reasoning" for c, _ in SLASH_COMMANDS))
 
-    def test_connect_and_model_are_offered_first(self):
-        # The two commands a new user needs come first in the list.
+    def test_model_is_offered_first_and_connect_is_merged_away(self):
+        # /connect merged into /model: one command is advertised.
         names = [c for c, _ in SLASH_COMMANDS]
-        self.assertEqual(names[:2], ["/connect", "/model"])
+        self.assertEqual(names[0], "/model")
+        self.assertNotIn("/connect", names)
 
     def test_help_mentions_the_settings_file(self):
         # "You can edit this by hand" is only true if help says where.
-        self.assertIn("/connect", console.HELP_TEXT)
         self.assertIn("/model", console.HELP_TEXT)
+        # /connect survives only as an inline alias note, never as its
+        # own command entry (leading-space line start).
+        self.assertNotIn("  /connect", console.HELP_TEXT)
 
 
 class MenuCommandsTest(TempSettings, unittest.TestCase):
@@ -128,22 +131,26 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
             menu, _ = self._run("/effort")
         menu.assert_called_once()
 
-    def test_bare_connect_opens_a_menu(self):
+    def test_bare_connect_opens_the_master_menu(self):
+        # /connect is an alias of /model: the bare form opens the one
+        # menu that manages providers and models together.
         menu, _ = self._run("/connect")
         menu.assert_called_once()
         values = [o.value for o in menu.call_args[0][2]]
-        self.assertIn("first", values)
-        self.assertIn("second", values)
+        self.assertIn(console.ADD_ENDPOINT, values)
+        self.assertIn(console.PICK_MODEL, values)
 
-    def test_connect_with_nothing_saved_skips_the_menu(self):
-        # With zero saved endpoints, /connect jumps straight into the
-        # add-endpoint flow, so no menu is shown.
+    def test_connect_with_nothing_saved_offers_the_add_entry(self):
+        # With zero saved endpoints the master menu still shows, leading
+        # with the single action a new user needs.
         for name in ("first", "second"):
             from core.agent.settings import remove_endpoint
 
             remove_endpoint(name)
         menu, _ = self._run("/connect")
-        menu.assert_not_called()
+        menu.assert_called_once()
+        values = [o.value for o in menu.call_args[0][2]]
+        self.assertEqual(values, [console.ADD_ENDPOINT])
 
     def test_bare_approve_opens_a_menu(self):
         menu, _ = self._run("/approve")
@@ -152,7 +159,8 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
 
     def test_choose_from_the_menu_actually_applies(self):
         with mock.patch.object(console, "fetch_models", return_value=["gpt-4o"]), \
-             mock.patch.object(console, "_menu", return_value="gpt-4o"):
+             mock.patch.object(console, "_menu",
+                               side_effect=[console.PICK_MODEL, "gpt-4o", None]):
             with redirect_stdout(io.StringIO()):
                 dispatch(self.session, "/model")
         self.assertEqual(self.session.config["llm"]["model"], "gpt-4o")
@@ -269,7 +277,7 @@ class HandEditableConfigTest(TempSettings, unittest.TestCase):
         self.session.config["llm"]["base_url"] = "https://mine.test/v1"
 
         with mock.patch.object(console, "fetch_models", return_value=[]), \
-             mock.patch.object(console, "_menu", return_value=None) as menu:
+             mock.patch.object(console, "_menu", side_effect=[console.PICK_MODEL, None]) as menu:
             with redirect_stdout(io.StringIO()):
                 dispatch(self.session, "/model")
         # The hand-written entry, plus the way out when the endpoint

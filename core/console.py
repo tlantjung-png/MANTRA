@@ -91,9 +91,8 @@ def _resolve_data_path(*parts: str) -> str:
 KNOWN_FAILURES_PATH = _resolve_data_path("knowledge", "known-failures.md")
 
 HELP_TEXT = """Commands:
-  /connect              add/switch endpoint — URL + key
-  /connect key [name]   replace stored key
-  /model                pick model — menu or /model <name> [effort]
+  /model                provider & model — add endpoint, pick a model
+  /model key [name]     replace stored key  (/connect is an alias)
   /help                 show help
   /workspace            show workspace path + files
   /memory               show memory file
@@ -3218,8 +3217,7 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
 
 
 SLASH_COMMANDS = [
-    ("/connect", "add/switch endpoint — URL + key"),
-    ("/model", "pick model — menu or /model <name>"),
+    ("/model", "provider & model — add endpoint, pick a model (/connect alias)"),
     ("/connect key", "replace stored key"),
     ("/help", "show help"),
     ("/workspace", "show workspace"),
@@ -4382,6 +4380,23 @@ def _choose_model(session: "ConsoleSession") -> bool:
         for m in fetched:
             if m not in all_by_model:
                 all_by_model[m] = name or "current"
+        # A very large catalogue (an aggregator like OpenRouter) is a
+        # wall of names: let the operator choose how to find a model
+        # before the full menu opens.
+        if len(fetched) > _LARGE_MODEL_CATALOGUE and name:
+            how = _menu(session, f"{len(fetched)} models at {name}", [
+                Option(value=SHOW_ALL_MODELS, hint="type to filter as you go"),
+                Option(value=SHOW_FIRST_MODELS, hint=f"first {_FIRST_MODEL_WINDOW} from the list"),
+                Option(value=TYPE_A_MODEL, hint="if you already know the name"),
+            ], allow_filter=False)
+            if how == TYPE_A_MODEL:
+                return _type_a_model(session)
+            if how == SHOW_FIRST_MODELS:
+                window = set(sorted(fetched)[:_FIRST_MODEL_WINDOW])
+                all_by_model = {m: p for m, p in all_by_model.items() if m in window or p != name}
+            elif not how:
+                return False
+            # SHOW_ALL_MODELS (or a cancel) falls through to the menu.
     elif not all_by_model:
         # No stored models anywhere and fetch failed
         if not base_url:
@@ -4727,6 +4742,116 @@ def _connect_remove(session: "ConsoleSession", name: str) -> None:
         session._print(session.style.warn(f"  no endpoint named '{name}'"))
 
 
+# ---------------------------------------------------------------- /model
+
+# A catalogue this large (an aggregator such as OpenRouter) is a wall of
+# names: offer the operator a choice of how to find a model instead of
+# dumping the whole list into a menu.
+_LARGE_MODEL_CATALOGUE = 40
+_FIRST_MODEL_WINDOW = 20
+
+ADD_ENDPOINT = "+ add a provider / endpoint"
+PICK_MODEL = "pick a model"
+SWITCH_ENDPOINT_ENTRY = "switch endpoint"
+REMOVE_ENDPOINT_ENTRY = "remove an endpoint"
+SHOW_ALL_MODELS = "pick from the full list"
+SHOW_FIRST_MODELS = "show the first few models"
+
+
+def _model_help(session: "ConsoleSession") -> None:
+    """The merged provider-and-model help (/model; /connect is an alias)."""
+    s = session.style
+    session._print(s.bold("  /model — provider & model, one place"))
+    session._print(s.dim("  usage:"))
+    session._print("    /model                          — menu: add a provider, pick a model")
+    session._print("    /model <name>                   — switch to a model directly")
+    session._print("    /model <name> <effort>          — switch and set reasoning")
+    session._print("    /model <url> [key] [model]      — add a provider, then pick a model")
+    session._print("    /model <endpoint-name>          — switch provider")
+    session._print("    /model list                     — show saved providers")
+    session._print("    /model remove <name>            — delete a provider")
+    session._print("    /model key [name]               — replace a stored key")
+    session._print(s.dim("  /connect still works as an alias of /model."))
+    session._print(s.dim("  effort: off | minimal | low | medium | high | xhigh"))
+    session._print(s.dim("  examples: /model gpt-4o   ·   /model gpt-5 high   ·   /model https://api.openai.com/v1"))
+
+
+def _model_master(session: "ConsoleSession") -> bool:
+    """The simple entry for non-technical operators: one menu manages the
+    provider and the model together."""
+    eps = known_endpoints()
+    model = session.config.get("llm", {}).get("model", "?")
+    current = session.endpoint_name or "no endpoint"
+    options = [Option(value=ADD_ENDPOINT, hint="paste a URL like https://api.openai.com/v1")]
+    if eps:
+        options.append(Option(value=PICK_MODEL, hint="from the endpoint's catalogue"))
+        options.append(Option(value=TYPE_A_MODEL, hint="not listed above"))
+        if len(eps) > 1:
+            options.append(Option(value=SWITCH_ENDPOINT_ENTRY, hint=""))
+        options.append(Option(value=REMOVE_ENDPOINT_ENTRY, hint=""))
+    choice = _menu(session, f"model & endpoint — {current} · {model}", options, allow_filter=False)
+    if not choice:
+        llm = session.config.get("llm", {})
+        session._print(f"model      {llm.get('model', '?')}")
+        session._print(f"endpoint   {llm.get('base_url', '?')}")
+        return False
+    if choice == ADD_ENDPOINT:
+        _connect_new(session)
+    elif choice == PICK_MODEL:
+        _choose_model(session)
+    elif choice == TYPE_A_MODEL:
+        _type_a_model(session)
+    elif choice == SWITCH_ENDPOINT_ENTRY:
+        picked = _connect_choose_endpoint(session)
+        if not picked:
+            return False
+        if picked == NEW_ENDPOINT:
+            _connect_new(session)
+        elif session.use_endpoint(picked):
+            _choose_model(session)
+    elif choice == REMOVE_ENDPOINT_ENTRY:
+        names = sorted(known_endpoints().keys())
+        if not names:
+            session._print(session.style.dim("  no endpoints to remove"))
+        else:
+            picked = _menu(session, "Remove endpoint", [Option(value=n, label=n, hint=known_endpoints()[n].get("base_url", "")) for n in names])
+            if picked:
+                _connect_remove(session, picked)
+    return True
+
+
+def _model_command(session: "ConsoleSession", parts: list[str]) -> bool:
+    """The single provider-and-model command.
+
+    /model is the name; /connect (and /setup, /login, /endpoint) are
+    aliases. The bare form opens one simple menu; one-liners cover the
+    rest so scripts and power users keep working.
+    """
+    if not parts:
+        return _model_master(session)
+    first = parts[0].lower()
+    if first in ("help", "-h", "--help", "?", "h"):
+        _model_help(session)
+        return True
+    # Endpoint management and the <url> [key] [model] add-form reuse the
+    # existing /connect logic.
+    if first in ("list", "show", "remove", "forget", "delete", "rm", "key", "keys") or "://" in first:
+        return _connect(session, parts)
+    saved = known_endpoints().get(first)
+    if saved:
+        # /model <endpoint-name> — switch provider (then pick a model).
+        return _connect(session, parts)
+    # Otherwise it is a model name, with an optional reasoning effort.
+    effort = parts[1] if len(parts) > 1 and parts[1] in (*REASONING_EFFORTS, "off") else None
+    if effort is not None:
+        _apply_model(session, parts[0], effort)
+    else:
+        # A bare model name still asks about reasoning as part of the
+        # same choice.
+        _apply_model(session, parts[0], _pick_effort(session, parts[0]))
+    return True
+
+
 def show_keys(session: "ConsoleSession") -> None:
     """List stored keys by masked value only - never the key itself."""
     known = stored_keys()
@@ -4934,33 +5059,10 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         session.show_diff()
     elif command == "/undo":
         session.undo_changes()
-    elif command == "/model":
-        parts = argument.split()
-        if not parts:
-            # No argument: the menu. Effort is part of the same choice,
-            # so /reasoning is not a separate stop any more.
-            if not _choose_model(session):
-                llm = session.config.get("llm", {})
-                session._print(f"model      {llm.get('model', '?')}")
-                session._print(f"endpoint   {llm.get('base_url', '?')}")
-        elif parts[0].lower() in ("help", "-h", "--help", "?", "h"):
-            s = session.style
-            session._print(s.bold("  /model — pick a model"))
-            session._print(s.dim("  usage:"))
-            session._print("    /model                       — pick from endpoint catalogue")
-            session._print("    /model <name>                — switch to model directly")
-            session._print("    /model <name> <effort>       — switch and set reasoning")
-            session._print("    /model help                  — show this help")
-            session._print(s.dim("  effort: off | minimal | low | medium | high | xhigh"))
-            session._print(s.dim("  examples:"))
-            session._print("    /model gpt-4o")
-            session._print("    /model gpt-5 high")
-            session._print("    /model meta-llama-3")
-        elif len(parts) >= 2:
-            # "/model gpt-5 high" sets both in one go.
-            _apply_model(session, parts[0], parts[1])
-        else:
-            _apply_model(session, parts[0], _pick_effort(session, parts[0]))
+    elif command in ("/model", "/connect", "/setup", "/login", "/endpoint", "/endpoints"):
+        # One command for providers and models; /connect and friends are
+        # aliases that keep old muscle memory and scripts working.
+        _model_command(session, argument.split())
     elif command in ("/reasoning", "/effort"):
         # Reasoning is a property of the model, so this is now the model
         # menu. Kept as an alias so muscle memory still lands somewhere.
@@ -4968,36 +5070,6 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             session.set_reasoning(argument)
         elif not _choose_model(session):
             session.show_reasoning()
-    elif command in ("/connect", "/setup", "/login", "/endpoint", "/endpoints"):
-        args = argument.split()
-        if args and args[0] in ("remove", "forget", "delete"):
-            if len(args) >= 2:
-                _connect_remove(session, args[1])
-            else:
-                eps = sorted(known_endpoints().keys())
-                if not eps:
-                    session._print(session.style.dim("  no endpoints to remove"))
-                else:
-                    choice = _menu(session, "Remove endpoint", [Option(value=n, label=n, hint=known_endpoints()[n].get("base_url","")) for n in eps])
-                    if choice:
-                        _connect_remove(session, choice)
-        elif args and args[0] == "keys":
-            show_keys(session)
-        elif args and args[0] == "key":
-            if len(args) >= 2:
-                _replace_key(session, args[1])
-            else:
-                eps = sorted(known_endpoints().keys())
-                if not eps:
-                    session._print(session.style.dim("  no endpoints yet - add one with /connect"))
-                else:
-                    choice = _menu(session, "Replace key for", [Option(value=n, label=n, hint=known_endpoints()[n].get("base_url","")) for n in eps])
-                    if choice:
-                        _replace_key(session, choice)
-                    else:
-                        _replace_key(session, "")
-        else:
-            _connect(session, args)
     elif command == "/approve":
         if not argument:
             # Modes are a fixed list, so they get a menu too.
