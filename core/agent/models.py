@@ -120,7 +120,7 @@ def fetch_models(
         if exc.code in (401, 403):
             raise LLMError(
                 f"the endpoint refused the key (HTTP {exc.code}). Check the "
-                f"key, or re-enter it with: /connect"
+                f"key, or re-enter it with: /model key"
             ) from exc
         if exc.code == 404:
             raise LLMError(

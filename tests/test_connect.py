@@ -571,38 +571,43 @@ class WiringTest(unittest.TestCase):
     def test_model_in_help_text(self):
         self.assertIn("/model", console.HELP_TEXT)
 
-    def test_dispatch_routes_connect(self):
+    def test_dispatch_routes_model(self):
         from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
         with mock.patch("core.console._model_command", return_value=True) as fake:
-            self.assertTrue(dispatch(session, "/connect"))
+            self.assertTrue(dispatch(session, "/model"))
             fake.assert_called_once_with(session, [])
 
-    def test_dispatch_routes_setup_alias(self):
+    def test_connect_is_no_longer_a_command(self):
+        # /connect was merged into /model and removed: the bare name is
+        # an unknown command now, never routed to the model manager.
         from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
+        buf = io.StringIO()
         with mock.patch("core.console._model_command", return_value=True) as fake:
-            self.assertTrue(dispatch(session, "/setup"))
-            fake.assert_called_once()
+            with redirect_stdout(buf):
+                self.assertTrue(dispatch(session, "/connect"))
+            fake.assert_not_called()
+        self.assertIn("unknown command", buf.getvalue())
 
-    def test_dispatch_passes_url_and_key(self):
+    def test_dispatch_passes_url_and_key_under_model(self):
         from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
         with mock.patch("core.console._connect", return_value=True) as fake:
-            dispatch(session, "/connect https://x.test/v1 sk-1")
+            dispatch(session, "/model https://x.test/v1 sk-1")
             fake.assert_called_once_with(session, ["https://x.test/v1", "sk-1"])
 
-    def test_every_endpoint_alias_reaches_the_merged_command(self):
-        """The command has several names; muscle memory must land somewhere."""
+    def test_old_connect_aliases_are_no_longer_commands(self):
+        """/connect, /setup, /login, /endpoint were merged away."""
         from core.console import dispatch
 
         for alias in ("/connect", "/setup", "/login", "/endpoint", "/endpoints"):
@@ -610,11 +615,14 @@ class WiringTest(unittest.TestCase):
                 workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
                 self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
                 session = make_session(workspace, [])
+                buf = io.StringIO()
                 with mock.patch("core.console._model_command", return_value=True) as fake:
-                    self.assertTrue(dispatch(session, alias))
-                    fake.assert_called_once_with(session, [])
+                    with redirect_stdout(buf):
+                        self.assertTrue(dispatch(session, alias))
+                    fake.assert_not_called()
+                self.assertIn("unknown command", buf.getvalue())
 
-    def test_connect_list_shows_the_file(self):
+    def test_model_list_shows_the_file(self):
         from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
@@ -622,17 +630,17 @@ class WiringTest(unittest.TestCase):
         session = make_session(workspace, [])
         buf = io.StringIO()
         with redirect_stdout(buf):
-            dispatch(session, "/connect list")
+            dispatch(session, "/model list")
         self.assertIn(str(settings_path()), buf.getvalue())
 
-    def test_connect_remove_delegates(self):
+    def test_model_remove_delegates(self):
         from core.console import dispatch
 
         workspace = tempfile.mkdtemp(prefix="mantra-dispatch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         session = make_session(workspace, [])
         with mock.patch("core.console._connect_remove", return_value=None) as fake:
-            dispatch(session, "/connect remove mybox")
+            dispatch(session, "/model remove mybox")
             fake.assert_called_once_with(session, "mybox")
 
 

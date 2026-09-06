@@ -92,7 +92,7 @@ KNOWN_FAILURES_PATH = _resolve_data_path("knowledge", "known-failures.md")
 
 HELP_TEXT = """Commands:
   /model                provider & model — add endpoint, pick a model
-  /model key [name]     replace stored key  (/connect is an alias)
+  /model key [name]     replace stored key
   /help                 show help
   /workspace            show workspace path + files
   /memory               show memory file
@@ -3080,7 +3080,7 @@ class ConsoleSession:
         entry = known_endpoints().get(name.lower())
         if entry is None:
             self._print(self.style.warn(f"  no endpoint named '{name}'"))
-            self._print(self.style.dim("  add one with /connect, or list them: /connect"))
+            self._print(self.style.dim("  add one with /model, or list them: /model"))
             return False
         llm = self.config.setdefault("llm", {})
         llm["base_url"] = entry["base_url"]
@@ -3118,7 +3118,7 @@ class ConsoleSession:
         self._print(self.style.warn(f"  warning: no key for ${key_env}"))
         self._print(
             self.style.dim(
-                f"  store one with /connect, or edit {settings_path()}"
+                f"  store one with /model, or edit {settings_path()}"
             )
         )
 
@@ -3128,7 +3128,7 @@ class ConsoleSession:
         current = (llm.get("base_url") or "").rstrip("/")
         known = known_endpoints()
         if not known:
-            self._print(self.style.dim("  no endpoints yet - add one with /connect"))
+            self._print(self.style.dim("  no endpoints yet - add one with /model"))
             # Name the file even here: an empty list is exactly when
             # somebody is most likely to want to type one in by hand.
             self._print(self.style.dim(f"  or add one to {settings_path()}"))
@@ -3153,7 +3153,7 @@ class ConsoleSession:
                 f"  {marker} {name:<12} {entry['base_url']:<38}"
                 f" {self.style.dim(tail)}"
             )
-        self._print(self.style.dim("  * = current. add or switch: /connect"))
+        self._print(self.style.dim("  * = current. add or switch: /model"))
         self._print(self.style.dim(f"  or edit by hand: {settings_path()}"))
 
     def banner(self) -> None:
@@ -3196,7 +3196,7 @@ class ConsoleSession:
 
 # There are no built-in endpoints. Everything MANTRA knows about lives
 # in the user's own settings file, which is hand-editable and is
-# written by /connect. See core/settings.py for the shape.
+# written by /model. See core/settings.py for the shape.
 
 # Endpoints reached over localhost that accept any key or none at all.
 KEYLESS_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0")
@@ -3217,8 +3217,8 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
 
 
 SLASH_COMMANDS = [
-    ("/model", "provider & model — add endpoint, pick a model (/connect alias)"),
-    ("/connect key", "replace stored key"),
+    ("/model", "provider & model — add endpoint, pick a model"),
+    ("/model key", "replace stored key"),
     ("/help", "show help"),
     ("/workspace", "show workspace"),
     ("/memory", "show memory"),
@@ -3328,10 +3328,6 @@ class ConsoleCompleter:
         stripped = buffer.lstrip()
         if stripped.startswith("/model "):
             return self._complete_model(cursor, token)
-        if stripped.startswith("/connect"):
-            c = self._complete_connect(buffer, start, cursor, token)
-            if c:
-                return c
         if stripped.startswith("/skills") or stripped.startswith("/skill "):
             c = self._complete_skills(buffer, start, cursor, token)
             if c:
@@ -3351,7 +3347,14 @@ class ConsoleCompleter:
         lowered = token.lower()
         matches = [m for m in known if m.lower().startswith(lowered)]
         if not matches:
-            return None
+            # /model also manages providers: offer the subcommands and
+            # the saved endpoint names alongside model names.
+            sub = [s for s in ("list", "remove", "key") if s.startswith(lowered)]
+            eps = [n for n in sorted(known_endpoints().keys()) if n.startswith(lowered)]
+            matches = sub + eps
+            if not matches:
+                return None
+            return Completion(items=matches, start=cursor - len(token), end=cursor)
         matches = matches[:50]
         labels = [m + ("   reasons" if is_reasoning_model(m) else "") for m in matches]
         return Completion(
@@ -3381,43 +3384,6 @@ class ConsoleCompleter:
         return Completion(
             items=["@" + m for m in matches], start=start, end=cursor, labels=matches
         )
-
-    def _complete_connect(self, buffer: str, start: int, cursor: int, token: str):
-        prefix = buffer[:start]
-        parts = prefix.strip().split()
-        if not parts or parts[0] != "/connect":
-            return None
-        if len(parts) == 1:
-            subcommands = ["list", "remove", "key", "keys", "show"]
-            endpoints = sorted(known_endpoints().keys())
-            candidates = subcommands + endpoints
-            lowered = token.lower()
-            matches = [c for c in candidates if c.lower().startswith(lowered)]
-            if not matches and lowered:
-                matches = [c for c in candidates if lowered in c.lower()]
-            if not matches:
-                return None
-            labels = []
-            for m in matches[:50]:
-                if m in endpoints:
-                    ep = known_endpoints()[m]
-                    labels.append(f"{m}  {ep.get('base_url','')}")
-                else:
-                    labels.append(m)
-            return Completion(items=matches[:50], start=start, end=cursor, labels=labels[:50])
-        elif len(parts) == 2:
-            sub = parts[1].lower()
-            if sub in ("remove", "forget", "delete", "rm", "key", "keys", "show", "list"):
-                endpoints = sorted(known_endpoints().keys())
-                lowered = token.lower()
-                matches = [e for e in endpoints if e.lower().startswith(lowered)]
-                if not matches and lowered:
-                    matches = [e for e in endpoints if lowered in e.lower()]
-                if not matches:
-                    return None
-                labels = [f"{m}  {known_endpoints()[m].get('base_url','')}" for m in matches[:50]]
-                return Completion(items=matches[:50], start=start, end=cursor, labels=labels)
-        return None
 
     def _complete_skills(self, buffer: str, start: int, cursor: int, token: str):
         # EASY: /skills space [anything] → shows matching skills, filtered by name/type
@@ -3637,10 +3603,10 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
             _skills_use(session, argument)
             return
         if skills.get(head):
-            # The first token is an exact skill name: attach it directly.
-            # A trailing reference ("/skills code-review @flappy.py") must
-            # not reroute the command into the fuzzy finder.
-            _skills_use(session, head)
+            # The first token is an exact skill name: attach it (bare),
+            # or run it once when a reference follows. The full argument
+            # carries the reference through to the one-shot path.
+            _skills_use(session, argument)
             return
         # Try find — if single hit, use it; else show options
         hits = skills.find(argument, limit=5)
@@ -3753,17 +3719,25 @@ def _skills_use(session: "ConsoleSession", name: str) -> None:
         session._print(session.style.dim("  usage: /skills <name>"))
         return
     found = skills.get(name)
+    rest = ""
     if found is None:
         # Tolerate a trailing reference ("use code-review @flappy.py"):
         # the first token being an exact skill name is what matters.
         head = name.split()[0].lower()
         if head != name.lower():
             found = skills.get(head)
+            rest = name.split(maxsplit=1)[1].strip()
     if found is None:
         cands = skills.find(name, limit=5)
         session._print(session.style.ember(f"  no skill named '{name}'"))
         if cands:
             session._print(session.style.dim("  did you mean: " + ", ".join(c.name for c in cands)))
+        return
+    if rest:
+        # A trailing reference ("/skills code-review @flappy.py") is a
+        # one-shot: run the skill once on those files, then detach - not
+        # an every-turn attachment.
+        _skills_one_shot(session, found, rest)
         return
     key = found.name.lower()
     if key in session.active_skills:
@@ -3773,6 +3747,26 @@ def _skills_use(session: "ConsoleSession", name: str) -> None:
     session.active_skills.append(key)
     session._print(session.style.dim(f"  attached '{found.name}' - it now rides along with every turn"))
     session._print(session.style.dim("  /skills clear to detach"))
+
+
+def _skills_one_shot(session: "ConsoleSession", found, reference: str) -> None:
+    """Run one skill once against the given reference, then detach.
+
+    "/skills code-review @flappy.py" runs code-review on the file for a
+    single turn instead of attaching it to every turn. The skill is
+    marked auto-attached so the turn's end detaches it again.
+    """
+    key = found.name.lower()
+    if key not in session.active_skills:
+        session.active_skills.append(key)
+        session.auto_attached.append(key)
+    _warn_untrusted_skill(session, found)
+    session._print(session.style.dim(f"  running '{found.name}' once on: {reference}"))
+    session.handle(f"Apply the {found.name} skill to: {reference}")
+    # handle detaches auto-attached skills at turn end; this guards the
+    # path where the turn aborts before its own cleanup runs.
+    session._detach_auto()
+    session._print(session.style.dim(f"  '{found.name}' ran once and is detached"))
 
 
 def _skills_use_all(session: "ConsoleSession") -> None:
@@ -4407,7 +4401,7 @@ def _choose_model(session: "ConsoleSession") -> bool:
     elif not all_by_model:
         # No stored models anywhere and fetch failed
         if not base_url:
-            session._print(session.style.warn("  no endpoint configured - /connect first"))
+            session._print(session.style.warn("  no endpoint configured - /model first"))
             return False
         return _rescue_catalogue(session, error)
     else:
@@ -4535,7 +4529,7 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     """Store a key over whatever is already there.
 
     Always prompts, even when a key is stored: a mistyped key used to
-    be permanent because /connect skipped the prompt once the store
+    be permanent because /model skipped the prompt once the store
     held any value at all.
     """
     s = session.style
@@ -4548,7 +4542,7 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     else:
         base_url = llm.get("base_url", "")
         if not base_url:
-            session._print(s.warn("  no endpoint to set a key for - /connect first"))
+            session._print(s.warn("  no endpoint to set a key for - /model first"))
             return False
         name = _derive_name(base_url)
         key_env = _derive_key_env(name)
@@ -4561,7 +4555,7 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
         # rescue a bad value that came from a variable. Say so rather
         # than accepting a key that will never be used.
         session._print(s.warn(f"  ${key_env} is set in this shell and wins over stored keys"))
-        session._print(s.dim(f"  clear it with: set {key_env}=   then re-run /connect key"))
+        session._print(s.dim(f"  clear it with: set {key_env}=   then re-run /model key"))
 
     stored = stored_keys().get(key_env, "")
     if stored:
@@ -4590,8 +4584,8 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
     if not url:
         url = _read_choice(session, "  endpoint url (e.g. https://api.openai.com/v1)> ").strip()
         if not url:
-            session._print(s.dim("  tip: paste a full URL, or try /connect list to see saved ones"))
-            session._print(s.dim("  examples: /connect https://api.openai.com/v1  ·  /connect https://api.meta.ai/v1"))
+            session._print(s.dim("  tip: paste a full URL, or try /model list to see saved ones"))
+            session._print(s.dim("  examples: /model https://api.openai.com/v1  ·  /model https://api.meta.ai/v1"))
             return False
     if "://" not in url:
         # Tolerate a host typed without a scheme rather than failing.
@@ -4629,7 +4623,7 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
             session._print(s.dim(f"  key stored ({mask(key)})"))
         elif not existing:
             session._print(s.warn("  no key given - skipping the fetch"))
-            session._print(s.dim("  store one later with /connect key, or add one to"))
+            session._print(s.dim("  store one later with /model key, or add one to"))
             session._print(s.dim(f"  {settings_path()}"))
             return False
         # else keep existing
@@ -4653,7 +4647,7 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
     picked = _choose_model(session)
     # If fetch failed or user cancelled, hint one-liner
     if not picked:
-        session._print(s.dim("  tip: /connect <url> <key> <model> to set in one go"))
+        session._print(s.dim("  tip: /model <url> <key> <model> to set in one go"))
     return picked
 
 
@@ -4661,25 +4655,9 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
     """Add or switch endpoints, then pick a model from the menu.
 
     Only a base URL and a key are needed; the catalogue comes from the
-    endpoint itself.
+    endpoint itself. /model is the command surface; this is the internal
+    endpoint flow behind it.
     """
-    if args and args[0].lower() in ("help", "-h", "--help", "?", "h"):
-        s = session.style
-        session._print(s.bold("  /connect — add or switch endpoint"))
-        session._print(s.dim("  usage:"))
-        session._print("    /connect                         — pick from saved or add new")
-        session._print("    /connect <url>                   — add endpoint, then pick model")
-        session._print("    /connect <url> <key>             — add with key, then pick model")
-        session._print("    /connect <url> <key> <model>     — add and set model directly")
-        session._print("    /connect <name>                  — switch to saved endpoint")
-        session._print("    /connect list                    — show saved endpoints")
-        session._print("    /connect remove <name>           — delete endpoint")
-        session._print("    /connect key [name]              — replace stored key")
-        session._print(s.dim("  examples:"))
-        session._print("    /connect https://api.openai.com/v1 sk-...")
-        session._print("    /connect https://api.meta.ai/v1")
-        session._print("    /connect groq")
-        return True
     # Subcommands first — before treating args as url
     if args and args[0].lower() in ("remove", "forget", "delete", "rm"):
         if len(args) >= 2:
@@ -4695,7 +4673,7 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
         return True
     if args and args[0].lower() in ("key", "keys"):
         if len(args) >= 3:
-            # /connect key <name> <key> — direct replace no prompt.
+            # /model key <name> <key> — direct replace no prompt.
             # The endpoint may carry a custom api_key_env; deriving the
             # env name from the short name would store an orphan key
             # under the wrong variable that the resolver never reads.
@@ -4711,10 +4689,10 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
             return _replace_key(session, args[1])
         return _replace_key(session, "")
     if len(args) >= 3:
-        # Scripted form: /connect <url> <key> <model>
+        # Scripted form: /model <url> <key> <model>
         return _connect_new(session, args[0], args[1], args[2])
     if len(args) >= 2:
-        # Scripted form: /connect <url> <key>
+        # Scripted form: /model <url> <key>
         return _connect_new(session, args[0], args[1])
     if len(args) == 1:
         if args[0].lower() in ("list", "show"):
@@ -4722,7 +4700,7 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
             return True
         # A saved endpoint's own name means "switch to it". Saved names
         # never contain a dot or a slash, so an exact match cannot be a
-        # host someone meant to add - and without this, `/connect groq`
+        # host someone meant to add - and without this, `/model groq`
         # would quietly invent https://groq and ask for a key.
         saved = known_endpoints().get(args[0].lower())
         if saved:
@@ -4760,13 +4738,14 @@ _FIRST_MODEL_WINDOW = 20
 ADD_ENDPOINT = "+ add a provider / endpoint"
 PICK_MODEL = "pick a model"
 SWITCH_ENDPOINT_ENTRY = "switch endpoint"
+REPLACE_KEY_ENTRY = "replace the api key"
 REMOVE_ENDPOINT_ENTRY = "remove an endpoint"
 SHOW_ALL_MODELS = "pick from the full list"
 SHOW_FIRST_MODELS = "show the first few models"
 
 
 def _model_help(session: "ConsoleSession") -> None:
-    """The merged provider-and-model help (/model; /connect is an alias)."""
+    """The merged provider-and-model help for /model."""
     s = session.style
     session._print(s.bold("  /model — provider & model, one place"))
     session._print(s.dim("  usage:"))
@@ -4778,7 +4757,6 @@ def _model_help(session: "ConsoleSession") -> None:
     session._print("    /model list                     — show saved providers")
     session._print("    /model remove <name>            — delete a provider")
     session._print("    /model key [name]               — replace a stored key")
-    session._print(s.dim("  /connect still works as an alias of /model."))
     session._print(s.dim("  effort: off | minimal | low | medium | high | xhigh"))
     session._print(s.dim("  examples: /model gpt-4o   ·   /model gpt-5 high   ·   /model https://api.openai.com/v1"))
 
@@ -4795,6 +4773,7 @@ def _model_master(session: "ConsoleSession") -> bool:
         options.append(Option(value=TYPE_A_MODEL, hint="not listed above"))
         if len(eps) > 1:
             options.append(Option(value=SWITCH_ENDPOINT_ENTRY, hint=""))
+        options.append(Option(value=REPLACE_KEY_ENTRY, hint=""))
         options.append(Option(value=REMOVE_ENDPOINT_ENTRY, hint=""))
     choice = _menu(session, f"model & endpoint — {current} · {model}", options, allow_filter=False)
     if not choice:
@@ -4816,6 +4795,16 @@ def _model_master(session: "ConsoleSession") -> bool:
             _connect_new(session)
         elif session.use_endpoint(picked):
             _choose_model(session)
+    elif choice == REPLACE_KEY_ENTRY:
+        names = sorted(known_endpoints().keys())
+        if len(names) == 1:
+            _replace_key(session, names[0])
+        elif names:
+            picked = _menu(session, "Replace key for", [Option(value=n, label=n, hint=known_endpoints()[n].get("base_url", "")) for n in names])
+            if picked:
+                _replace_key(session, picked)
+        else:
+            session._print(session.style.dim("  no endpoints yet - add one with /model"))
     elif choice == REMOVE_ENDPOINT_ENTRY:
         names = sorted(known_endpoints().keys())
         if not names:
@@ -4830,9 +4819,8 @@ def _model_master(session: "ConsoleSession") -> bool:
 def _model_command(session: "ConsoleSession", parts: list[str]) -> bool:
     """The single provider-and-model command.
 
-    /model is the name; /connect (and /setup, /login, /endpoint) are
-    aliases. The bare form opens one simple menu; one-liners cover the
-    rest so scripts and power users keep working.
+    The bare form opens one simple menu; one-liners cover the rest so
+    scripts and power users keep working.
     """
     if not parts:
         return _model_master(session)
@@ -4841,7 +4829,7 @@ def _model_command(session: "ConsoleSession", parts: list[str]) -> bool:
         _model_help(session)
         return True
     # Endpoint management and the <url> [key] [model] add-form reuse the
-    # existing /connect logic.
+    # internal _connect flow.
     if first in ("list", "show", "remove", "forget", "delete", "rm", "key", "keys") or "://" in first:
         return _connect(session, parts)
     saved = known_endpoints().get(first)
@@ -4864,7 +4852,7 @@ def show_keys(session: "ConsoleSession") -> None:
     known = stored_keys()
     if not known:
         session._print(session.style.dim("  no keys stored yet"))
-        session._print(session.style.dim("  /connect stores one when you add an endpoint"))
+        session._print(session.style.dim("  /model stores one when you add an endpoint"))
         return
     session._print(session.style.bold("  stored keys"))
     for name in sorted(known):
@@ -5066,9 +5054,9 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         session.show_diff()
     elif command == "/undo":
         session.undo_changes()
-    elif command in ("/model", "/connect", "/setup", "/login", "/endpoint", "/endpoints"):
-        # One command for providers and models; /connect and friends are
-        # aliases that keep old muscle memory and scripts working.
+    elif command == "/model":
+        # One command for providers and models; /connect is gone so a
+        # single name is advertised and nothing else drifts in.
         _model_command(session, argument.split())
     elif command in ("/reasoning", "/effort"):
         # Reasoning is a property of the model, so this is now the model

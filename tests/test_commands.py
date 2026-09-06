@@ -131,23 +131,23 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
             menu, _ = self._run("/effort")
         menu.assert_called_once()
 
-    def test_bare_connect_opens_the_master_menu(self):
-        # /connect is an alias of /model: the bare form opens the one
-        # menu that manages providers and models together.
-        menu, _ = self._run("/connect")
+    def test_bare_model_opens_the_master_menu(self):
+        # The bare form opens the one menu that manages providers and
+        # models together.
+        menu, _ = self._run("/model")
         menu.assert_called_once()
         values = [o.value for o in menu.call_args[0][2]]
         self.assertIn(console.ADD_ENDPOINT, values)
         self.assertIn(console.PICK_MODEL, values)
 
-    def test_connect_with_nothing_saved_offers_the_add_entry(self):
+    def test_model_with_nothing_saved_offers_the_add_entry(self):
         # With zero saved endpoints the master menu still shows, leading
         # with the single action a new user needs.
         for name in ("first", "second"):
             from core.agent.settings import remove_endpoint
 
             remove_endpoint(name)
-        menu, _ = self._run("/connect")
+        menu, _ = self._run("/model")
         menu.assert_called_once()
         values = [o.value for o in menu.call_args[0][2]]
         self.assertEqual(values, [console.ADD_ENDPOINT])
@@ -303,7 +303,7 @@ class HandEditableConfigTest(TempSettings, unittest.TestCase):
         # Editing the file is enough for MANTRA to accept the name.
         add_endpoint("mine", "https://mine.test/v1", "", ["m1"])
         with redirect_stdout(io.StringIO()):
-            self.assertTrue(dispatch(self.session, "/connect mine"))
+            self.assertTrue(dispatch(self.session, "/model mine"))
         self.assertEqual(self.session.config["llm"]["base_url"], "https://mine.test/v1")
         self.assertEqual(self.session.config["llm"]["model"], "m1")
 

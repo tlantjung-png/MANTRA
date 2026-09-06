@@ -526,7 +526,7 @@ class EndpointSwitchTest(unittest.TestCase):
     def test_saved_endpoint_sets_url_key_and_model(self):
         self._save("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY",
                    ["llama-3.1-8b-instant"])
-        out = self._capture(["/connect groq"])
+        out = self._capture(["/model groq"])
         llm = self.session.config["llm"]
         self.assertEqual(llm["base_url"], "https://api.groq.com/openai/v1")
         self.assertEqual(llm["api_key_env"], "GROQ_API_KEY")
@@ -551,20 +551,20 @@ class EndpointSwitchTest(unittest.TestCase):
         self.assertFalse(self.session.use_endpoint("notanendpoint"))
         self.assertEqual(self.session.config["llm"], before)
 
-    def test_unknown_name_points_at_connect(self):
+    def test_unknown_name_points_at_model(self):
         import io
         from contextlib import redirect_stdout
 
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             self.session.use_endpoint("notanendpoint")
-        self.assertIn("/connect", buffer.getvalue())
+        self.assertIn("/model", buffer.getvalue())
 
     def test_listing_marks_the_current_endpoint(self):
         self._save("first", "https://first.test/v1", "", ["m1"])
         self._save("second", "https://second.test/v1", "", ["m2"])
         self.session.use_endpoint("first")
-        out = self._capture(["/connect list"])
+        out = self._capture(["/model list"])
         self.assertIn("*", out)
         self.assertIn("first", out)
 

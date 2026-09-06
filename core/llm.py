@@ -281,7 +281,7 @@ class OpenAICompatClient(LLMClient):
             raise LLMError(
                 f"no API key available for '{self.api_key_env}'. Set that "
                 "environment variable, open a new terminal so it loads, or "
-                "store the key once with: /connect"
+                "store the key once with: /model key"
             )
 
         use_stream = self.stream and on_delta is not None

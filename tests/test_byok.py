@@ -544,7 +544,7 @@ class ModelDiscoveryTest(TempStorage, unittest.TestCase):
             with self.assertRaises(LLMError) as caught:
                 fetch_models("https://x/v1", "DISCOVERY_KEY")
         self.assertIn("refused the key", str(caught.exception))
-        self.assertIn("/connect", str(caught.exception))
+        self.assertIn("/model", str(caught.exception))
 
     def test_missing_catalogue_suggests_typing_it(self):
         from core.agent.exceptions import LLMError
@@ -732,7 +732,7 @@ class ModelMenuTest(TempStorage, unittest.TestCase):
                 ok = console._choose_model(self.session)
         self.assertFalse(ok)
         fetch.assert_not_called()
-        self.assertIn("/connect", buf.getvalue())
+        self.assertIn("/model", buf.getvalue())
 
     def test_the_pairing_is_remembered_for_next_time(self):
         self._pick(["o3-mini"], ["o3-mini", "low"])
