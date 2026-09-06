@@ -748,6 +748,25 @@ class MarkdownTableRenderTest(unittest.TestCase):
         # The raw pipe-run row must not survive as literal text.
         self.assertNotIn("| 1 |", out)
         self.assertNotIn("|---|", out)
+        # The column edge must not drift across a wrapped row: every
+        # line of a multi-line row keeps the same pipe column.
+        pipe_cols = [ln.find("\u2502") for ln in lines if "\u2502" in ln]
+        self.assertEqual(len(set(pipe_cols)), 1, pipe_cols)
+
+    def test_bold_cell_does_not_leak_markers_when_wrapped(self):
+        from core.console import render_markdown
+
+        md = (
+            "| A | B |\n"
+            "|---|---|\n"
+            "| **Core purpose** | helps wrap a very long sentence across several rows indeed |\n"
+        )
+        out = self._plain(render_markdown(md, self.style))
+        self.assertNotIn("**", out)
+        self.assertIn("Core purpose", out)
+        # Every continuation line keeps the column edge.
+        pipe_cols = [ln.find("\u2502") for ln in out.split("\n") if "\u2502" in ln]
+        self.assertEqual(len(set(pipe_cols)), 1, pipe_cols)
 
     def test_streaming_path_matches_batch_path(self):
         from core.console import StreamingRenderer, render_markdown

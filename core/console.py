@@ -62,8 +62,10 @@ from core.term import (
     force_utf8_output,
     safe_write,
     selection_in_progress,
+    term_size,
     visible_len,
 )  # shared wide-aware impl
+from core.tui.transcript import wrap_ansi  # styled-aware wrap for table cells
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -326,28 +328,6 @@ def _strip_inline_html(text: str) -> str:
     )
 
 
-def _wrap_plain(text: str, width: int) -> list[str]:
-    """Word-wrap plain text to ``width`` visible columns."""
-    if width <= 0:
-        return [text]
-    lines: list[str] = []
-    for para in text.split("\n"):
-        cur = ""
-        for word in para.split(" "):
-            trial = word if not cur else cur + " " + word
-            if not word or visible_len(trial) <= width:
-                cur = trial
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = word
-        if cur:
-            lines.append(cur)
-        elif not para:
-            lines.append("")
-    return lines or [""]
-
-
 def _render_table(rows: list[list[str]], style: Style) -> str:
     """Render a markdown table as an aligned grid.
 
@@ -368,13 +348,21 @@ def _render_table(rows: list[list[str]], style: Style) -> str:
     widths: list[int] = []
     for c in range(ncols):
         vals = [r[c] for r in all_rows if c < len(r) and r[c].strip()]
-        longest = max([visible_len(_strip_inline_html(v)) for v in vals] or [0])
+        # Measure the STYLED cell: **bold** and `code` markers are
+        # consumed by _inline_md, so raw-cell widths inflate the column
+        # and misalign continuation lines (the pipe column shifts).
+        longest = max(
+            [visible_len(_inline_md(_strip_inline_html(v), style)) for v in vals] or [0]
+        )
         cap = _TABLE_LAST_COL_CAP if c == ncols - 1 else _TABLE_COL_CAP
         widths.append(max(1, min(cap, longest)))
-    # Keep the grid inside a terminal width even when a column is huge:
-    # shrink the widest columns first so the transcript does not break
-    # the alignment at a hard wrap.
-    budget = 100 - 3 * (ncols - 1)
+    # Keep the grid inside the terminal (or a sane default when piped):
+    # a wider row breaks at the hard wrap and destroys the alignment.
+    try:
+        term_cols = term_size()[0]
+    except Exception:
+        term_cols = 80
+    budget = max(60, min(100, term_cols - 4)) - 3 * (ncols - 1)
     while sum(widths) > budget:
         widest = max(range(ncols), key=lambda c: widths[c])
         if widths[widest] <= 8:
@@ -385,17 +373,20 @@ def _render_table(rows: list[list[str]], style: Style) -> str:
         wrapped: list[list[str]] = []
         for c in range(ncols):
             v = cells[c] if c < len(cells) else ""
-            wrapped.append(_wrap_plain(_strip_inline_html(v), widths[c]))
+            # Wrap the STYLED cell (markers consumed) so **bold** spans
+            # never split across rows and continuation lines re-carry
+            # the open SGR.
+            styled = _inline_md(_strip_inline_html(v), style)
+            if bold and "\x1b[1" not in styled:
+                styled = style._wrap(theme.BONE_BOLD, styled)
+            wrapped.append(wrap_ansi(styled, widths[c]))
         height = max(len(w) for w in wrapped)
         out: list[str] = []
         for li in range(height):
             parts: list[str] = []
             for c in range(ncols):
-                txt = wrapped[c][li] if li < len(wrapped[c]) else ""
-                styled = _inline_md(txt, style)
-                if bold:
-                    styled = style._wrap(theme.BONE_BOLD, styled)
-                parts.append(styled + " " * (widths[c] - visible_len(txt)))
+                line = wrapped[c][li] if li < len(wrapped[c]) else ""
+                parts.append(line + " " * (widths[c] - visible_len(line)))
             pipe = style._wrap(theme.HAIR, "│")
             out.append(parts[0] + "".join(" " + pipe + " " + p for p in parts[1:]))
         return out
@@ -5154,8 +5145,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # Color follows the stream: a real terminal gets ANSI, a pipe or
     # redirect gets clean text unless the operator forces color.
-    force_color = os.environ.get("MANTRA_FORCE_COLOR", "").lower() in ("1", "true", "yes")
-    style = Style(enabled=not args.plain and (sys.stdout.isatty() or force_color))
+    # NO_COLOR (the cross-tool convention) always wins.
+    if args.plain or os.environ.get("NO_COLOR") is not None:
+        color_on = False
+    else:
+        mode = os.environ.get("MANTRA_COLOR", "auto").lower()
+        forced = os.environ.get("MANTRA_FORCE_COLOR", "").lower() in ("1", "true", "yes")
+        color_on = mode == "always" or (mode != "never" and (sys.stdout.isatty() or forced))
+    style = Style(enabled=color_on)
     workspace = args.workspace or _infer_workspace()
     session = ConsoleSession(config, workspace, style)
 
