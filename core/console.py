@@ -3636,22 +3636,23 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
         if skills.get(argument):
             _skills_use(session, argument)
             return
-        elif skills.get(head) and not rest:
-            # Single token like "load-skills-here" — use directly
+        if skills.get(head):
+            # The first token is an exact skill name: attach it directly.
+            # A trailing reference ("/skills code-review @flappy.py") must
+            # not reroute the command into the fuzzy finder.
             _skills_use(session, head)
             return
+        # Try find — if single hit, use it; else show options
+        hits = skills.find(argument, limit=5)
+        if len(hits) == 1:
+            _skills_use(session, hits[0].name)
+            return
+        elif hits:
+            _skills_find(session, argument)
+            return
         else:
-            # Try find — if single hit, use it; else show options
-            hits = skills.find(argument, limit=5)
-            if len(hits) == 1:
-                _skills_use(session, hits[0].name)
-                return
-            elif hits:
-                _skills_find(session, argument)
-                return
-            else:
-                _skills_show(session, argument)
-                return
+            _skills_show(session, argument)
+            return
 
 
 def _skills_help(session: "ConsoleSession") -> None:
@@ -3752,6 +3753,12 @@ def _skills_use(session: "ConsoleSession", name: str) -> None:
         session._print(session.style.dim("  usage: /skills <name>"))
         return
     found = skills.get(name)
+    if found is None:
+        # Tolerate a trailing reference ("use code-review @flappy.py"):
+        # the first token being an exact skill name is what matters.
+        head = name.split()[0].lower()
+        if head != name.lower():
+            found = skills.get(head)
     if found is None:
         cands = skills.find(name, limit=5)
         session._print(session.style.ember(f"  no skill named '{name}'"))
