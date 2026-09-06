@@ -5051,7 +5051,17 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             except OSError as exc:
                 session._print(session.style.ember(f"  cannot read memory: {exc}"))
     elif command == "/diff":
-        session.show_diff()
+        # In the TUI the changeset opens in the full-screen review;
+        # everywhere else it stays the plain text diff.
+        layout = session.layout
+        if layout is not None and layout.active:
+            diff = session._git("diff", "--no-color", "--unified=3") or ""
+            if diff and getattr(layout, "open_review", None):
+                layout.open_review(diff)
+            else:
+                session.show_diff()
+        else:
+            session.show_diff()
     elif command == "/undo":
         session.undo_changes()
     elif command == "/model":

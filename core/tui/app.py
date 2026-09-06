@@ -18,6 +18,24 @@ from typing import Any
 
 from core import theme
 from core.term import visible_len
+from core.diffparse import parse_diff
+from core.tui.review import ReviewState, render_review
+
+# style keys emitted by the review renderer -> theme SGR parameters
+_REVIEW_STYLE_SGR = {
+    "add": theme.SAGE,
+    "del": theme.EMBER,
+    "pair": None,
+    "ctx": None,
+    "dim": theme.FAINT,
+    "head": theme.BONE_BOLD,
+    "sel": theme.BONE_BOLD,
+    "sep": theme.HAIR,
+}
+
+
+def _styled(text: str, sgr: str | None) -> str:
+    return f"\x1b[{sgr}m{text}\x1b[0m" if sgr else text
 from core.term import ansi_strip as strip_ansi
 
 from core.tui.backend import Backend, Key, Mouse, Paste, Resize
@@ -62,6 +80,13 @@ class LayoutBridge:
     @property
     def active(self) -> bool:
         return self.app.running
+
+    def open_review(self, diff_text: str) -> None:
+        """Open the full-screen diff review for the given diff text."""
+        files = parse_diff(diff_text)
+        if files:
+            self.app.review = ReviewState(files=files)
+            self.app.mark_dirty()
 
     @property
     def app_scrolls(self) -> bool:
@@ -226,6 +251,7 @@ class TuiApp:
         self.dirty = True
         self._history: list[str] = []      # submitted prompts, newest last
         self._history_idx = 0              # len() = the fresh (empty) slot
+        self.review: ReviewState | None = None  # full-screen diff review, if open
 
         self.busy = False
         self.busy_label = "Channeling"
@@ -527,6 +553,10 @@ class TuiApp:
         if isinstance(event, Resize):
             self._pending_resize = (event.cols, event.rows, time.monotonic())
             return
+        if self.review is not None:
+            if isinstance(event, Key):
+                self._handle_review_key(event.key, event.mods)
+            return
         if isinstance(event, Paste):
             if isinstance(self.overlay, LinePrompt):
                 self.overlay.insert(event.text)
@@ -799,6 +829,11 @@ class TuiApp:
         select_style = styles.id_for(STYLE_SELECT)
         warn_style = styles.id_for(STYLE_WARN)
 
+        # Full-screen diff review replaces the whole chrome.
+        if self.review is not None:
+            self._render_review_frame(buf, styles, cols, rows)
+            return
+
         composer_height = self._composer_height(rows)
         content_top = 2
         content_bottom = rows - 2 - composer_height  # inclusive
@@ -935,6 +970,49 @@ class TuiApp:
             f"{label('CACHE:')} {st._wrap(theme.SAGE, rate)}",
         ]
         return (" " + st._wrap(theme.HAIR, "·") + " ").join(parts)
+
+    # ── full-screen diff review ─────────────────────────────
+
+    def _render_review_frame(self, buf, styles, cols: int, rows: int) -> None:
+        review = self.review
+        frame = render_review(review, cols, rows)
+        review._total = frame.total
+        viewport = max(1, rows - 2)
+        review.clamp(frame.total, viewport)
+        # Header row: current file + stats.
+        buf.set_styled_line(0, 0, _styled(frame.header[:cols], theme.BONE_BOLD), styles, cols)
+        # Sidebar (files), body (hunks), footer (key hints).
+        body_top = 1
+        body_bottom = rows - 2
+        for y, row in enumerate(frame.sidebar[: max(0, body_bottom - body_top)]):
+            buf.set_styled_line(0, body_top + y, _styled(row.text, _REVIEW_STYLE_SGR.get(row.style)), styles, cols)
+        for y, row in enumerate(frame.body):
+            if body_top + y > body_bottom:
+                break
+            buf.set_styled_line(frame.sidebar_w, body_top + y, _styled(row.text, _REVIEW_STYLE_SGR.get(row.style)), styles, cols)
+        buf.set_styled_line(0, rows - 1, _styled(frame.footer[:cols], theme.FAINT), styles, cols)
+
+    def _handle_review_key(self, key: str, mods: frozenset) -> None:
+        review = self.review
+        if review is None:
+            return
+        viewport = max(1, self.rows - 2)
+        total = int(getattr(review, "_total", 0) or 0)
+        if key in ("q", "esc"):
+            self.review = None
+        elif key in ("up", "k"):
+            review.step(-1, total, viewport)
+        elif key in ("down", "j"):
+            review.step(1, total, viewport)
+        elif key in ("pageup", "pagedown"):
+            review.step((-1 if key == "pageup" else 1) * max(3, viewport - 2), total, viewport)
+        elif key in ("home", "end"):
+            review.offset = 0 if key == "home" else max(0, total - viewport)
+        elif key in ("tab", "l") or (key == "tab" and "shift" in mods) or key == "h":
+            review.next_file(-1 if key == "h" or (key == "tab" and "shift" in mods) else 1)
+        elif key == "s":
+            review.split = not review.split
+        self.mark_dirty()
 
     def _border_text(self) -> str:
         if self.busy:
