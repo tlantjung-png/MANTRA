@@ -268,19 +268,26 @@ class CommandTest(unittest.TestCase):
         self.assertIn("attached 'tdd'", self._shown())
         self.assertIn("tdd", self.session.active_skills)
 
-    def test_a_name_with_a_file_reference_still_attaches(self):
-        # Regression: "/skills code-review @flappy.py" was rerouted into
-        # the fuzzy finder by the trailing @reference; an exact first
-        # token must attach directly.
-        _skills(self.session, "tdd @flappy.py")
-        self.assertIn("attached 'tdd'", self._shown())
-        self.assertIn("tdd", self.session.active_skills)
-        self.assertNotIn("skills for:", self._shown())
+    def test_a_name_with_a_file_reference_runs_once_then_detaches(self):
+        # "/skills code-review @flappy.py" must run the skill ONCE on the
+        # reference and detach - not attach it for every turn.
+        with mock.patch.object(self.session, "handle", return_value=None):
+            _skills(self.session, "tdd @flappy.py")
+        shown = self._shown()
+        self.assertIn("running 'tdd' once on: @flappy.py", shown)
+        self.assertIn("ran once and is detached", shown)
+        self.assertNotIn("attached 'tdd'", shown)
+        self.assertNotIn("skills for:", shown)
+        self.assertEqual(self.session.active_skills, [])
+        self.assertEqual(self.session.auto_attached, [])
 
-    def test_use_with_a_file_reference_attaches(self):
-        _skills(self.session, "use tdd @flappy.py")
-        self.assertIn("attached 'tdd'", self._shown())
-        self.assertIn("tdd", self.session.active_skills)
+    def test_use_with_a_file_reference_runs_once(self):
+        with mock.patch.object(self.session, "handle", return_value=None):
+            _skills(self.session, "use tdd @flappy.py")
+        shown = self._shown()
+        self.assertIn("running 'tdd' once on: @flappy.py", shown)
+        self.assertNotIn("attached 'tdd'", shown)
+        self.assertEqual(self.session.active_skills, [])
 
     def test_show_prints_the_procedure(self):
         _skills(self.session, "show tdd")
