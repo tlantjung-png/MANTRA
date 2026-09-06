@@ -224,6 +224,8 @@ class TuiApp:
         self.running = True
         self._stopped = False
         self.dirty = True
+        self._history: list[str] = []      # submitted prompts, newest last
+        self._history_idx = 0              # len() = the fresh (empty) slot
 
         self.busy = False
         self.busy_label = "Channeling"
@@ -356,6 +358,9 @@ class TuiApp:
         text = text.strip()
         if not text:
             return
+        if not self._history or self._history[-1] != text:
+            self._history.append(text)
+        self._history_idx = len(self._history)
         if self.busy:
             self.queued = text
             self.toast_message("queued — runs when the current turn ends")
@@ -528,6 +533,7 @@ class TuiApp:
                 self.mark_dirty()
                 return
             self.composer.consume_paste(event.text)
+            self._history_idx = len(self._history)  # pasting edits, not recall
             self.mark_dirty()
             return
         if isinstance(event, Mouse):
@@ -593,9 +599,9 @@ class TuiApp:
                     self.transcript.scroll_down(max(3, self._content_height - 2))
             self.mark_dirty()
             return
-        if key in ("up", "down") and not self.composer.buffer and not self.composer.popup_open:
-            # Empty composer: arrow keys scroll the transcript (the
-            # standard chat-TUI convention) instead of being a no-op.
+        if key in ("up", "down") and "ctrl" in mods:
+            # Transcript scroll on ctrl+up/down (plain arrows recall the
+            # prompt history; wheel and PageUp also scroll).
             with self.lock:
                 if key == "up":
                     self.transcript.scroll_up(1)
@@ -603,6 +609,26 @@ class TuiApp:
                     self.transcript.scroll_down(1)
             self.mark_dirty()
             return
+        if key in ("up", "down") and not self.composer.popup_open and (
+            not self.composer.buffer or self._history_idx != len(self._history)
+        ):
+            # Empty composer (or mid-recall): up/down cycle the session's
+            # prompt history like a shell. Typing exits the recall mode.
+            if key == "up":
+                if self._history_idx > 0:
+                    self._history_idx -= 1
+                    self.composer.set_text(self._history[self._history_idx])
+                    self.mark_dirty()
+                    return
+            else:
+                if self._history_idx < len(self._history):
+                    self._history_idx += 1
+                    if self._history_idx < len(self._history):
+                        self.composer.set_text(self._history[self._history_idx])
+                    else:
+                        self.composer.clear()
+                    self.mark_dirty()
+                    return
         if key == "home" and not self.composer.buffer and not self.composer.popup_open:
             # Symmetry with "end" below: home jumps the transcript to
             # the top when the composer has no text to move within.
@@ -642,7 +668,12 @@ class TuiApp:
                 self.toast_message("copied")
             self.mark_dirty()
             return
+        before = self.composer.buffer
         self.composer.consume_key(key, mods)
+        if self.composer.buffer != before:
+            # The operator edited the recalled text (or typed fresh):
+            # leave history recall mode.
+            self._history_idx = len(self._history)
         if self.composer.submitted is not None:
             text = self.composer.submitted
             self.composer.submitted = None

@@ -190,6 +190,11 @@ class Composer:
     def consume_paste(self, text: str) -> None:
         self._insert(text.replace("\r\n", "\n").replace("\r", "\n"))
 
+    def set_text(self, text: str) -> None:
+        """Replace the buffer with *text* (prompt history recall)."""
+        self.clear()
+        self._insert(text)
+
     def _insert(self, text: str) -> None:
         self.buffer = self.buffer[: self.cursor] + text + self.buffer[self.cursor :]
         self.cursor += len(text)

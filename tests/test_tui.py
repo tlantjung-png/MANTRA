@@ -466,20 +466,21 @@ class AppIntegrationTest(unittest.TestCase):
         joined = "\n".join(grid_rows(app.renderer.buffer))
         self.assertIn("^", joined)
 
-    def test_empty_composer_arrow_keys_scroll_the_transcript(self):
-        # Regression: up/down on an empty composer were a no-op, so
-        # arrow-key users could not scroll after a reply.
+    def test_empty_composer_arrow_keys_do_not_scroll_without_history(self):
+        # Plain up/down on an empty composer recall prompt history (see
+        # test_empty_composer_up_down_cycles_prompt_history); with no
+        # history they fall through instead of scrolling - scrolling
+        # lives on ctrl+up/down, wheel and PageUp.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(60):
                 app.transcript.append(f"line {i}")
         app.handle_event(Key("up"))
-        self.assertGreater(app.transcript.offset, 0)
-        self.assertFalse(app.transcript.follow)
-        app.handle_event(Key("home"))
-        self.assertEqual(app.transcript.scrolled, app.transcript.offset)  # jumped up
+        self.assertEqual(app.transcript.offset, 0)  # no history: no recall/scroll
         app.handle_event(Key("down"))
-        self.assertLess(app.transcript.offset, 60)
+        self.assertEqual(app.transcript.offset, 0)
+        app.handle_event(Key("home"))
+        self.assertGreater(app.transcript.offset, 0)  # home jumps to the top
         app.handle_event(Key("end"))
         self.assertEqual(app.transcript.offset, 0)
         self.assertTrue(app.transcript.follow)
@@ -495,6 +496,46 @@ class AppIntegrationTest(unittest.TestCase):
         app.handle_event(Key("up"))
         self.assertEqual(app.transcript.offset, 0)
         self.assertTrue(app.transcript.follow)
+
+    def test_empty_composer_up_down_cycles_prompt_history(self):
+        # Prompt history: up recalls the previous prompt, down walks back
+        # to the fresh slot; typing leaves the recall mode.
+        app, session, backend = _make_app([])
+        for p in ("first prompt", "second prompt", "third prompt"):
+            for ch in p:
+                app.handle_event(Key(ch))
+            app.handle_event(Key("enter"))
+        self.assertEqual(app._history, ["first prompt", "second prompt", "third prompt"])
+
+        app.handle_event(Key("up"))
+        self.assertEqual(app.composer.buffer, "third prompt")
+        app.handle_event(Key("up"))
+        self.assertEqual(app.composer.buffer, "second prompt")
+        app.handle_event(Key("up"))
+        self.assertEqual(app.composer.buffer, "first prompt")
+        app.handle_event(Key("down"))
+        self.assertEqual(app.composer.buffer, "second prompt")
+        app.handle_event(Key("down"))
+        self.assertEqual(app.composer.buffer, "third prompt")
+        app.handle_event(Key("down"))
+        self.assertEqual(app.composer.buffer, "")
+
+        # Typing exits the recall mode: up no longer overwrites.
+        app.handle_event(Key("up"))
+        app.handle_event(Key("x"))
+        app.handle_event(Key("up"))
+        self.assertEqual(app.composer.buffer, "third promptx")
+
+    def test_ctrl_arrows_scroll_the_transcript(self):
+        # Plain arrows recall history; ctrl+up/down still scroll.
+        app, session, backend = _make_app([])
+        with app.lock:
+            for i in range(60):
+                app.transcript.append(f"line {i}")
+        app.handle_event(Key("up", mods=frozenset({"ctrl"})))
+        self.assertGreater(app.transcript.offset, 0)
+        app.handle_event(Key("down", mods=frozenset({"ctrl"})))
+        self.assertLess(app.transcript.offset, 60)
 
     def test_prompt_box_is_a_closed_rectangle(self):
         # The prompt is a full rectangle: status row as the top edge,
