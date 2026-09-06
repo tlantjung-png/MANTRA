@@ -22,7 +22,14 @@ _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 # Bare C0/C1 controls that survive the ANSI filter (ESC c, BEL, BS, C1
 # CSI bytes, ...) can reset or corrupt the terminal frame. Layout
 # controls the transcript actually renders (\n \r \t) are not matched.
+# NOTE: \x1b (ESC) is deliberately inside the class: it must be removed
+# when it is NOT part of a kept SGR sequence. sanitize_ingest shields
+# the ESC byte of kept sequences before this strip runs.
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+# Printable stand-in for the ESC byte of a kept SGR sequence while the
+# control-char strip runs; restored afterwards.
+_SGR_SHIELD = "_SGRESC_"
 
 
 def sanitize_ingest(text: str) -> str:
@@ -34,11 +41,18 @@ def sanitize_ingest(text: str) -> str:
     """
 
     def _keep(m: "re.Match[str]") -> str:
-        return m.group(0) if m.group(0).endswith("m") else ""
+        # Keep SGR sequences whole, every other escape is dropped. The
+        # ESC byte is shielded so the strip below cannot eat it and
+        # leave literal "[2m" codes behind (which would render as text
+        # and never colour the line).
+        return _SGR_SHIELD + m.group(0)[1:] if m.group(0).endswith("m") else ""
 
-    # Strip every escape except SGR, then drop bare C0/C1 controls that
-    # survive the filter (bare ESC + non-bracket byte, BEL, C1 CSI, ...).
-    return _CTRL_RE.sub("", _ANSI_RE.sub(_keep, text))
+    # Strip every escape except SGR, drop bare C0/C1 controls (including
+    # the ESC byte of dropped sequences), then restore the shielded ESC
+    # bytes so the stored line carries real, parseable SGR.
+    shielded = _ANSI_RE.sub(_keep, text)
+    stripped = _CTRL_RE.sub("", shielded)
+    return stripped.replace(_SGR_SHIELD + "[", "\x1b[")
 
 
 def wrap_ansi(text: str, width: int) -> list[str]:

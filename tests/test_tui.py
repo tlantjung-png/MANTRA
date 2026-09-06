@@ -129,6 +129,21 @@ class BufferTest(unittest.TestCase):
 
 
 class TranscriptTest(unittest.TestCase):
+    def test_sanitize_ingest_keeps_sgr_esc_byte(self):
+        # Regression: the control-char strip used to eat the ESC byte of
+        # kept SGR sequences, leaving literal "[2m" codes that rendered
+        # as text and never coloured the line.
+        from core.tui.transcript import sanitize_ingest
+
+        line = "\x1b[2m18:13\x1b[0m  Hello\n\x1b[1;38;5;167mENCHANTER\x1b[0m Hi\n"
+        kept = sanitize_ingest(line)
+        self.assertIn("\x1b[2m", kept)
+        self.assertIn("\x1b[1;38;5;167m", kept)
+        self.assertIn("\x1b[0m", kept)
+        self.assertNotIn("\n[2m", kept)  # no ESC-less code text survives
+        # Non-SGR escapes are still dropped entirely.
+        self.assertEqual(sanitize_ingest("a\x1b[2Jb"), "ab")
+
     def test_partial_lines_commit_on_newline(self):
         t = Transcript()
         t.set_width(40)
