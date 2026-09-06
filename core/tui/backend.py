@@ -95,6 +95,15 @@ _CTRL_NAMES = {
 
 _SGR_MOUSE = re.compile(r"^<(-?\d+);(\d+);(\d+)([Mm])")
 
+# Bracketed paste markers. On Windows the console delivers a paste as
+# key records rather than a byte stream, but a host that wraps pastes
+# (e.g. Windows Terminal after ``?2004h``) sends the markers too; the
+# reader reassembles them into one Paste event so newlines inside the
+# paste cannot submit the composer mid-paste.
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
+_PASTE_CAP = 200000
+
 
 class Backend:
     """Owns the terminal: raw mode, event decoding, frame writes."""
@@ -442,7 +451,24 @@ class Backend:
                     # Mouse event (prefix-matched so a burst of reports
                     # in one buffer is consumed one report at a time).
                     if pending:
-                        pending += ch
+                        # Repeats arrive as one record with wRepeatCount
+                        # (held key or paste of identical chars); expand
+                        # them while collecting a bracketed paste so the
+                        # body is not shortened.
+                        if key.wRepeatCount > 1 and pending.startswith(_PASTE_START):
+                            pending += ch * key.wRepeatCount
+                        else:
+                            pending += ch
+                        if pending.startswith(_PASTE_START):
+                            end = pending.find(_PASTE_END)
+                            if end >= 0:
+                                body = pending[len(_PASTE_START):end]
+                                self.events.put(Paste(body))
+                                pending = ""
+                            elif len(pending) > _PASTE_CAP:
+                                flush_pending()
+                            pending_at = time.monotonic()
+                            continue
                         m = mouse_re.match(pending)
                         if m:
                             button, col, row = int(m.group(1)), int(m.group(2)), int(m.group(3))

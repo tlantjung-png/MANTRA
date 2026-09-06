@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 import os
+import subprocess
 import threading
 import time
 
@@ -23,6 +24,17 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+
+# All kernel32 calls below carry explicit argtypes/restype: without them
+# ctypes converts wide strings and pointers incorrectly and the child
+# process never runs (silent exit 1, no stderr through the ConPTY).
+BOOL = ctypes.c_int
+DWORD = ctypes.c_ulong
+HANDLE = ctypes.c_void_p
+LPVOID = ctypes.c_void_p
+LPCWSTR = ctypes.c_wchar_p
+LPWSTR = ctypes.c_wchar_p
+LONG = ctypes.c_long
 
 
 class COORD(ctypes.Structure):
@@ -66,13 +78,38 @@ class _Pipe:
                 k32.CloseHandle(h)
 
 
+k32.CreatePipe.argtypes = [ctypes.POINTER(HANDLE), ctypes.POINTER(HANDLE), ctypes.POINTER(_SecurityAttributes), DWORD]
+k32.CreatePipe.restype = BOOL
+k32.WriteFile.argtypes = [HANDLE, LPVOID, DWORD, ctypes.POINTER(DWORD), LPVOID]
+k32.WriteFile.restype = BOOL
+k32.ReadFile.argtypes = [HANDLE, LPVOID, DWORD, ctypes.POINTER(DWORD), LPVOID]
+k32.ReadFile.restype = BOOL
+k32.CloseHandle.argtypes = [HANDLE]
+k32.CloseHandle.restype = BOOL
+k32.GetStdHandle.argtypes = [DWORD]
+k32.GetStdHandle.restype = HANDLE
+k32.GetConsoleMode.argtypes = [HANDLE, ctypes.POINTER(DWORD)]
+k32.GetConsoleMode.restype = BOOL
+k32.SetConsoleMode.argtypes = [HANDLE, DWORD]
+k32.SetConsoleMode.restype = BOOL
+k32.GetExitCodeProcess.argtypes = [HANDLE, ctypes.POINTER(DWORD)]
+k32.GetExitCodeProcess.restype = BOOL
+k32.SetHandleInformation.argtypes = [HANDLE, DWORD, DWORD]
+k32.SetHandleInformation.restype = BOOL
+k32.WaitForSingleObject.argtypes = [HANDLE, DWORD]
+k32.WaitForSingleObject.restype = DWORD
+k32.TerminateProcess.argtypes = [HANDLE, DWORD]
+k32.TerminateProcess.restype = BOOL
+k32.InitializeProcThreadAttributeList.argtypes = [LPVOID, DWORD, DWORD, ctypes.POINTER(ctypes.c_size_t)]
+k32.InitializeProcThreadAttributeList.restype = BOOL
+k32.UpdateProcThreadAttribute.argtypes = [LPVOID, DWORD, DWORD, LPVOID, ctypes.c_size_t, LPVOID, LPVOID]
+k32.UpdateProcThreadAttribute.restype = BOOL
+k32.DeleteProcThreadAttributeList.argtypes = [LPVOID]
+k32.DeleteProcThreadAttributeList.restype = None
 k32.CreatePseudoConsole.restype = ctypes.c_long  # HRESULT: 0 is S_OK, negative means failure
 k32.CreatePseudoConsole.argtypes = [COORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
 k32.ResizePseudoConsole.argtypes = [ctypes.c_void_p, COORD]
 k32.ClosePseudoConsole.argtypes = [ctypes.c_void_p]
-k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-k32.CloseHandle.argtypes = [ctypes.c_void_p]
-k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 
 
 class _StartupInfo(ctypes.Structure):
@@ -109,6 +146,13 @@ class _ProcessInfo(ctypes.Structure):
     ]
 
 
+k32.CreateProcessW.argtypes = [
+    LPCWSTR, LPWSTR, LPVOID, LPVOID, BOOL, DWORD, LPVOID, LPCWSTR,
+    ctypes.POINTER(_StartupInfoEx), ctypes.POINTER(_ProcessInfo),
+]
+k32.CreateProcessW.restype = BOOL
+
+
 class ConPTY:
     """A child console application of a known size, driven by tests."""
 
@@ -123,6 +167,11 @@ class ConPTY:
         )
         if hr < 0:  # HRESULT: S_OK (0) means created, negative means failure
             raise OSError(f"CreatePseudoConsole failed: 0x{hr & 0xFFFFFFFF:08X}")
+        # Some ConPTY configurations only deliver input/output when the
+        # pseudoconsole handle itself is marked inheritable, since the
+        # child reaches it through handle inheritance in addition to the
+        # process-attribute list.
+        k32.SetHandleInformation(self._hpc, 0x0001, 0x0001)  # HANDLE_FLAG_INHERIT
 
         attr_size = ctypes.c_size_t()
         k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
@@ -139,14 +188,14 @@ class ConPTY:
         si.StartupInfo.cb = ctypes.sizeof(_StartupInfoEx)
         si.lpAttributeList = ctypes.cast(attr, ctypes.c_void_p)
         pi = _ProcessInfo()
-        cmd = " ".join(args or [sys_executable(), "-m", "core.console"])
+        cmd = subprocess.list2cmdline(args or [sys_executable(), "-m", "core.console"])
         self._cmd_buffer = ctypes.create_unicode_buffer(cmd)
         # bInheritHandles must be TRUE: the pseudoconsole's internal
         # handles reach the child only through handle inheritance.
         ok = k32.CreateProcessW(
             None, self._cmd_buffer, None, None, True,
-            EXTENDED_STARTUPINFO_PRESENT, attr, cwd or os.getcwd(),
-            ctypes.byref(si.StartupInfo), ctypes.byref(pi),
+            EXTENDED_STARTUPINFO_PRESENT, None, cwd or os.getcwd(),
+            ctypes.byref(si), ctypes.byref(pi),
         )
         k32.DeleteProcThreadAttributeList(attr)
         if not ok:

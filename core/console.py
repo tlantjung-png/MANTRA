@@ -1959,6 +1959,7 @@ class ConsoleSession:
             if len(summary) > 56:
                 summary = summary[:53].rstrip() + "..."
             self._note(f"skill auto-attached: {found.name} — {summary}")
+            _warn_untrusted_skill(self, found)
         if bundle is None:
             return None
         if prefs.get("auto_bundle", False):
@@ -3530,6 +3531,28 @@ def _skills_show(session: "ConsoleSession", name: str) -> None:
     session._print(session.style.dim(f"  /skills use {found.name} to attach it"))
 
 
+# Skills already flagged as coming from an external (non-bundled) root;
+# each is warned about once per process, not on every attachment.
+_UNTRUSTED_SKILL_WARNED: set[str] = set()
+
+
+def _warn_untrusted_skill(session: "ConsoleSession", skill) -> None:
+    """Warn once per external skill: its procedure is prompt input."""
+    if skills.is_bundled(skill):
+        return
+    key = skill.name.lower()
+    if key in _UNTRUSTED_SKILL_WARNED:
+        return
+    _UNTRUSTED_SKILL_WARNED.add(key)
+    root = str(skill.root) if skill.root else "an external root"
+    session._print(
+        session.style.warn(
+            f"  '{skill.name}' comes from {root} - its procedure is injected "
+            "into the model prompt as instructions. Treat it as untrusted input."
+        )
+    )
+
+
 def _skills_use(session: "ConsoleSession", name: str) -> None:
     if not name:
         session._print(session.style.dim("  usage: /skills <name>"))
@@ -3545,6 +3568,7 @@ def _skills_use(session: "ConsoleSession", name: str) -> None:
     if key in session.active_skills:
         session._print(session.style.dim(f"  '{found.name}' is already attached"))
         return
+    _warn_untrusted_skill(session, found)
     session.active_skills.append(key)
     session._print(session.style.dim(f"  attached '{found.name}' - it now rides along with every turn"))
     session._print(session.style.dim("  /skills clear to detach"))
@@ -3564,6 +3588,7 @@ def _skills_use_all(session: "ConsoleSession") -> None:
         session._print(session.style.dim(f"  all {len(known)} skills already attached"))
         return
     for k in new:
+        _warn_untrusted_skill(session, skills.get(k))
         session.active_skills.append(k)
     session._print(session.style.dim(f"  attached all {len(new)} skills: " + ", ".join(new)))
     session._print(session.style.dim("  bundle auto is kept — /skills auto bundle on|off to change"))
@@ -4847,6 +4872,11 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         session.verbose = not session.verbose
         session._print(f"verbose {'on' if session.verbose else 'off'}")
     else:
+        # A line like "/tmp/x" or "/usr/local/bin" is a path, not a
+        # command; hand it to the agent instead of swallowing it. A
+        # single-token "/typo" keeps the unknown-command error.
+        if "/" in command[1:] or "/" in argument:
+            return False
         session._print(f"unknown command '{command}' - /help for the list")
     return True
 

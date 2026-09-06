@@ -222,6 +222,20 @@ def get(name: str) -> Skill | None:
     return load_all().get((name or "").strip().lower())
 
 
+def is_bundled(skill: Skill | None) -> bool:
+    """True when the skill ships with the repo (version-controlled, reviewed).
+
+    A skill from the personal ``~/.mantra/skills`` tree or a
+    ``MANTRA_SKILLS`` override is operator-added input: its procedure is
+    injected into the model prompt verbatim, so callers surface a trust
+    warning for those rather than treating them like shipped code.
+    """
+    if skill is None or skill.root is None:
+        return False
+    repo = Path(__file__).resolve().parents[2] / "skills"
+    return skill.root == repo
+
+
 def _table_rows(text: str) -> list[list[str]]:
     """Body rows of a markdown table, cells stripped.
 
