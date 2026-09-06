@@ -46,6 +46,10 @@ from core.agent.settings import (
 )
 from core.agent.knowledge import (
     append_memory,
+    plan_memory_write,
+    read_raw_tail,
+    relevant_memory,
+    rewrite_memory,
     assemble_system_prompt,
     find_instructions_file,
     render_environment,
@@ -1821,7 +1825,7 @@ class ConsoleSession:
 
     # ---- message handling ------------------------------------------------
 
-    def _effective_system_prompt(self) -> str:
+    def _effective_system_prompt(self, request_text: str = "") -> str:
         """The base prompt plus whatever the session is aiming at.
 
         Rebuilt per turn rather than frozen at startup, because the goal
@@ -1841,6 +1845,12 @@ class ConsoleSession:
             )
             if skill.resources:
                 prompt += "\n\nBundled with this skill: " + ", ".join(skill.resources)
+        # Progressive disclosure: the newest memory entries already ride
+        # in the base prompt; add only the older entries this request
+        # actually touches (keyword-ranked, capped).
+        rel = relevant_memory(self.memory_path, request_text)
+        if rel:
+            prompt += "\n\n## Memory relevant to this request\n" + rel
         if not self.goal and not self.todos:
             # Re-apply cap even when only skills were added
             TOTAL_CAP = 20000
@@ -2267,7 +2277,7 @@ class ConsoleSession:
             evaluator=NullEvaluator(),
             logger=self.logger,
             events=self.bus,
-            system_prompt=self._effective_system_prompt(),
+            system_prompt=self._effective_system_prompt(request_text),
             max_steps=self.max_steps,
             on_delta=self._on_delta,
             context=self.context,
@@ -2509,10 +2519,23 @@ class ConsoleSession:
 
     def _record_memory(self, task: dict, result: RunResult) -> None:
         final = (result.final_message or "").strip().replace("\n", " ")[:300]
+        entry = (
+            f"- {time.strftime('%Y-%m-%d %H:%M')} | {task['task_id']} | "
+            f"{result.stopped_reason}: {final} | status=active"
+        )
+        # Search-before-write: a near-duplicate is skipped entirely, and
+        # a new entry on a topic already covered marks the old one
+        # superseded instead of stacking copies (memory rot).
+        existing = read_raw_tail(self.memory_path)
+        action, updated = plan_memory_write(existing, entry)
+        if action == "skip":
+            return
+        if action == "supersede":
+            rewrite_memory(self.memory_path, updated, new_entry=entry)
+            return
         ok = append_memory(
             self.memory_path,
-            f"- {time.strftime('%Y-%m-%d %H:%M')} | {task['task_id']} | "
-            f"{result.stopped_reason}: {final}",
+            entry,
         )
         if not ok:
             self._print("(memory write skipped: store busy or unwritable)")
