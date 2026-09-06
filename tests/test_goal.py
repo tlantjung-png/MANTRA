@@ -511,9 +511,9 @@ class TodoListTest(_IsolatedSessionTest):
         note = self.session._handle_stream_todo_report(
             "TODO ADD: fix the lint errors in main.py"
         )
-        # Open items lead with the palette's crimson ☐, and the running
+        # Open items lead with the ASCII [ ] marker, and the running
         # count of open items is right there in the note.
-        self.assertIn("\u2610", note)
+        self.assertIn("[ ]", note)
         self.assertIn("fix the lint errors in main.py", note)
         self.assertIn("2 open", note)
 
@@ -522,8 +522,8 @@ class TodoListTest(_IsolatedSessionTest):
         note = self.session._handle_stream_todo_report(
             "TODO DONE: ship the dashboard"
         )
-        self.assertIn("\u2611", note)
-        self.assertNotIn("\u2610", note)
+        self.assertIn("[x]", note)
+        self.assertNotIn("[ ]", note)
 
     def test_a_repeated_stream_report_swallows_its_line(self):
         # The same report arriving twice in one stream applies once and
@@ -539,7 +539,7 @@ class TodoListTest(_IsolatedSessionTest):
         _todo(self.session, "add second")
         _todo(self.session, "done 1")
         snippet = self.session._todo_status_snippet()
-        self.assertIn("\u2610", snippet)
+        self.assertIn("[ ]", snippet)
         self.assertIn("1 open item", snippet)
 
     def test_status_snippet_is_empty_when_nothing_is_open(self):

@@ -626,7 +626,7 @@ def _inline_md(line: str, style: Style) -> str:
     # Links — the crimson accent (interactive affordance).
     segment = _re.sub(
         r'\[([^\]]+)\]\([^)]+\)',
-        lambda m: style._wrap(theme.BLOOD, m.group(1).replace("\\[", "[").replace("\\]", "]")),
+        lambda m: style._wrap(theme.LINK, m.group(1).replace("\\[", "[").replace("\\]", "]")),
         segment,
     )
     # Bold — strong bone.
@@ -1025,7 +1025,7 @@ class ConsoleSession:
             total = len(lines)
             if total > 120:
                 lines = lines[:120]
-            out = [self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.SAGE, "✓ ") + self.style._wrap(theme.BONE, f"wrote {path} ({total} lines)")]
+            out = [self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.BONE, f"wrote {path} ({total} lines)")]
             for line in lines:
                 out.append(_syntax_highlight(line, self.style))
             if total > 120:
@@ -1045,8 +1045,8 @@ class ConsoleSession:
         if body.strip():
             pane = self._diff_pane_rows(body, max_lines=220)
             if pane is not None:
-                return self._box(f"✎ edited {path}", pane)
-            return self._format_diff(body, max_lines=220, title=f"✎ edited {path}")
+                return self._box(f"edit {path}", pane)
+            return self._format_diff(body, max_lines=220, title=f"edit {path}")
         if isinstance(result, str) and result.strip():
             return self._format_diff(result.strip(), max_lines=20)
         return ""
@@ -1481,7 +1481,7 @@ class ConsoleSession:
             else:
                 self._print(msg)
         elif name == "tool_denied":
-            self._print(f"  {self.style._wrap(theme.EMBER, '✗ DENIED')} {self.style.dim(payload.get('tool','').upper())}")
+            self._print(f"  {self.style._wrap(theme.EMBER, 'DENIED')} {self.style.dim(payload.get('tool','').upper())}")
         elif name == "run_error":
             self._print(f"  {self.style._wrap(theme.EMBER, '!! ' + str(payload.get('error')))}")
         elif name == "tool_result":
@@ -1567,10 +1567,10 @@ class ConsoleSession:
         elapsed = max(0.1, now - (self._turn_started or now))
         rate_str = _short(round(self._stream_tokens / elapsed))
         if self.style.enabled:
-            counter = self.style._wrap(theme.FAINT, f" {tok_str} tok ↓ · {rate_str} tok/s")
+            counter = self.style._wrap(theme.FAINT, f" {tok_str} tok · {rate_str} tok/s")
             body = self.style.hair("\u2502 ") + self.style.bone("MANTRA >") + counter
         else:
-            body = "\u2502 MANTRA >" + f" {tok_str} tok ↓ · {rate_str} tok/s"
+            body = "\u2502 MANTRA >" + f" {tok_str} tok · {rate_str} tok/s"
         self.layout.draw_prompt(body=body)
 
     # ---- approvals -------------------------------------------------------
@@ -1952,7 +1952,7 @@ class ConsoleSession:
             self._print(self.style.dim("  no todos - /todo add <what needs doing>"))
             return
         for index, item in enumerate(self.todos, 1):
-            marker = self.style.brand("\u2610") if not item["done"] else self.style.hair("\u2611")
+            marker = self.style.ash("[ ]") if not item["done"] else self.style.hair("[x]")
             body = item["text"] if not item["done"] else self.style.strike(item["text"])
             self._print(f"  {index:>2} {marker} {body}")
         open_count = sum(1 for t in self.todos if not t["done"])
@@ -2004,14 +2004,14 @@ class ConsoleSession:
         """Styled open-item count for the border row while a turn runs.
 
         Empty string when nothing is open, so the spinner row only gains
-        the ``☐ N open`` readout when the checklist actually has work
+        the ``[ ] N open`` readout when the checklist actually has work
         left - and it drains live as the agent checks items off.
         """
         open_count = sum(1 for t in self.todos if not t["done"])
         if not open_count:
             return ""
         plural = "" if open_count == 1 else "s"
-        return self.style.dim(self.style.brand("\u2610") + f" {open_count} open item{plural}")
+        return self.style.dim(f"[ ] {open_count} open item{plural}")
 
     def _check_todo_completion(self, result: "RunResult | None") -> None:
         """Apply the agent's TODO reports from its final message.
@@ -2079,18 +2079,18 @@ class ConsoleSession:
             # Already applied inline earlier in this stream (or a done
             # item re-reported): nothing to show, swallow the line.
             return ""
-        # Palette checkboxes, dimmed: an open item carries the crimson ☐
-        # (the same mark /todo shows), a finished one the hairline ☑ with
+        # ASCII checkboxes, dimmed: an open item carries the [ ] marker
+        # (the same mark /todo shows), a finished one the [x] with
         # the text struck through - so a note reads exactly like a row of
         # the checklist, only quieter than the reply around it.
         if head.strip().upper() == "TODO DONE":
             return self.style.dim(
-                self.style.hair("\u2611") + " " + self.style.strike(text.strip())
+                self.style.hair("[x]") + " " + self.style.strike(text.strip())
             )
         open_count = sum(1 for t in self.todos if not t["done"])
         plural = "" if open_count == 1 else "s"
         return self.style.dim(
-            self.style.brand("\u2610") + " " + text.strip()
+            "[ ] " + text.strip()
             + f" ({open_count} open item{plural})"
         )
 
@@ -2859,7 +2859,7 @@ class ConsoleSession:
             self,
             "Resume a session",
             options,
-            hint="↑↓ move · Enter resume · Esc cancel",
+            hint="up/down move · Enter resume · Esc cancel",
         )
         if not chosen:
             return False

@@ -464,7 +464,7 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertGreater(app.transcript.scrolled, 0)
         app.render_frame()
         joined = "\n".join(grid_rows(app.renderer.buffer))
-        self.assertIn("↑", joined)
+        self.assertIn("^", joined)
 
     def test_empty_composer_arrow_keys_scroll_the_transcript(self):
         # Regression: up/down on an empty composer were a no-op, so
@@ -528,16 +528,16 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertNotIn("╭", chip_row)
 
     def test_status_chip_does_not_leak_prompt_label(self):
-        # The live token counter rides the prompt body ("│ MANTRA > 1 tok ↓");
+        # The live token counter rides the prompt body ("│ MANTRA > 1 tok ·");
         # only the counter part belongs in the border chip.
         app, session, backend = _make_app([])
-        session.layout.draw_prompt("\033[2m│ \033[0m\033[1mMANTRA >\033[0m 1 tok ↓")
-        self.assertEqual(app.counter_text, "1 tok ↓")
+        session.layout.draw_prompt("\033[2m│ \033[0m\033[1mMANTRA >\033[0m 1 tok ·")
+        self.assertEqual(app.counter_text, "1 tok ·")
         self.assertNotIn("MANTRA", app.counter_text)
 
     def test_counter_chip_clears_when_busy_ends(self):
         app, session, backend = _make_app([])
-        app.set_counter("1 tok ↓")
+        app.set_counter("1 tok ·")
         app.set_busy(False)
         self.assertEqual(app.counter_text, "")
 
@@ -550,14 +550,14 @@ class AppIntegrationTest(unittest.TestCase):
         app, session, backend = _make_app([])
         app._turn_started = time.monotonic() - 2
         app.set_busy(True, label="Chanting")
-        app.counter_text = "1 tok ↓ · 12 tok/s"
+        app.counter_text = "1 tok · · 12 tok/s"
         app.queued = "something"
         app.toast = "note"
         app.render_frame()
         border = grid_rows(app.renderer.buffer)[app.rows - 3]
         self.assertIn("Chanting", border)
         self.assertRegex(border, r"\d+s")
-        self.assertIn("1 tok ↓", border)
+        self.assertIn("1 tok ·", border)
         self.assertIn("tok/s", border)
         self.assertNotIn("queued", border)
         self.assertNotIn("note", border)
@@ -614,7 +614,7 @@ class AppIntegrationTest(unittest.TestCase):
 
     def test_busy_chip_shows_counter_during_a_streaming_turn(self):
         # The counter rides the live delta stream: a real streaming turn
-        # must put "tok ↓" and "tok/s" into the busy chip, not just a
+        # must put "tok ·" and "tok/s" into the busy chip, not just a
         # preset counter_text.
         from core.scripted import LLMResponse, ScriptedLLMClient
 
@@ -632,7 +632,7 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: app.counter_text != "", 5))
         app.render_frame()
         border = grid_rows(app.renderer.buffer)[app.rows - 3]
-        self.assertIn("tok ↓", border)
+        self.assertIn("tok ·", border)
         self.assertIn("tok/s", border)
         wait_until(lambda: not app.busy, 10)
 
@@ -685,7 +685,7 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: app.counter_text != "", 5))
         app.render_frame()
         border = grid_rows(app.renderer.buffer)[app.rows - 3]
-        self.assertIn("tok ↓", border)
+        self.assertIn("tok ·", border)
         self.assertIn("tok/s", border)
         wait_until(lambda: not app.busy, 10)
 

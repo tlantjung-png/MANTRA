@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any
 
+from core import theme
 from core.term import visible_len
 from core.term import ansi_strip as strip_ansi
 
@@ -41,11 +42,10 @@ RESIZE_DEBOUNCE = 0.016
 _WHEEL_UP = 64
 _WHEEL_DOWN = 65
 
-STYLE_INFO = ("38;5;245",)
 STYLE_HAIR = ("38;5;238",)
-STYLE_ACCENT = ("38;5;131",)
+STYLE_ACCENT = (theme.BLOOD,)
 STYLE_SELECT = ("7",)
-STYLE_WARN = ("38;5;179",)
+STYLE_WARN = (theme.WARN,)
 
 
 class LayoutBridge:
@@ -763,7 +763,6 @@ class TuiApp:
         cols, rows = buf.cols, buf.rows
         buf.reset()
         styles = renderer.styles
-        info_style = styles.id_for(STYLE_INFO)
         hair_style = styles.id_for(STYLE_HAIR)
         accent = styles.id_for(STYLE_ACCENT)
         select_style = styles.id_for(STYLE_SELECT)
@@ -774,9 +773,9 @@ class TuiApp:
         content_bottom = rows - 2 - composer_height  # inclusive
         height = content_bottom - content_top + 1
 
-        # Top info bar + hairline.
+        # Top info bar (coloured labels/values) + hairline.
         info = self._info_text()
-        buf.set_str(0, 0, info[:cols], info_style)
+        buf.set_styled_line(0, 0, info, styles, cols)
         buf.set_str(0, 1, "─" * cols, hair_style)
 
         # Transcript window.
@@ -806,7 +805,7 @@ class TuiApp:
         # Bottom border row with status.
         border_row = rows - 1 - composer_height
         status = self._border_text()
-        marker = f" ↑{self.transcript.scrolled}" if self.transcript.scrolled else ""
+        marker = f" ^{self.transcript.scrolled}" if self.transcript.scrolled else ""
         if self.transcript.scrolled:
             status = (status + marker) if status else marker.lstrip()
         line = "╭─ " + status + " "
@@ -886,9 +885,23 @@ class TuiApp:
         tokens_in = totals.get("tokens_in", 0)
         cache = totals.get("cache_hit", 0)
         rate = f"{cache * 100 // tokens_in}%" if tokens_in else "0%"
-        parts = [f"WORKSPACE: {ws_short or '~'}", f"MODEL: {model} ({reasoning})",
-                 f"APPROVAL: {approval}", f"CACHE: {rate}"]
-        return " · ".join(parts)
+
+        # Coloured fields, same theme as the transcript: faint labels,
+        # semantic values (model in info blue, approval by mode, cache
+        # in sage), hairline separators.
+        st = self.session.style
+        label = lambda t: st._wrap(theme.FAINT, t)
+        appr_color = {
+            "auto": theme.SAGE, "plan": theme.INFO,
+            "yolo": theme.WARN, "default": theme.ASH,
+        }.get(approval, theme.ASH)
+        parts = [
+            f"{label('WORKSPACE:')} {st._wrap(theme.ASH, ws_short or '~')}",
+            f"{label('MODEL:')} {st._wrap(theme.INFO, f'{model} ({reasoning})')}",
+            f"{label('APPROVAL:')} {st._wrap(appr_color, approval)}",
+            f"{label('CACHE:')} {st._wrap(theme.SAGE, rate)}",
+        ]
+        return (" " + st._wrap(theme.HAIR, "·") + " ").join(parts)
 
     def _border_text(self) -> str:
         if self.busy:
@@ -919,9 +932,9 @@ class TuiApp:
         # card sits centered in the content area and re-centers on every
         # frame (i.e. follows resizes) until real content arrives.
         self._welcome_lines = [
-            "\033[1;38;5;131mM A N T R A\033[0m",
-            "\033[38;5;245mSpells Matter\033[0m",
-            f"\033[38;5;240m{__version__}\033[0m",
+            f"\033[{theme.BLOOD_BOLD}mM A N T R A\033[0m",
+            f"\033[{theme.FAINT}mSpells Matter\033[0m",
+            f"\033[{theme.HAIR}m{__version__}\033[0m",
         ]
         self._welcome_card = True
         self.mark_dirty()
