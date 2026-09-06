@@ -719,6 +719,70 @@ class InlineMarkdownTest(unittest.TestCase):
         self.assertIn("`echo`", rendered)
 
 
+class MarkdownTableRenderTest(unittest.TestCase):
+    """Reply tables render as aligned grids, not raw pipe text."""
+
+    def setUp(self):
+        self.style = Style(enabled=True)
+
+    def _plain(self, text: str) -> str:
+        import re as _re
+
+        return _re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+    def test_table_renders_as_an_aligned_grid(self):
+        from core.console import render_markdown
+
+        md = (
+            "| # | Issue | Severity |\n"
+            "|---|-------|----------|\n"
+            "| 1 | `snapshot` accessed | Medium |\n"
+            "| 2 | base_url not validated | Low |\n"
+        )
+        out = self._plain(render_markdown(md, self.style))
+        lines = out.split("\n")
+        self.assertIn("#", lines[0])
+        self.assertIn("Severity", lines[0])
+        self.assertIn("┼", lines[1])  # the hairline column rule
+        self.assertIn("snapshot accessed", out)
+        # The raw pipe-run row must not survive as literal text.
+        self.assertNotIn("| 1 |", out)
+        self.assertNotIn("|---|", out)
+
+    def test_streaming_path_matches_batch_path(self):
+        from core.console import StreamingRenderer, render_markdown
+
+        md = (
+            "| A | B |\n"
+            "|---|---|\n"
+            "| one | two |\n"
+        )
+        expected = self._plain(render_markdown(md, self.style)).rstrip("\n")
+        r = StreamingRenderer(self.style)
+        streamed = self._plain(r.render_piece(md) + r.flush()).rstrip("\n")
+        self.assertEqual(streamed, expected)
+        # Buffered rows must not emit a blank line each.
+        self.assertNotIn("\n\n\n", streamed)
+
+    def test_html_and_entities_are_stripped(self):
+        from core.console import render_markdown
+
+        md = "| A | B |\n|---|---|\n| x<br>y &amp; z | <b>bold</b> |\n"
+        out = self._plain(render_markdown(md, self.style))
+        self.assertNotIn("<br>", out)
+        self.assertNotIn("<b>", out)
+        self.assertIn("&", out)
+        self.assertIn("x", out)
+
+    def test_lone_pipe_line_stays_a_paragraph(self):
+        from core.console import render_markdown
+
+        md = "| just | a | paragraph |\n\nnext\n"
+        out = self._plain(render_markdown(md, self.style))
+        self.assertIn("| just | a | paragraph |", out)
+        self.assertIn("next", out)
+
+
 class UndoChangesTest(unittest.TestCase):
     """/undo reverts tracked changes only after explicit confirmation."""
 

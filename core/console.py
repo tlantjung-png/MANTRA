@@ -204,13 +204,23 @@ class StreamingRenderer:
     def __init__(self, style: Style) -> None:
         self.style = style
         self._in_code_fence = False
+        self._table_rows: list[str] = []
         self._buf: str = ""
         self.report_hook = None  # callable(line: str) -> styled replacement
 
     def reset(self) -> None:
         """Reset state for a new response."""
         self._in_code_fence = False
+        self._table_rows = []
         self._buf = ""
+
+    def _flush_table(self) -> str:
+        """Render buffered table rows and clear the buffer."""
+        lines = self._table_rows
+        self._table_rows = []
+        if not lines:
+            return ""
+        return _flush_table_lines(lines, self.style)
 
     def _line_out(self, line: str) -> str:
         """One complete line: TODO reports via the hook, everything else markdown."""
@@ -239,17 +249,172 @@ class StreamingRenderer:
         out = ""
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            out += self._line_out(line) + "\n"
+            rendered = self._line_out(line)
+            if rendered:
+                out += rendered + "\n"
+            elif not line.strip():
+                # A genuinely blank source line keeps its blank line;
+                # a buffered table row renders nothing until the block
+                # completes, so it must not emit one.
+                out += "\n"
         return out
 
     def flush(self) -> str:
         """Flush any remaining buffered text (called at end of stream)."""
+        out = ""
+        if self._table_rows:
+            out = self._flush_table()
         if self._buf:
             leftover = self._buf
             self._buf = ""
-            return self._line_out(leftover)
-        return ""
+            if out:
+                out += "\n"
+            return out + self._line_out(leftover)
+        return out
 # ------------------------------------------------------------- markdown-lite
+
+_TABLE_COL_CAP = 40
+_TABLE_LAST_COL_CAP = 64
+_TABLE_ROW_CAP = 200
+
+
+def _is_table_row(line: str) -> bool:
+    """True for a markdown table row: '| a | b |'."""
+    s = line.strip()
+    return s.startswith("|") and s.endswith("|") and "|" in s[1:-1]
+
+
+def _is_table_sep(line: str) -> bool:
+    """True for the markdown table separator row: '|---|---|'."""
+    s = line.strip()
+    if not (s.startswith("|") and s.endswith("|")):
+        return False
+    return bool(re.fullmatch(r"[\s:\-|]+", s[1:-1])) and "-" in s
+
+
+def _table_cells(line: str) -> list[str]:
+    """Split a table row into trimmed cells."""
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _cell_is_sep(cell: str) -> bool:
+    """True when a cell is a column rule like '---' or ':---:'."""
+    return bool(re.fullmatch(r":?-{2,}:?", cell.strip()))
+
+
+def _strip_inline_html(text: str) -> str:
+    """Drop the inline HTML and entities the model emits in prose and cells."""
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", " ", text)
+    text = re.sub(
+        r"(?i)</?(?:b|i|em|strong|code|pre|u|s|p|h[1-6]|span|div|ul|ol|li|"
+        r"table|thead|tbody|tr|td|th|blockquote|a)\b[^>]*>",
+        "",
+        text,
+    )
+    return (
+        text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+
+
+def _wrap_plain(text: str, width: int) -> list[str]:
+    """Word-wrap plain text to ``width`` visible columns."""
+    if width <= 0:
+        return [text]
+    lines: list[str] = []
+    for para in text.split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            trial = word if not cur else cur + " " + word
+            if not word or visible_len(trial) <= width:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        elif not para:
+            lines.append("")
+    return lines or [""]
+
+
+def _render_table(rows: list[list[str]], style: Style) -> str:
+    """Render a markdown table as an aligned grid.
+
+    The header is bone-bold with a hairline rule; body cells keep the
+    default face. Cells wrap inside their column; the last column keeps
+    more room because report tables carry their long text there.
+    """
+    ncols = max(len(r) for r in rows)
+    has_rule = (
+        len(rows) > 1
+        and len(rows[1]) >= 2
+        and all(_cell_is_sep(c) for c in rows[1])
+    )
+    header = rows[0]
+    body = rows[2:] if has_rule else rows[1:]
+    all_rows = [header] + body
+
+    widths: list[int] = []
+    for c in range(ncols):
+        vals = [r[c] for r in all_rows if c < len(r) and r[c].strip()]
+        longest = max([visible_len(_strip_inline_html(v)) for v in vals] or [0])
+        cap = _TABLE_LAST_COL_CAP if c == ncols - 1 else _TABLE_COL_CAP
+        widths.append(max(1, min(cap, longest)))
+    # Keep the grid inside a terminal width even when a column is huge:
+    # shrink the widest columns first so the transcript does not break
+    # the alignment at a hard wrap.
+    budget = 100 - 3 * (ncols - 1)
+    while sum(widths) > budget:
+        widest = max(range(ncols), key=lambda c: widths[c])
+        if widths[widest] <= 8:
+            break
+        widths[widest] -= 1
+
+    def _row_lines(cells: list[str], bold: bool) -> list[str]:
+        wrapped: list[list[str]] = []
+        for c in range(ncols):
+            v = cells[c] if c < len(cells) else ""
+            wrapped.append(_wrap_plain(_strip_inline_html(v), widths[c]))
+        height = max(len(w) for w in wrapped)
+        out: list[str] = []
+        for li in range(height):
+            parts: list[str] = []
+            for c in range(ncols):
+                txt = wrapped[c][li] if li < len(wrapped[c]) else ""
+                styled = _inline_md(txt, style)
+                if bold:
+                    styled = style._wrap(theme.BONE_BOLD, styled)
+                parts.append(styled + " " * (widths[c] - visible_len(txt)))
+            pipe = style._wrap(theme.HAIR, "│")
+            out.append(parts[0] + "".join(" " + pipe + " " + p for p in parts[1:]))
+        return out
+
+    lines = _row_lines(header, bold=True)
+    if has_rule:
+        runs = [style._wrap(theme.HAIR, "─" * w) for w in widths]
+        lines.append(runs[0] + "".join(
+            style._wrap(theme.HAIR, "─┼─") + r for r in runs[1:]
+        ))
+    for row in body:
+        lines.extend(_row_lines(row, bold=False))
+    return "\n".join(lines)
+
+
+def _flush_table_lines(lines: list[str], style: Style) -> str:
+    """Render buffered table-looking lines: a grid when the shape holds,
+    otherwise the plain paragraph lines they always were."""
+    if len(lines) < 2 or not (
+        _is_table_sep(lines[1])
+        or len({len(_table_cells(l)) for l in lines}) == 1
+    ):
+        return "\n".join(_inline_md(l, style) for l in lines)
+    return _render_table([_table_cells(l) for l in lines], style)
+
 
 def _syntax_highlight(line: str, style: Style) -> str:
     """Generic syntax highlight for any language — Blood & Bone: muted sage
@@ -287,6 +452,12 @@ def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
     in_fence = getattr(ctx, "_in_code_fence", False)
     stripped = line.strip()
 
+    # A table block ending right where a fence starts must flush before
+    # the fence branches consume the line.
+    if ctx is not None and ctx._table_rows and (in_fence or stripped.startswith("```")):
+        out = ctx._flush_table()
+        return (out + "\n" + _render_md_line(line, style, ctx)) if out else _render_md_line(line, style, ctx)
+
     if in_fence:
         if stripped.startswith("```"):
             if ctx is not None:
@@ -297,6 +468,19 @@ def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
         if ctx is not None:
             ctx._in_code_fence = True
         return style._wrap(theme.HAIR, "│" + "─" * 4)
+
+    # Consecutive table rows buffer until the block ends so the grid can
+    # be aligned; the separator on line two confirms the shape.
+    if ctx is not None and _is_table_row(line):
+        if len(ctx._table_rows) >= _TABLE_ROW_CAP:
+            out = ctx._flush_table()
+            ctx._table_rows.append(line)
+            return out
+        ctx._table_rows.append(line)
+        return ""
+    if ctx is not None and ctx._table_rows:
+        out = ctx._flush_table()
+        return (out + "\n" + _render_md_line(line, style, ctx)) if out else _render_md_line(line, style, ctx)
 
     # headings: bone bold; hairline under H1 and H2, ash for H3
     if stripped.startswith("#"):
@@ -341,16 +525,34 @@ def render_markdown(text: str, style: Style) -> str:
     """Render Markdown to styled terminal output — Blood & Bone palette."""
     out_lines = []
     in_fence = False
+    table_buf: list[str] = []
+
+    def _flush_table_buf() -> None:
+        nonlocal table_buf
+        if not table_buf:
+            return
+        lines = table_buf
+        table_buf = []
+        out_lines.append(_flush_table_lines(lines, style))
+
     for line in text.split("\n"):
         stripped = line.strip()
         # Code fence toggle — hairline border.
         if stripped.startswith("```"):
+            _flush_table_buf()
             in_fence = not in_fence
             out_lines.append(style._wrap(theme.HAIR, "│" + "─" * 4))
             continue
         if in_fence:
             out_lines.append(_syntax_highlight(line, style))
             continue
+        # Tables — buffered so the grid aligns when the block ends.
+        if _is_table_row(line):
+            table_buf.append(line)
+            if len(table_buf) > _TABLE_ROW_CAP:
+                _flush_table_buf()
+            continue
+        _flush_table_buf()
         # Headings — bone bold; hairline under H1, ash for H3.
         if stripped.startswith("#"):
             level = len(stripped) - len(stripped.lstrip("#"))
@@ -391,12 +593,14 @@ def render_markdown(text: str, style: Style) -> str:
             continue
         # Normal paragraph.
         out_lines.append(_inline_md(line, style))
+    _flush_table_buf()
     return "\n".join(out_lines)
 
 
 def _inline_md(line: str, style: Style) -> str:
     """Inline markdown: code, bold, italic, strikethrough, links — Blood & Bone."""
     import re as _re
+    line = _strip_inline_html(line)
     # Sentinel tokens shield escaped backticks and asterisks from the
     # splitters below, and are restored afterwards.
     _ESC = "\x00ESC_BT\x00"
