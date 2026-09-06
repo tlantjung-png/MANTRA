@@ -94,7 +94,8 @@ HELP_TEXT = """Commands:
   /model                provider & model — add endpoint, pick a model
   /model key [name]     replace stored key
   /fix                  send the last failure to the agent for a fix
-  /sessions             saved conversations — list and resume
+  /sessions             saved conversations — browse and resume
+  /sessions <name>      resume that session directly
   /help                 show help
   /workspace            show workspace path + files
   /memory               show memory file
@@ -104,7 +105,6 @@ HELP_TEXT = """Commands:
   /cost                 show token usage
   /compact              summarise conversation
   /clear                clear conversation (/reset is an alias)
-  /resume [name]        resume autosaved session
   /goal <text>          set session goal (/goal note, /goal done)
   /todo                 session checklist — /todo add|done|rm|clear
    /skills <name>        attach skill — /skills + space, Tab filter
@@ -821,7 +821,7 @@ class ConsoleSession:
         self.verbose = bool(config.get("verbose", False))
         self.max_steps = int(config.get("max_steps", 30))
         # Set the first time autosave writes, so a session that never got
-        # anywhere leaves no file behind. Adopted by /resume so picking a
+        # anywhere leaves no file behind. Adopted by /sessions so picking a
         # session up continues it instead of forking it.
         self.session_name = ""
         # The standing objective, if the operator set one. Injected into
@@ -2682,7 +2682,7 @@ class ConsoleSession:
         """Keep the session resumable without being asked.
 
         Silent by design: the only time the operator learns the file
-        exists is when /resume lists it. Nothing is written until there
+        exists is when /sessions lists it. Nothing is written until there
         is a real conversation.
         """
         if len(self.context.messages) < 2:
@@ -2726,14 +2726,14 @@ class ConsoleSession:
                 self._print(self.style.dim("  no saved sessions yet"))
                 return False
             self._print(self.style.ember(f"  no session named '{name}'"))
-            self._print(self.style.dim("  /resume lists them"))
+            self._print(self.style.dim("  /sessions lists them"))
             return False
         # Workspace guard: a session saved in one workspace is not
         # resumed in another.
         saved_ws = data.get("workspace") or ""
         if saved_ws and not self._is_same_workspace(saved_ws):
             self._print(self.style.warn(f"  session '{name}' belongs to workspace {saved_ws}"))
-            self._print(self.style.dim(f"  current workspace is {self.workspace} — switch workspace or use /resume list to see this workspace's sessions"))
+            self._print(self.style.dim(f"  current workspace is {self.workspace} — switch workspace or use /sessions list to see this workspace's sessions"))
             return False
         messages = data.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -2885,7 +2885,7 @@ class ConsoleSession:
             if item["summary"]:
                 self._print(self.style.dim(f"      {item['summary']}"))
         self._print("")
-        self._print(self.style.dim("  /resume <name> to pick one up"))
+        self._print(self.style.dim("  /sessions <name> to pick one up"))
 
     def pick_session(self) -> bool:
         """Resume from a menu — filtered to current workspace. False when nothing was chosen."""
@@ -3270,7 +3270,7 @@ SLASH_COMMANDS = [
     ("/model", "provider & model — add endpoint, pick a model"),
     ("/model key", "replace stored key"),
     ("/fix", "send the last failure to the agent for a fix"),
-    ("/sessions", "saved conversations — list and resume (/resume)"),
+    ("/sessions", "saved conversations — browse and resume"),
     ("/help", "show help"),
     ("/workspace", "show workspace"),
     ("/memory", "show memory"),
@@ -3280,7 +3280,6 @@ SLASH_COMMANDS = [
     ("/cost", "show usage"),
     ("/compact", "summarise chat"),
     ("/clear", "clear chat"),
-    ("/resume", "resume session"),
     ("/goal", "set goal"),
     ("/todo", "session checklist"),
     ("/workflow", "run workflow"),
@@ -5185,12 +5184,12 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         if session.layout is not None and session.layout.active:
             session.layout.clear_content()
         session._print("conversation cleared (files kept)")
-    elif command == "/resume":
+    elif command == "/sessions":
+        # The session manager: browse (panel in the TUI, text picker
+        # elsewhere), list, or resume a named session directly.
         parts = argument.split() if argument else []
+        layout = session.layout
         if not parts:
-            # In the TUI the bare form opens the navigable session
-            # panel; elsewhere it stays the text picker.
-            layout = session.layout
             if layout is not None and layout.active and getattr(layout, "open_sessions", None):
                 layout.open_sessions()
             else:
@@ -5199,14 +5198,6 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             session.show_sessions()
         else:
             session.resume_session(parts[0])
-    elif command == "/sessions":
-        # The session manager: the navigable panel in the TUI, the text
-        # picker elsewhere.
-        layout = session.layout
-        if layout is not None and layout.active and getattr(layout, "open_sessions", None):
-            layout.open_sessions()
-        else:
-            session.pick_session()
     elif command == "/goal":
         _goal(session, argument)
     elif command == "/todo":

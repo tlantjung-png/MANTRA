@@ -302,39 +302,41 @@ class DispatchTest(SessionTestBase):
 
         return dispatch(session, line)
 
-    def test_resume_with_no_args_opens_the_picker(self):
+    def test_sessions_with_no_args_opens_the_picker(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "pick_session") as picked:
             from core.console import dispatch
 
-            dispatch(session, "/resume")
+            dispatch(session, "/sessions")
         picked.assert_called_once()
 
-    def test_resume_list_shows_them(self):
+    def test_sessions_list_shows_them(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "show_sessions") as shown:
             from core.console import dispatch
 
-            dispatch(session, "/resume list")
+            dispatch(session, "/sessions list")
         shown.assert_called_once()
 
-    def test_resume_by_name_resumes(self):
+    def test_sessions_by_name_resumes(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "resume_session") as resumed:
             from core.console import dispatch
 
-            dispatch(session, "/resume k-chat-20260101-000000")
+            dispatch(session, "/sessions k-chat-20260101-000000")
         resumed.assert_called_once_with("k-chat-20260101-000000")
 
-    def test_resume_is_in_the_command_table(self):
+    def test_sessions_is_in_the_command_table(self):
         from core.console import SLASH_COMMANDS
 
-        self.assertIn("/resume", [c for c, _ in SLASH_COMMANDS])
+        self.assertIn("/sessions", [c for c, _ in SLASH_COMMANDS])
+        self.assertNotIn("/resume", [c for c, _ in SLASH_COMMANDS])
 
-    def test_resume_is_in_the_help_text(self):
+    def test_sessions_is_in_the_help_text(self):
         from core.console import HELP_TEXT
 
-        self.assertIn("/resume", HELP_TEXT)
+        self.assertIn("/sessions", HELP_TEXT)
+        self.assertNotIn("/resume", HELP_TEXT)
 
 
 if __name__ == "__main__":

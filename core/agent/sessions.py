@@ -85,7 +85,7 @@ def _path(name: str) -> Path:
 _MAX_MESSAGE_CHARS = 20_000
 
 # Sessions over this size are unusable as context and too costly to parse
-# on every listing; matches the console's explicit-load guard so /resume
+# on every listing; matches the console's explicit-load guard so /sessions
 # cannot bypass it by reading the file directly.
 _MAX_SESSION_BYTES = 10_000_000
 
