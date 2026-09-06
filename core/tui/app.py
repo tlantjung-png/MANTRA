@@ -1003,7 +1003,7 @@ class TuiApp:
         ]
         if getattr(s, "last_error", None):
             # A recent failure waits: /fix sends it to the agent.
-            parts.append(st._wrap(theme.EMBER, "[!] fix"))
+            parts.append(st._wrap(theme.EMBER, "[!] FIX"))
         return (" " + st._wrap(theme.HAIR, "·") + " ").join(parts)
 
     # ── full-screen diff review ─────────────────────────────
