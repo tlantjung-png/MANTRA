@@ -93,6 +93,7 @@ KNOWN_FAILURES_PATH = _resolve_data_path("knowledge", "known-failures.md")
 HELP_TEXT = """Commands:
   /model                provider & model — add endpoint, pick a model
   /model key [name]     replace stored key
+  /fix                  send the last failure to the agent for a fix
   /help                 show help
   /workspace            show workspace path + files
   /memory               show memory file
@@ -851,6 +852,7 @@ class ConsoleSession:
         # turn inherits a procedure nobody asked for, and would stop the
         # router ever looking again.
         self.auto_attached: list[str] = []
+        self.last_error: str | None = None  # most recent failure, for /fix
         # True while a bundle is running its steps. A bundle step is a
         # turn like any other, but it is one the router must keep its
         # hands off: the step already knows which skill it wants.
@@ -1285,6 +1287,44 @@ class ConsoleSession:
         )
         return self._box(title, rows)
 
+    def _capture_last_error(self, tool: str, observation: str) -> None:
+        """Keep the most recent failed tool/command result for /fix."""
+        text = observation.strip()
+        if text.startswith("ERROR"):
+            self.last_error = f"[{tool}] {text[:2000]}"
+            return
+        # run_command / shell_output observations begin with an exit_code
+        # line; a nonzero code is a failure worth fixing (grep's "no
+        # matches" and similar notes are explicitly not errors).
+        m = re.match(r"exit_code:\s*(\d+)([^\n]*)", text)
+        if m:
+            code = int(m.group(1))
+            if code != 0 and "not an error" not in m.group(2):
+                self.last_error = f"[{tool}] {text[:2000]}"
+
+    def _fix_prompt(self, hint: str = "") -> str | None:
+        """The agent prompt for the most recent failure, or None."""
+        if not self.last_error:
+            return None
+        prompt = (
+            "A tool or command failed in this workspace. Here is the failure:\n"
+            f"---\n{self.last_error}\n---\n"
+            "Diagnose the root cause and suggest a fix. Do NOT run any "
+            "command yourself - propose the exact command for the operator "
+            "to approve and run."
+        )
+        if hint:
+            prompt += f"\nAdditional hint from the operator: {hint}"
+        return prompt
+
+    def _attention(self) -> None:
+        """A soft terminal bell so a failed turn or a denial is noticed."""
+        try:
+            sys.stdout.write("\x07")
+            sys.stdout.flush()
+        except OSError:
+            pass
+
     def _on_tool_observation(self, tool: str, observation: str, step: int) -> None:
         """Show what a tool returned while the agent works.
 
@@ -1294,6 +1334,10 @@ class ConsoleSession:
         output, diffs and file contents the agent sees, not just the tool
         name. Ctrl+O (typed mid-run) hides or restores these boxes.
         """
+        # Remember the most recent failure for /fix, before the display
+        # filter: read_file errors matter as much as command failures.
+        if isinstance(observation, str) and observation.strip():
+            self._capture_last_error(tool, observation)
         if not self._show_tool_output:
             return
         if not isinstance(observation, str) or not observation.strip():
@@ -2175,6 +2219,7 @@ class ConsoleSession:
         self.auto_attached = []
 
     def handle(self, text: str) -> RunResult | None:
+        self.last_error = None  # a fresh turn starts clean for /fix
         # Startup card disappears on first real work. Splash rows count as
         # no content: they live in the same viewport buffer, and counting
         # them made the very first turn look like "resumed content" — the
@@ -2316,6 +2361,10 @@ class ConsoleSession:
                 self._report_changes()
                 self._check_goal_completion(result)
                 self._check_todo_completion(result)
+                # Attention: a failed turn or a denied approval is the
+                # one thing that must not pass silently.
+                if result.stopped_reason == "error" or int(result.metrics.get("denied", 0)) > 0:
+                    self._attention()
                 # After the turn is fully reported, so a session saved
                 # mid-turn cannot be missing the assistant's last answer.
                 self.autosave()
@@ -3219,6 +3268,7 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
 SLASH_COMMANDS = [
     ("/model", "provider & model — add endpoint, pick a model"),
     ("/model key", "replace stored key"),
+    ("/fix", "send the last failure to the agent for a fix"),
     ("/help", "show help"),
     ("/workspace", "show workspace"),
     ("/memory", "show memory"),
@@ -5062,6 +5112,14 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
                 session.show_diff()
         else:
             session.show_diff()
+    elif command == "/fix":
+        # Send the most recent failed command/tool result to the agent
+        # for a diagnosis and a suggested (never auto-run) fix.
+        prompt = session._fix_prompt(argument.strip())
+        if prompt is None:
+            session._print(session.style.dim("  no recent failure to fix"))
+        else:
+            session.handle(prompt)
     elif command == "/undo":
         session.undo_changes()
     elif command == "/model":

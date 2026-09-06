@@ -969,6 +969,9 @@ class TuiApp:
             f"{label('APPROVAL:')} {st._wrap(appr_color, approval)}",
             f"{label('CACHE:')} {st._wrap(theme.SAGE, rate)}",
         ]
+        if getattr(s, "last_error", None):
+            # A recent failure waits: /fix sends it to the agent.
+            parts.append(st._wrap(theme.EMBER, "[!] fix"))
         return (" " + st._wrap(theme.HAIR, "·") + " ").join(parts)
 
     # ── full-screen diff review ─────────────────────────────
