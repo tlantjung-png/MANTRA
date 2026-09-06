@@ -466,6 +466,36 @@ class AppIntegrationTest(unittest.TestCase):
         joined = "\n".join(grid_rows(app.renderer.buffer))
         self.assertIn("↑", joined)
 
+    def test_empty_composer_arrow_keys_scroll_the_transcript(self):
+        # Regression: up/down on an empty composer were a no-op, so
+        # arrow-key users could not scroll after a reply.
+        app, session, backend = _make_app([])
+        with app.lock:
+            for i in range(60):
+                app.transcript.append(f"line {i}")
+        app.handle_event(Key("up"))
+        self.assertGreater(app.transcript.offset, 0)
+        self.assertFalse(app.transcript.follow)
+        app.handle_event(Key("home"))
+        self.assertEqual(app.transcript.scrolled, app.transcript.offset)  # jumped up
+        app.handle_event(Key("down"))
+        self.assertLess(app.transcript.offset, 60)
+        app.handle_event(Key("end"))
+        self.assertEqual(app.transcript.offset, 0)
+        self.assertTrue(app.transcript.follow)
+
+    def test_arrow_keys_do_not_scroll_while_typing(self):
+        # With text in the composer, up/down stay caret navigation.
+        app, session, backend = _make_app([])
+        with app.lock:
+            for i in range(60):
+                app.transcript.append(f"line {i}")
+        for ch in "hi":
+            app.handle_event(Key(ch))
+        app.handle_event(Key("up"))
+        self.assertEqual(app.transcript.offset, 0)
+        self.assertTrue(app.transcript.follow)
+
     def test_prompt_box_is_a_closed_rectangle(self):
         # The prompt is a full rectangle: status row as the top edge,
         # wall rows for the input, and a solid bottom edge underneath.

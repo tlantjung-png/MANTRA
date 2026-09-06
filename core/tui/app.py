@@ -593,6 +593,23 @@ class TuiApp:
                     self.transcript.scroll_down(max(3, self._content_height - 2))
             self.mark_dirty()
             return
+        if key in ("up", "down") and not self.composer.buffer and not self.composer.popup_open:
+            # Empty composer: arrow keys scroll the transcript (the
+            # standard chat-TUI convention) instead of being a no-op.
+            with self.lock:
+                if key == "up":
+                    self.transcript.scroll_up(1)
+                else:
+                    self.transcript.scroll_down(1)
+            self.mark_dirty()
+            return
+        if key == "home" and not self.composer.buffer and not self.composer.popup_open:
+            # Symmetry with "end" below: home jumps the transcript to
+            # the top when the composer has no text to move within.
+            with self.lock:
+                self.transcript.scroll_up(10**6)
+            self.mark_dirty()
+            return
         if key == "ctrl+home" or (key == "home" and "ctrl" in mods):
             with self.lock:
                 # scroll_up clamps to the real top; assigning a huge raw
