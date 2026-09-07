@@ -4,25 +4,17 @@
 
 Two entry points are exposed.
 
-The interactive console accepts optional flags to select the workspace location, override the configured model, endpoint address, reasoning effort, and approval mode, and to disable styling or to handle a single message non-interactively before exiting. It restores the operator's saved active endpoint and model selections at startup when no explicit overrides are given, and it guides a first-time operator through endpoint configuration before opening the prompt.
+The interactive console accepts optional flags to select the configuration document, override the workspace location, handle a single message non-interactively before exiting, override the configured model, set the reasoning effort, override the endpoint address, and select the approval mode, plus a flag to disable styling. It restores the operator's saved active endpoint and model selections at startup when no explicit overrides are given, and it guides a first-time operator through endpoint configuration before opening the prompt.
 
-The headless runner requires paths to a configuration document and a task document. It returns a process exit status: zero when the evaluator passed, one when it failed, and two for configuration or task-file errors. Relative paths for configuration and log locations are resolved against the project root.
+The headless runner requires paths to a configuration document and a task document. It returns a process exit status: zero when the evaluator passed, one when it failed, and two for configuration or task-file errors. Input paths are resolved against the working directory and then the project root, while relative log paths inside the configuration are anchored to the project root so the same configuration works from any working directory. The resolved paths are the effective locations used for the run.
 
 ## Interactive Commands
 
-Commands are invoked with a leading slash. The full set is listed by the help command.
+Commands are invoked with a leading slash. The full set is: /exit and /quit to leave the console (with an autosave first), /help or a bare / to show the command help, /workspace to show the workspace path and files, /memory to show the memory file, /diff to show uncommitted changes, /fix to send the most recent failure back to the agent for a diagnosis and a suggested fix, /undo to discard changes after confirmation, /model to manage providers and models (add an endpoint, pick a model, replace a stored key), /reasoning and /effort to set the thinking effort, /approve to select the approval mode, /cost to show token usage and cache metrics, /compact to summarize the conversation, /clear and /reset to clear the conversation while keeping files, /sessions to browse, list, or resume saved conversations, /goal to set, show, or clear a standing objective, /todo to manage a session checklist, /workflow to create, show, launch, or remove workflow sequences, /skills and /skill to discover and attach skills, and /verbose to toggle per-tool detail. Any other line starting with a slash that looks like a path is handed to the agent rather than rejected.
 
-Workspace inspection commands display the workspace location and contents, the durable memory file, and uncommitted changes, with a confirmation step before discarding changes.
+## File References
 
-Model, endpoint, and approval commands list or select the available options. They present a menu when no argument is supplied and apply a direct assignment when an argument is supplied. Model commands also offer a thinking-effort choice and complete from the endpoint's own model catalogue. Endpoint commands support adding, switching, listing, removing, and replacing stored credentials, with always-prompted replacement to allow correction of a mistyped credential and with handling for both hidden and visible prompts.
-
-Cost and status commands display token usage, cache metrics, and conversation size in both human-readable and structured forms. History management commands summarize, clear, or reset the conversation while preserving the system prompt and files.
-
-The console autosaves the conversation to a session transcript after each turn, and the session resume command restores one from the automatically saved transcripts, with the most recent transcript listed first and traversal-unsafe names rejected.
-
-Goal and todo commands set, show, and clear a standing objective and a session checklist, both of which are injected into every turn's system prompt. Skill and workflow commands discover, display, attach, and launch procedural bundles. The verbosity command toggles per-tool detail. The exit command autosaves the session and terminates.
-
-File references use a leading at-sign plus a path or pattern. They are resolved relative to the workspace, rejected if outside, and expanded to content, listing, or glob matches. Each file is capped, the total attached content is capped, the number of glob matches is capped, and unknown references are reported.
+File references use a leading at-sign plus a path or pattern. They are resolved relative to the workspace, rejected if outside, and expanded to content, directory listing, or glob matches. Each file is capped, the total attached content is capped, the number of glob matches is capped, and unknown references are reported.
 
 ## Configuration Sections
 
@@ -32,7 +24,26 @@ The language model section identifies the provider name, model name, endpoint ad
 
 Top-level keys control the maximum steps per task, the base system prompt, the token threshold for automatic summarization, verbosity, and skill routing preferences including automatic attachment and bundle launching. Unknown top-level or section keys are rejected.
 
+## Task Document
+
 The task document requires a problem statement. Optional keys provide a repository address, a base commit, a setup command, a setup timeout, a clone timeout, and a task-specific test command that overrides the evaluator configuration.
+
+## Environment Variables
+
+The following environment variables are honored.
+
+- MANTRA_SETTINGS relocates the user-wide settings document.
+- MANTRA_CREDENTIALS relocates the restricted credentials store.
+- MANTRA_SESSIONS relocates the session transcript directory.
+- MANTRA_SKILLS relocates or adds an operator-owned skills root used alongside the bundled library.
+- MANTRA_WORKFLOWS relocates the workflow definitions file.
+- MANTRA_RULES_FILE adds a command-rules file that the approval policy consults.
+- MANTRA_PRE_TOOL_USE_LOG redirects the redacted pre-tool-use approval audit log.
+- MANTRA_SCRIPT points at a scripted-conversation document consumed by the scripted language model client for hermetic testing.
+- MANTRA_COLOR selects the color mode (auto, always, or never).
+- MANTRA_FORCE_COLOR, when set to a truthy value, forces ANSI styling even when standard output is not a terminal.
+- NO_COLOR, when present, disables styling and takes precedence over the other color settings.
+- MANTRA_ALLOW_FILE_URL, when set to a truthy value, permits file-scheme URLs in web fetching, which are blocked by default.
 
 ## Abstract Interfaces
 
@@ -42,7 +53,7 @@ The sandbox interface provisions the environment for a task, executes shell comm
 
 The tool interface exposes a name, description, and parameter schema. Execution is performed against a sandbox and returns an observation string that is appended to the conversation. Tool schemas are passed to the language model as part of the function-calling specification. File tools share a single edit ledger that enforces read-before-edit within a session and tracks whether the last view was partial.
 
-The evaluator interface examines the sandbox after the orchestrator finishes. It returns a verdict indicating pass or fail, a descriptive detail string, and optional metrics. One implementation runs a shell command and interprets a zero exit status without timeout as pass, with per-task override support and tail truncation. The other always reports a neutral result for interactive sessions without automated grading.
+The evaluator interface examines the sandbox after the orchestrator finishes and never raises. It returns a verdict indicating pass or fail, a descriptive detail string, and optional metrics. One implementation runs a shell command and interprets a zero exit status without timeout as pass, with per-task override support, tail truncation, and execution errors surfaced as failed verdicts rather than exceptions. The other always reports a neutral result for interactive sessions without automated grading.
 
 The logger interface receives structured events and never propagates input or output errors. Implementations append one record per line with a timestamp and use both in-process and inter-process locks with verified stale handling. The event bus interface allows subscription of handlers and fans out events synchronously while suppressing handler exceptions to isolate observers.
 

@@ -52,6 +52,11 @@ def load_script_file(path: str) -> list[LLMResponse]:
     for item in raw:
         tool_calls = []
         for idx, tc in enumerate(item.get("tool_calls", [])):
+            if not isinstance(tc, dict) or not tc.get("name"):
+                raise ValueError(
+                    f"script entry {len(out)} tool_call {idx}: each tool "
+                    'call needs a "name" string'
+                )
             tool_calls.append(ToolCall(
                 id=tc.get("id") or f"call_script_{len(out)}_{idx}",
                 name=tc["name"],

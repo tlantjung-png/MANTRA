@@ -3,16 +3,21 @@
 Runs the full agent loop offline: a scripted LLM fixes a seeded bug through
 the real tools, the command evaluator grades the result, and edge behaviors
 (context truncation, unknown components) are checked alongside.
-Run from the project root:  python -m unittest discover -s tests -v
+Run from the project root with pytest (preferred):  python -m pytest tests/ -q
+(conftest.py redirects the session and audit-log stores per test; plain
+`python -m unittest discover -s tests -v` works too, but only gets the
+import-time redirection from tests/__init__.py, not the per-test re-assert.)
 """
 
 from __future__ import annotations
 
 import os
 import json
+import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "."))
 
@@ -143,6 +148,9 @@ class SmokeTest(unittest.TestCase):
         workspace = make_workspace()
         llm = ScriptedLLMClient(
             [
+                # The edit ledger refuses unread files; read first so the
+                # wrong fix below is what the run actually attempts.
+                tool_call_response("read_file", {"path": "greet.py"}),
                 tool_call_response(
                     "edit_file",
                     {"path": "greet.py", "old_string": '"helo"', "new_string": '"hi"'},
@@ -514,6 +522,24 @@ class SseStreamParseTest(unittest.TestCase):
         result = parse_sse_stream(lines)
         self.assertIsNone(result.content)
 
+    def test_tool_call_arguments_that_never_parse_as_json_fail(self):
+        # A hostile or truncated producer whose tool arguments are not
+        # JSON must fail the stream as an LLMError, never dispatch.
+        from core.agent.exceptions import LLMError
+        from core.llm import parse_sse_stream
+
+        lines = [
+            "data: " + json.dumps(
+                {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "c1", "function": {"name": "edit_file", "arguments": "not json at all {"}},
+                ]}}]}
+            ),
+            "data: [DONE]",
+        ]
+        with self.assertRaises(LLMError) as ctx:
+            parse_sse_stream(lines)
+        self.assertIn("mid-tool-call (edit_file)", str(ctx.exception))
+
 
 class SandboxScreenTest(unittest.TestCase):
     """The traversal guard must block real escapes, not cmd.exe switches."""
@@ -617,6 +643,280 @@ class EmptyStreamRetryTest(unittest.TestCase):
         with self.assertRaises(LLMError):
             self._run(client, hard)
         self.assertEqual(calls["n"], 1)
+
+
+class InferWorkspaceTest(unittest.TestCase):
+    """Workspace inference must refuse protected directories."""
+
+    @staticmethod
+    def _infer_from(path: str) -> str:
+        from core.console import _infer_workspace
+
+        old = os.getcwd()
+        try:
+            os.chdir(path)
+            return _infer_workspace()
+        finally:
+            os.chdir(old)
+
+    def test_cwd_inside_the_project_infers_to_itself(self):
+        from core.console import PROJECT_ROOT
+
+        subdir = os.path.join(PROJECT_ROOT, "tests")
+        self.assertTrue(os.path.isdir(subdir))
+        self.assertEqual(self._infer_from(subdir), subdir)
+
+    def test_cwd_at_home_is_refused(self):
+        from core.console import PROJECT_ROOT
+
+        self.assertEqual(
+            self._infer_from(os.path.expanduser("~")),
+            os.path.join(PROJECT_ROOT, "workspace"),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "drive roots are Windows-only")
+    def test_cwd_at_the_drive_root_is_refused_on_windows(self):
+        from core.console import PROJECT_ROOT
+
+        drive_root = os.path.splitdrive(os.getcwd())[0] + os.sep
+        self.assertEqual(
+            self._infer_from(drive_root),
+            os.path.join(PROJECT_ROOT, "workspace"),
+        )
+
+    def test_cwd_at_the_project_workspace_default_infers_to_itself(self):
+        from core.console import PROJECT_ROOT
+
+        default_ws = os.path.join(PROJECT_ROOT, "workspace")
+        self.assertTrue(os.path.isdir(default_ws))
+        self.assertEqual(self._infer_from(default_ws), default_ws)
+
+
+class SearchToolTest(unittest.TestCase):
+    """The model-facing search/find tools actually execute."""
+
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="mantra-search-")
+        self.sandbox = LocalSandbox(self.workspace)
+        self.sandbox.setup({})
+
+    def test_search_code_finds_literal_matches(self):
+        from core.tools.search import SearchCodeTool
+
+        with open(os.path.join(self.workspace, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("def h():\n    return 'hi'\n")
+        out = SearchCodeTool().execute(self.sandbox, query="return 'hi'")
+        self.assertIn("a.py:2", out)
+
+    def test_search_code_no_matches(self):
+        from core.tools.search import SearchCodeTool
+
+        out = SearchCodeTool().execute(self.sandbox, query="zzz-not-there")
+        self.assertIn("no matches", out)
+
+    def test_search_code_notes_the_hit_ceiling(self):
+        from core.tools.search import SearchCodeTool
+
+        for i in range(60):
+            with open(os.path.join(self.workspace, f"f{i:02d}.py"), "w", encoding="utf-8") as fh:
+                fh.write("needle-line\n")
+        out = SearchCodeTool().execute(self.sandbox, query="needle-line")
+        self.assertIn("hit ceiling 50", out)
+
+    def test_search_code_rejects_invalid_queries(self):
+        from core.tools.search import SearchCodeTool
+
+        tool = SearchCodeTool()
+        self.assertIn("invalid characters", tool.execute(self.sandbox, query="a\nb"))
+        self.assertIn("too long", tool.execute(self.sandbox, query="x" * 501))
+
+    def test_find_file_matches_and_rejects_metacharacters(self):
+        from core.tools.search import FindFileTool
+
+        with open(os.path.join(self.workspace, "report_q3.py"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        self.assertIn("report_q3.py", FindFileTool().execute(self.sandbox, pattern="q3"))
+        out = FindFileTool().execute(self.sandbox, pattern="*")
+        self.assertIn("unsupported characters", out)
+
+
+class ClipboardSmokeTest(unittest.TestCase):
+    """Clipboard routes must degrade without a terminal, never raise."""
+
+    def test_copy_falls_back_gracefully(self):
+        import core.tui.clipboard as clip
+
+        with mock.patch.object(clip, "_copy_windows", return_value=False), \
+             mock.patch.object(clip, "_copy_posix", return_value=False), \
+             mock.patch.object(clip, "_copy_osc52") as osc52:
+            clip.copy_text("hello")
+        osc52.assert_called_once_with("hello")
+
+    def test_empty_copy_is_a_noop(self):
+        import core.tui.clipboard as clip
+
+        with mock.patch.object(clip, "_copy_osc52") as osc52:
+            clip.copy_text("")
+        osc52.assert_not_called()
+
+    def test_paste_returns_empty_without_a_terminal(self):
+        import core.tui.clipboard as clip
+
+        with mock.patch.object(clip, "_paste_windows", return_value=""), \
+             mock.patch.object(clip, "_paste_posix", return_value=""):
+            self.assertEqual(clip.paste_text(), "")
+
+
+class TermPrimitivesTest(unittest.TestCase):
+    def test_visible_len_and_char_width(self):
+        from core.term import _char_width, ansi_strip, visible_len
+
+        self.assertEqual(visible_len("abc"), 3)
+        self.assertEqual(_char_width("a"), 1)
+        self.assertEqual(_char_width("\u6f22"), 2)  # CJK counts as 2 columns
+        self.assertEqual(_char_width("\u0301"), 0)  # combining mark: 0 columns
+        # ANSI escapes contribute no width.
+        self.assertEqual(visible_len("\x1b[31mred\x1b[0m"), 3)
+        self.assertEqual(ansi_strip("\x1b[38;2::255:0:0mX"), "X")
+
+
+class ThemeTokensTest(unittest.TestCase):
+    def test_theme_tokens_exist_and_are_sgr_codes(self):
+        import core.theme as theme
+
+        for name in ("BONE", "ASH", "FAINT", "HAIR", "BLOOD", "SAGE", "EMBER", "WARN", "LINK", "INFO"):
+            self.assertTrue(getattr(theme, name).startswith("38;5;"), name)
+        self.assertEqual(theme.DIFF_ADD, theme.SAGE)
+        self.assertEqual(theme.DIFF_REMOVE, theme.EMBER)
+
+
+class HeadlessMainTest(unittest.TestCase):
+    """core.main builds and rejects missing inputs with exit code 2."""
+
+    def test_missing_config_and_task_exit_2(self):
+        import core.main as main_mod
+
+        with mock.patch.object(sys, "argv", ["mantra"]):
+            self.assertEqual(
+                main_mod.main(["--config", "no-such-config.yaml", "--task", "no-such-task.json"]),
+                2,
+            )
+
+    def test_missing_required_flags_raise_system_exit_2(self):
+        import core.main as main_mod
+
+        with mock.patch.object(sys, "argv", ["mantra"]):
+            with self.assertRaises(SystemExit) as ctx:
+                main_mod.main([])
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class TuiLoopSmokeTest(unittest.TestCase):
+    """tui.loop imports and its Presenter can be driven."""
+
+    def test_presenter_runs_and_stops_when_the_app_is_not_running(self):
+        from core.tui.loop import Presenter
+
+        class _StoppedApp:
+            running = False
+
+        Presenter(_StoppedApp()).run()  # loop never enters: returns cleanly
+
+
+class SandboxSecurityTest(unittest.TestCase):
+    """The sandbox containment surface: repo URLs, commits, screen, resolve."""
+
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="mantra-sandbox-sec-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
+        self.sandbox = LocalSandbox(self.workspace)
+        self.sandbox.setup({})
+
+    def test_repo_url_scheme_matrix(self):
+        safe = LocalSandbox._is_safe_repo_url
+        self.assertTrue(safe("https://github.com/x/y.git"))
+        self.assertTrue(safe("http://host/x"))
+        self.assertTrue(safe("git@github.com:x/y.git"))
+        self.assertTrue(safe("ssh://git@host/x"))
+        self.assertTrue(safe("git://host/x"))
+        self.assertFalse(safe(""))
+        self.assertFalse(safe("ftp://host/x"))
+        self.assertFalse(safe("C:\\repo"))
+        self.assertFalse(safe("x" * 2049))
+
+    def test_file_url_is_gated_by_env(self):
+        safe = LocalSandbox._is_safe_repo_url
+        self.assertFalse(safe("file:///etc/passwd"))
+        with mock.patch.dict(os.environ, {"MANTRA_ALLOW_FILE_URL": "1"}):
+            self.assertTrue(safe("file:///etc/passwd"))
+
+    def test_repo_url_rejects_control_chars(self):
+        safe = LocalSandbox._is_safe_repo_url
+        self.assertFalse(safe("https://x/\x00y"))
+        self.assertFalse(safe("https://x/\nhost"))
+        self.assertFalse(safe("https://x/\rhost"))
+
+    def test_commit_shell_metacharacters_are_rejected(self):
+        safe = LocalSandbox._is_safe_commit
+        self.assertTrue(safe("abc123def"))
+        self.assertTrue(safe("v1.2.3"))
+        for bad in ("abc;rm -rf x", "abc&echo", "abc|cat", "abc`ls`",
+                    "a$HOME", "a(b)", "a>b", "a'b'", 'a"b"'):
+            self.assertFalse(safe(bad), bad)
+
+    def test_screen_command_blocks_escapes_and_passes_safe(self):
+        self.assertIsNone(self.sandbox.screen_command("python run.py"))
+        self.assertIsNone(self.sandbox.screen_command("git diff --no-color -- flappy.py"))
+        self.assertIsNotNone(self.sandbox.screen_command("type ..\\secrets.txt"))
+        self.assertIsNotNone(self.sandbox.screen_command("cat ../outside/file.txt"))
+        self.assertIsNotNone(self.sandbox.screen_command("echo %USERPROFILE%\\secret.txt"))
+        self.assertIsNotNone(
+            self.sandbox.screen_command("cat C:\\Windows\\system32\\drivers\\etc\\hosts")
+        )
+
+    def test_resolve_rejects_escapes_and_allows_inside(self):
+        from core.agent.exceptions import SandboxError
+
+        inside = self.sandbox._resolve("sub/file.txt")
+        self.assertTrue(
+            inside.startswith(os.path.realpath(self.workspace) + os.sep), inside
+        )
+        for bad in ("..\\outside.txt", "../../x"):
+            with self.assertRaises(SandboxError):
+                self.sandbox._resolve(bad)
+
+    def test_resolve_refuses_a_symlink_escaping_the_workspace(self):
+        from core.agent.exceptions import SandboxError
+
+        outside = tempfile.mkdtemp(prefix="mantra-symlink-out-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        link = os.path.join(self.workspace, "escape")
+        try:
+            os.symlink(outside, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        with self.assertRaises(SandboxError):
+            self.sandbox._resolve("escape/target.txt")
+
+    def test_write_file_rejects_symlink_targets_escaping(self):
+        from core.agent.exceptions import SandboxError
+
+        outside = tempfile.mkdtemp(prefix="mantra-symlink-out-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        with open(os.path.join(outside, "secret.txt"), "w", encoding="utf-8") as fh:
+            fh.write("do not touch")
+        try:
+            os.symlink(os.path.join(outside, "secret.txt"),
+                       os.path.join(self.workspace, "link.txt"))
+            os.symlink(outside, os.path.join(self.workspace, "escape"))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        with self.assertRaises(SandboxError):
+            self.sandbox.write_file("link.txt", "overwritten")
+        with self.assertRaises(SandboxError):
+            self.sandbox.write_file("escape/target.txt", "x")
+        with open(os.path.join(outside, "secret.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "do not touch")
 
 
 if __name__ == "__main__":

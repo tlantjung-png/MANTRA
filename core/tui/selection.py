@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from core.term import _char_width, ansi_strip as strip_ansi
+from core.term import _WidthScanner, ansi_strip as strip_ansi
 
 
 DRAG_THRESHOLD = 2  # cells of motion before a press becomes a drag
@@ -32,12 +32,15 @@ def col_to_offset(text: str, col: int) -> int:
     cells = 0
     i = 0
     n = len(text)
+    # Per-scan ZWJ state: a continuation char after a ZWJ occupies no new
+    # cells, so width math must track it within this one string only.
+    scanner = _WidthScanner()
     while i < n and cells < col:
         m = _ANSI_RE.match(text, i)
         if m:
             i = m.end()
             continue
-        w = max(1, _char_width(text[i]))
+        w = max(1, scanner.feed(text[i]))
         if cells + w > col:
             break  # col falls inside this character: keep its offset
         cells += w

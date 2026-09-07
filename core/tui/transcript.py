@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import threading
 
-from core.term import _char_width
+from core.term import _WidthScanner, _char_width
 
 # Word-wrap for styled text: escape sequences carry no width, are never
 # split, and open SGR codes are re-emitted on continuation rows. Wide
@@ -20,9 +20,9 @@ from core.term import _char_width
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 
 # Bare C0/C1 controls (ESC c, BEL, BS, C1 CSI bytes, ...) can reset or
-# corrupt the terminal frame. Layout controls the transcript actually
-# renders (\n \t) are preserved: sanitize_ingest handles them itself, so
-# this class never needs an exception for them.
+# corrupt the terminal frame. \n is handled by line-splitting at ingest;
+# \t is expanded to spaces here so a tab stop can never reach the
+# terminal (see D1).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]")
 
 
@@ -54,6 +54,10 @@ def sanitize_ingest(text: str) -> str:
                 # parseable so trailing parameter bytes cannot leak.
                 i = m.end() if m else i + 1
             continue
+        if ch == "\t":
+            out.append("    ")  # expand tabs: a raw tab stop must never paint
+            i += 1
+            continue
         if ch == "\r" or _CTRL_RE.match(ch):
             i += 1  # carriage returns and bare C0/C1 controls are never layout
             continue
@@ -66,7 +70,8 @@ def wrap_ansi(text: str, width: int) -> list[str]:
     if width <= 0:
         return [text]
     plain = _ANSI_RE.sub("", text)
-    if sum(_char_width(c) for c in plain) <= width:
+    quick = _WidthScanner()
+    if sum(quick.feed(c) for c in plain) <= width:
         return [text]
     n = len(text)
     i = 0
@@ -101,6 +106,10 @@ def wrap_ansi(text: str, width: int) -> list[str]:
     seg: list[str] = []
     seg_w = 0
     open_codes: list[str] = []
+    # One scanner per wrap call: a ZWJ at the end of one token must count
+    # as a continuation at the start of the next, so the state is shared
+    # across every token laid out below but never leaks to other strings.
+    scanner = _WidthScanner()
 
     def flush_seg() -> None:
         nonlocal seg, seg_w
@@ -131,7 +140,7 @@ def wrap_ansi(text: str, width: int) -> list[str]:
             if m:
                 j = m.end()
                 continue
-            total += _char_width(s[j])
+            total += scanner.feed(s[j])
             j += 1
         return total
 
@@ -144,7 +153,7 @@ def wrap_ansi(text: str, width: int) -> list[str]:
                     if seg_w >= width:
                         break
                     seg.append(tok)
-                    seg_w += _char_width(tok)
+                    seg_w += scanner.feed(tok)
             continue
         word_w = 0
         for tok in chunk:
@@ -174,6 +183,7 @@ def wrap_ansi(text: str, width: int) -> list[str]:
     return out if out else [""]
 
 _MAX_LINES = 8000
+_PARTIAL_CAP = 4096  # longest live tail held for an unterminated line (D23)
 
 
 class Transcript:
@@ -182,6 +192,7 @@ class Transcript:
         self.raw: list[str] = []          # styled logical lines
         self.display: list[str] = []      # wrapped display rows (styled)
         self.partial = ""                 # live, unterminated tail (styled)
+        self._partial_rows: list[str] = []  # wrapped tail rows, cached per width
         self._width = 0
         self.offset = 0                   # display rows from the bottom
         self.follow = True
@@ -202,28 +213,13 @@ class Transcript:
                     self.display.extend(wrap_ansi(clean, self._width))
             self.version += 1
 
-    def _wrap_one_locked(self, line: str) -> None:
-        """Replace one logical line's display rows incrementally.
-
-        A full rewrap is O(total content); this is O(one line), which is
-        what an append-heavy streaming feed needs once the transcript
-        holds thousands of lines.
-        """
-        if self.raw:
-            self.raw[-1] = line
-        if not self._width:
-            return
-        if self.display:
-            self.display.pop()
-        self.display.extend(wrap_ansi(line, self._width))
-        self.version += 1
-
     def append_partial(self, styled_text: str) -> None:
         """Feed a live fragment: complete lines commit, the tail is held."""
         with self._lock:
             data = (self.partial + styled_text).replace("\r", "")
             parts = data.split("\n")
-            self.partial = parts.pop()
+            self.partial = parts.pop()[-_PARTIAL_CAP:]
+            self._cache_partial_locked()
             for line in parts:
                 self.append(line)
 
@@ -232,6 +228,7 @@ class Transcript:
             if self.partial:
                 pending = self.partial
                 self.partial = ""
+                self._partial_rows = []
                 self.append(pending)
 
     def clear(self) -> None:
@@ -239,6 +236,7 @@ class Transcript:
             self.raw = []
             self.display = []
             self.partial = ""
+            self._partial_rows = []
             self.offset = 0
             self.follow = True
             self.version += 1
@@ -250,21 +248,34 @@ class Transcript:
             self._width = cols
             self._rewrap_locked()
 
+    def _cache_partial_locked(self) -> None:
+        """Recompute the wrapped tail rows (cached per width, see D23)."""
+        self._partial_rows = (
+            wrap_ansi(self.partial, self._width) if (self.partial and self._width) else []
+        )
+
+    def _clamp_offset_locked(self) -> None:
+        """Pin offset to the display pool after rewrap/truncation (D4)."""
+        total = len(self.display) + len(self._partial_rows)
+        max_offset = max(0, total - self.viewport_height)
+        if self.offset > max_offset:
+            self.offset = max_offset
+
     def _rewrap_locked(self) -> None:
         self.display = []
         if not self._width:
             return
         for line in self.raw:
             self.display.extend(wrap_ansi(line, self._width))
+        self._cache_partial_locked()
+        self._clamp_offset_locked()
         self.version += 1
 
     # ── scrolling ─────────────────────────────────────────────
 
     def visible_rows(self, height: int) -> list[str]:
         with self._lock:
-            pool = self.display if self.offset > 0 else self.display + (
-                wrap_ansi(self.partial, self._width) if (self.partial and self._width) else []
-            )
+            pool = self.display if self.offset > 0 else self.display + self._partial_rows
             if height <= 0:
                 return []
             if self.offset > 0:
@@ -275,9 +286,7 @@ class Transcript:
 
     def scroll_up(self, amount: int = 3) -> None:
         with self._lock:
-            total = len(self.display) + (
-                len(wrap_ansi(self.partial, self._width)) if (self.partial and self._width) else 0
-            )
+            total = len(self.display) + len(self._partial_rows)
             # Detach only as far as there is content above the viewport:
             # when everything already fits, scrolling must be a no-op.
             max_offset = max(0, total - self.viewport_height)
@@ -315,9 +324,7 @@ class Transcript:
                 end = max(0, len(self.display) - self.offset)
                 start = max(0, end - height)
                 return [(i, self.display[i]) for i in range(start, end)]
-            pool = self.display + (
-                wrap_ansi(self.partial, self._width) if (self.partial and self._width) else []
-            )
+            pool = self.display + self._partial_rows
             start = max(0, len(pool) - height)
             return [(i, pool[i]) for i in range(start, len(pool))]
 
@@ -325,4 +332,9 @@ class Transcript:
         with self._lock:
             if 0 <= display_index < len(self.display):
                 return self.display[display_index]
+            # The wrapped partial tail is visible while following; resolve
+            # it too so a drag ending there still copies (see D9/D11).
+            rel = display_index - len(self.display)
+            if 0 <= rel < len(self._partial_rows):
+                return self._partial_rows[rel]
             return ""

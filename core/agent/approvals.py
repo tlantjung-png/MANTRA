@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import re
+import sys
+import threading
 from typing import Any, Callable
+
+from core.agent.repairs import canonical_command
 
 AskCallback = Callable[[str], str]  # returns "y" | "n" | "a"
 NoteCallback = Callable[[str], None]
@@ -71,9 +75,10 @@ _SAFE_COMMANDS = (
 _DESTRUCTIVE_RE = re.compile("|".join(_DESTRUCTIVE), re.IGNORECASE)
 _SAFE_RE = re.compile("|".join(_SAFE_COMMANDS), re.IGNORECASE)
 
-# Mid-session AGENTS.md / MEMORY.md cache invalidation guard. Both files
-# get the same fence: redirection and the PowerShell content-setting
-# commands, so a shell-layer rewrite of either is refused.
+# Mid-session AGENTS.md / MEMORY.md cache-invalidation fence. Both files
+# get the same fence on the run_command path: redirection and the
+# PowerShell content-setting commands are refused, and tool-level writes
+# (write_file/edit_file) to either file classify as confirm (D10).
 _FORBIDRE = [
     re.compile(r"(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md", re.IGNORECASE),
     re.compile(r"(>|>>)\s*[^|\r\n]*MEMORY\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md", re.IGNORECASE),
@@ -163,8 +168,11 @@ def _redact_sensitive(s: str) -> str:
     # that appear near assignment-like syntax or as bare values.
     s = re.sub(r"(?i)(?<![A-Za-z0-9])(sk-[a-zA-Z0-9_\-]{12,}|sk_[a-f0-9_\-]{12,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z_\-]{20,})(?![A-Za-z0-9])", "[REDACTED]", s)
     s = re.sub(r"(?i)(passw(or)?d|secret|token|apikey|api[-_]?key|authorization|bearer|credential)\s*[=:]\s*[\"']?(?:bearer\s+)?[^\"'\s,;]+", r"\1=[REDACTED]", s)
-    # Generic high-entropy bare tokens near assignment (e.g. key=abc123... 20+ chars)
-    s = re.sub(r"(?i)\b(key|secret|token)\s*=\s*[\"']?[A-Za-z0-9_\-]{20,}[\"']?", r"\1=[REDACTED]", s)
+    # Generic bare key assignments: values of 6+ chars are almost always
+    # credentials (key=abc123) rather than ordinary words (key=value),
+    # so the threshold is far below the 20-char high-entropy cutoff used
+    # for prefix-less tokens elsewhere.
+    s = re.sub(r"(?i)\b(key|secret|token)\s*=\s*[\"']?[A-Za-z0-9_\-]{6,}[\"']?", r"\1=[REDACTED]", s)
     # Bare bearer tokens (eyJ... JWT style) without prefix
     s = re.sub(r"\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b", "[REDACTED]", s)
     # Also redact any value that exactly matches a stored credential (exact match)
@@ -189,7 +197,7 @@ def _is_escaped(text: str, idx: int) -> bool:
             break
     return (slashes % 2) == 1
 
-def _get_tokens(segment: str) -> list[str]:
+def _tokenize(segment: str) -> list[str]:
     """Tokenize outside quotes; handle PowerShell grouping delimiters."""
     tokens: list[str] = []
     cur: list[str] = []
@@ -216,12 +224,38 @@ def _get_tokens(segment: str) -> list[str]:
     if tokens and len(tokens) == 1 and trimmed and trimmed[0] in ('"', "'") and " " in tokens[0]:
         # Recursively tokenize the inner quoted command
         inner = tokens[0]
-        return _get_tokens(inner) + tokens[1:]
+        return _tokenize(inner) + tokens[1:]
+    return tokens
+
+
+def _wrapper_oneliner(tokens: list[str]) -> bool:
+    """True when the segment is a wrapper interpreter with inline code.
+
+    ``bash -c``, ``cmd /c`` and ``powershell -c``/``-Command`` execute
+    their remaining text as code, exactly like the interpreters in
+    ``_is_interpreter_oneliner``; ``_get_tokens`` strips them before
+    that check runs, so the wrapper head is detected here instead (D1).
+    """
+    if len(tokens) < 3:
+        return False
+    wrapper = tokens[0].lower().replace("\\", "/").split("/")[-1]
+    if wrapper.endswith(".exe"):
+        wrapper = wrapper[:-4]
+    switch = tokens[1].lower()
+    return (
+        (wrapper in ("cmd", "cmd.exe") and switch == "/c")
+        or (wrapper in ("powershell", "powershell.exe", "pwsh", "pwsh.exe") and switch in ("-command", "-c"))
+        or (wrapper in ("bash", "bash.exe", "sh", "dash", "zsh") and switch == "-c")
+    )
+
+
+def _get_tokens(segment: str) -> list[str]:
+    """Tokenize outside quotes, then expand wrappers to the inner command."""
+    tokens = _tokenize(segment)
     # Wrapper expansion: classify the inner command only, so the wrapper
-    # does not double-count the risk. Slice the token stream after the
-    # switch token instead of re-searching the raw segment — the switch
-    # text can appear earlier inside a quoted body or a path, and a
-    # leftmost search there would truncate the real inner command.
+    # does not double-count the risk. The interpreter one-liner gate is
+    # preserved separately by _wrapper_oneliner, so bash/powershell/cmd
+    # -c one-liners still classify as confirm (D1).
     if len(tokens) >= 3:
         wrapper = tokens[0].lower().replace("\\", "/").split("/")[-1]
         switch = tokens[1].lower()
@@ -308,11 +342,10 @@ def _has_redirect(segment: str) -> bool:
     return False
 
 
-# Interpreters that can execute code passed inline. A payload handed to
-# one of these can do anything a destructive shell command can, spelled in
-# a way the destructive patterns never see, so the invocation is gated
-# behind explicit confirmation in every interactive mode rather than
-# riding through as an ordinary mutation.
+# Interpreters with inline code can execute arbitrary payloads the pattern
+# screen cannot see, so they are gated behind explicit confirmation in every
+# interactive mode. Wrapper interpreters (bash -c, cmd /c, powershell -c)
+# are caught by _wrapper_oneliner before expansion strips them (D1).
 _INTERPRETER_TOKENS = frozenset(
     {
         "python", "python3", "pypy", "pypy3",
@@ -362,6 +395,12 @@ def _classify_segment(segment: str) -> str:
                 return "destructive"
             if any(f in rest for f in ("-exec", "-execdir", "-ok", "-okdir")):
                 return "mutating"
+    # Wrapper interpreters (bash -c, cmd /c, powershell -c, pwsh -Command)
+    # are expanded to their inner command by _get_tokens, so the one-liner
+    # check below would never see the interpreter: detect the wrapper from
+    # the pre-expansion token head and gate it like any inline code (D1).
+    if _wrapper_oneliner(_tokenize(segment)):
+        return "confirm"
     # Interpreter one-liners: the payload is invisible to every pattern
     # above, so the invocation needs a human yes/no regardless of mode.
     if _is_interpreter_oneliner(tokens):
@@ -469,7 +508,8 @@ def classify_command(command: str) -> str:
             risk = _apply_token_rules(rules if isinstance(rules, list) else [], seg, risk)
             # A bare shell interpreter fed by a preceding segment (a pipe
             # or chain) executes the incoming text as commands: escalate
-            # to confirm so the payload is never silently run.
+            # to confirm. Wrapper one-liners (bash -c ...) already classify
+            # as confirm via _wrapper_oneliner before expansion (D1).
             if idx > 0:
                 head = _get_tokens(seg)
                 if len(head) == 1:
@@ -499,6 +539,14 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
     if tool in ("write_file", "edit_file"):
         path = str(arguments.get("path", "?"))
         verb = "overwrite" if tool == "write_file" else "edit"
+        # The shell-layer fence must also cover tool-level writes: a
+        # direct write_file to AGENTS.md/MEMORY.md bypasses the run_command
+        # forbid rules, so route it to explicit confirmation (D10).
+        import os as _os
+
+        base = _os.path.basename(path.replace("\\", "/")).lower()
+        if base in ("agents.md", "memory.md"):
+            return "confirm", f"{verb} {path} (fenced file)"
         return "mutating", f"{verb} {path}"
 
     if tool == "git_reset":
@@ -511,23 +559,76 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
         # Repair aliases (cmd, shellCommand, ...) must not bypass the
         # gate: classification runs before the loop's repair pass, so an
         # alias key would otherwise classify as "safe" with no prompt.
-        command = str(arguments.get("command") or "").strip()
-        if not command:
-            try:
-                from core.agent.repairs import ALIASES as _ALIASES
-                for alias in _ALIASES.get("command", ()):
-                    if alias != "command" and arguments.get(alias):
-                        command = str(arguments[alias]).strip()
-                        break
-            except Exception:
-                command = ""
+        command = canonical_command(arguments)
         preview = command if len(command) <= 160 else command[:157] + "..."
         return classify_command(command), preview or "(empty command)"
+
+    # Fail closed for future mutating tools without a dedicated branch.
+    return "confirm", f"{tool} (unclassified mutating tool)"
 
 
 # The audit log is written by every tool check, so the ACL tightening
 # runs once per process instead of spawning icacls on every call.
 _LOG_ACL_DONE = False
+
+# One-time stderr warning when the audit log cannot be written: a silent
+# fail-open would leave tool use unlogged (D3).
+_LOG_WRITE_WARNED = False
+
+
+def _warn_audit_log_failure() -> None:
+    """Surface the first audit-log write failure to the operator."""
+    global _LOG_WRITE_WARNED
+    if _LOG_WRITE_WARNED:
+        return
+    _LOG_WRITE_WARNED = True
+    print(
+        "[approvals] pre-tool-use audit log could not be written; "
+        "tool calls are running unlogged",
+        file=sys.stderr,
+    )
+
+
+def _rotate_audit_log(log_path: str) -> None:
+    """Truncate a >1MB audit log to its tail, under a sibling lock.
+
+    Two processes rotating concurrently would both read-modify-write the
+    file and drop each other's recent lines; the exclusive-create lock
+    makes rotation single-writer. Fails open (no rotation) on lock
+    contention or OSError, matching the best-effort logging contract (D3).
+    """
+    import os
+    import time as _time
+
+    lock_path = log_path + ".lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return  # another process is rotating; leave the file alone
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.read()[-200_000:]
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(tail)
+            f.write(
+                f"# rotated {_time.strftime('%Y-%m-%d %H:%M:%S')} — older entries truncated\n"
+            )
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
+# Guards the shared audit-log rotation counter so concurrent approval
+# checks never lose increments.
+_LOG_CHECK_LOCK = threading.Lock()
 
 
 def _restrict_audit_log(log_path: str) -> None:
@@ -596,15 +697,20 @@ class ApprovalPolicy:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             # Rotate before appending so the audit log cannot grow unbounded.
             # Size is sampled every 64th call; reading and rewriting the file
-            # on every tool call is filesystem churn on long sessions.
-            _log_check_counter = getattr(ApprovalPolicy, "_log_check_counter", 0) + 1
-            ApprovalPolicy._log_check_counter = _log_check_counter
+            # on every tool call is filesystem churn on long sessions. The
+            # counter is a shared class attribute, so the increment is
+            # guarded: concurrent checks must not lose increments and skip
+            # a rotation forever.
+            with _LOG_CHECK_LOCK:
+                ApprovalPolicy._log_check_counter = (
+                    getattr(ApprovalPolicy, "_log_check_counter", 0) + 1
+                )
+                _log_check_counter = ApprovalPolicy._log_check_counter
             try:
+                # A missing log file fails the size probe; that is normal
+                # on the first call, not a logging failure.
                 if _log_check_counter % 64 == 0 and os.path.getsize(log_path) > 1_000_000:
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                        tail = f.read()[-200_000:]
-                    with open(log_path, "w", encoding="utf-8") as f:
-                        f.write(tail)
+                    _rotate_audit_log(log_path)
             except OSError:
                 pass
             safe_detail = _redact_sensitive(detail)[:200]
@@ -614,7 +720,7 @@ class ApprovalPolicy:
             # Owner-only ACL: os.chmod alone is a no-op on Windows.
             _restrict_audit_log(log_path)
         except Exception:
-            pass
+            _warn_audit_log_failure()
 
         if self.mode == "plan" and tool in MUTATING_TOOLS:
             self._note(f"plan mode: refused {tool} ({detail})")
@@ -633,7 +739,6 @@ class ApprovalPolicy:
         # only way to stop being asked.
         if self.mode == "auto" and risk == "mutating":
             return True
-
         key = self._key(tool, arguments)
         if key in self.session_allowed:
             return True
@@ -657,7 +762,9 @@ class ApprovalPolicy:
     @staticmethod
     def _key(tool: str, arguments: dict[str, Any]) -> str:
         if tool == "run_command":
-            command = str(arguments.get("command", "")).strip()
+            # Alias spellings share the canonical key, matching classify
+            # and the loop's repair pass (D4).
+            command = canonical_command(arguments)
             # Lowercase verb for matching; preserve path case.
             parts = command.split()
             if parts:

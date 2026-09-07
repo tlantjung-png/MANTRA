@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+# @@ -oldStart[,count] +newStart[,count] @@; counts are optional.
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
@@ -105,16 +106,20 @@ def parse_diff(text: str) -> list[FileDiff]:
             continue
         if hunk is None:
             continue
-        if line.startswith("+") and not line.startswith("+++"):
+        # Classify +/- lines first: only the spaced "+++ " / "--- " forms
+        # are file headers; a content line like "++i" or "--x" is data.
+        if line.startswith("+") and not line.startswith("+++ "):
             hunk.lines.append(DiffLine("add", None, new_no, line[1:]))
             new_no += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif line.startswith("-") and not line.startswith("--- "):
             hunk.lines.append(DiffLine("del", old_no, None, line[1:]))
             old_no += 1
         elif line.startswith(" ") or line == "":
             hunk.lines.append(DiffLine("ctx", old_no, new_no, line[1:] if line else ""))
             old_no += 1
             new_no += 1
-        # Any other header-ish line is ignored inside a hunk.
+        # Any other line is ignored inside a hunk (index headers, a
+        # spaced "+++ "/"--- " header that somehow appears mid-hunk,
+        # "\ No newline" markers).
 
     return [f for f in files if f.hunks]

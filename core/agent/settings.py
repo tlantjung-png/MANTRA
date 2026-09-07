@@ -289,8 +289,8 @@ def add_endpoint(
     api_key_env: str = "",
     models: Iterable[str] | None = None,
     note: str = "",
-) -> None:
-    """Add or replace an endpoint. Raises ValueError on a bad entry."""
+) -> bool:
+    """Add or replace an endpoint. Raises ValueError on a bad entry. Returns persistence status."""
     name = (name or "").strip().lower()
     if not name:
         raise ValueError("an endpoint needs a name")
@@ -313,7 +313,7 @@ def add_endpoint(
         }
     )
     data["endpoints"][name] = merged
-    _write(data)
+    return _write(data)
 
 
 def remove_endpoint(name: str) -> bool:
@@ -328,19 +328,20 @@ def remove_endpoint(name: str) -> bool:
     if data["active"].get("endpoint") == name:
         data["active"]["endpoint"] = ""
         data["active"]["model"] = ""
-    _write(data)
+    if not _write(data):
+        return False
     return True
 
 
-def set_models(name: str, models: Iterable[str]) -> None:
+def set_models(name: str, models: Iterable[str]) -> bool:
     """Record what an endpoint serves, so /model can list it offline."""
     name = (name or "").strip().lower()
     data = load()
     entry = data["endpoints"].get(name)
     if entry is None:
-        return
+        return False
     entry["models"] = [str(m) for m in models if str(m).strip()]
-    _write(data)
+    return _write(data)
 
 
 def models_for(name: str) -> list[str]:
@@ -382,16 +383,16 @@ def set_active(
     endpoint: str | None = None,
     model: str | None = None,
     reasoning_effort: Any = _UNSET,
-) -> None:
+) -> bool:
     """Record the current choice. Arguments left as-is when not given."""
     data = load()
     if endpoint is not None:
-        data["active"]["endpoint"] = endpoint
+        data["active"]["endpoint"] = (endpoint or "").strip().lower()
     if model is not None:
-        data["active"]["model"] = model
+        data["active"]["model"] = (model or "").strip()
     if reasoning_effort is not _UNSET:
         data["active"]["reasoning_effort"] = reasoning_effort
-    _write(data)
+    return _write(data)
 
 
 def skills_prefs() -> dict[str, Any]:
@@ -411,14 +412,14 @@ def skills_prefs() -> dict[str, Any]:
     }
 
 
-def set_skills_prefs(auto: bool | None = None, auto_bundle: bool | None = None) -> None:
+def set_skills_prefs(auto: bool | None = None, auto_bundle: bool | None = None) -> bool:
     """Record the skills preferences. Arguments left as-is when not given."""
     data = load()
     if auto is not None:
         data["skills"]["auto"] = bool(auto)
     if auto_bundle is not None:
         data["skills"]["auto_bundle"] = bool(auto_bundle)
-    _write(data)
+    return _write(data)
 
 
 def validate_endpoint(entry: dict[str, Any]) -> str | None:

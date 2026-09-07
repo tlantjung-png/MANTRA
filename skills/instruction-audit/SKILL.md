@@ -34,7 +34,7 @@ before large prompt-asset changes, or periodically as maintenance.
    attends to costs tokens without changing behavior.
 5. Apply the prune test to every rule: if removing it would not cause a concrete
    mistake, propose removal. Historical narration moves to memory or the
-   CHANGELOG.
+   repository change log, when present.
 6. Route changes through the owning flow - update-memory for memory entries,
    known-failures for failure classes, rules edits for approvals - and verify with
    the relevant focused suites.

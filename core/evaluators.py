@@ -9,8 +9,19 @@ from core.types import Sandbox
 
 class CommandEvaluator(Evaluator):
     def __init__(self, test_cmd: str, timeout: float = 600.0) -> None:
+        # A config timeout outside (0,600] would make every sandbox.exec
+        # return exit -1 ("timeout out of range"); surface it here as a
+        # config error instead of a silent wall of failures (D22).
+        try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            raise ValueError(f"evaluator timeout must be a number, got {timeout!r}") from None
+        if not 0 < timeout_f <= 600:
+            raise ValueError(
+                f"evaluator timeout must be in (0, 600], got {timeout!r}"
+            )
         self.test_cmd = test_cmd
-        self.timeout = timeout
+        self.timeout = timeout_f
 
     def evaluate(self, sandbox: Sandbox, task: dict) -> EvaluationResult:
         command = task.get("test_cmd", self.test_cmd)
@@ -22,7 +33,16 @@ class CommandEvaluator(Evaluator):
                 passed=False,
                 detail=f"test_cmd must be a non-empty string, got {command!r}",
             )
-        result = sandbox.exec(command, timeout=self.timeout)
+        try:
+            result = sandbox.exec(command, timeout=self.timeout)
+        except Exception as exc:
+            # Contract: evaluate() must never raise; surface as failure.
+            from core.agent.approvals import _redact_sensitive as _redact
+
+            return EvaluationResult(
+                passed=False,
+                detail=f"evaluator error: {_redact(str(exc))[:2000]}",
+            )
         passed = result.exit_code == 0 and not result.timed_out
         # The last 4KB of tool output can carry credentials the agent
         # printed; redact known secret patterns before persisting.
@@ -35,14 +55,11 @@ class CommandEvaluator(Evaluator):
                 + f"; output tail:\n{tail}"
             ),
         )
-"""Evaluator: always passes for interactive sessions."""
-
-
-from core.types import EvaluationResult, Evaluator
-from core.types import Sandbox
 
 
 class NullEvaluator(Evaluator):
+    """Always passes; used for interactive runs without automatic grading."""
+
     def evaluate(self, sandbox: Sandbox, task: dict) -> EvaluationResult:
         return EvaluationResult(
             passed=True, detail="interactive run (no automatic grading)"

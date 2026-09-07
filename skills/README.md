@@ -43,7 +43,7 @@ monitor stack) were rewritten to use the primitives this repo really ships:
 - workflows: `/workflow` (JSON prompt sequences in `~/.mantra/workflows.json`)
 - integrity chain: not shipped - deliberately left behind (see docs/ADOPTION.md)
 - sessions & logs: `~/.mantra/sessions/`, `logs/*.jsonl`
-- session state: `/goal`, `/todo`, `/compact`, `/resume`
+- session state: `/goal`, `/todo`, `/compact`, `/sessions` (resume was folded into `/sessions`)
 - tools: the console's bounded `read_file` / `list_dir` / `search_code` / diff
   renderer, with read-before-edit enforcement built into `edit_file`
 

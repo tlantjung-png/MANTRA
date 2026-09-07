@@ -137,6 +137,21 @@ def repair_quoted_escapes_json_text(json_text: str) -> str:
     """Repair single-backslash Windows paths in JSON text."""
     return _repair_quoted_escapes_json(json_text)
 
+
+def canonical_command(arguments: dict[str, Any]) -> str:
+    """The run_command payload under its canonical ``command`` key.
+
+    Alias spellings (cmd, shellCommand, ...) resolve to the canonical
+    value so dedup and session keys agree with the repair pass (D4).
+    """
+    command = str(arguments.get("command") or "").strip()
+    if command:
+        return command
+    for alias in ALIASES.get("command", ()):
+        if alias != "command" and arguments.get(alias):
+            return str(arguments[alias]).strip()
+    return ""
+
 def _is_json_array_string(s: str) -> bool:
     # Matches arrays, objects, and quoted strings despite the name; also
     # gates the object-string parse path below.

@@ -42,6 +42,24 @@ def render_environment(workspace: str) -> str:
         f"- python: {platform.python_version()}",
         f"- workspace: {workspace}",
     ]
+    git_line = _git_facts(workspace)
+    if git_line:
+        lines.append(git_line)
+    return "\n".join(lines)
+
+
+# Git facts per workspace, cached briefly: each system-prompt rebuild
+# otherwise spawns up to three git subprocesses (D21).
+_GIT_FACTS_CACHE: dict[str, tuple[float, str]] = {}
+_GIT_FACTS_TTL = 30.0
+
+
+def _git_facts(workspace: str) -> str:
+    """Git state line for a workspace, cached for a short TTL."""
+    now = time.monotonic()
+    cached = _GIT_FACTS_CACHE.get(workspace)
+    if cached and now - cached[0] < _GIT_FACTS_TTL:
+        return cached[1]
     repo_state, flag = _git_checked(workspace, "rev-parse", "--is-inside-work-tree")
     if repo_state == "ok" and flag == "true":
         branch_state, branch = _git_checked(workspace, "rev-parse", "--abbrev-ref", "HEAD")
@@ -53,18 +71,24 @@ def render_environment(workspace: str) -> str:
         else:
             # Avoid guessing clean when probe failed.
             state = "state unknown (status probe failed)"
-        lines.append(f"- git: branch {branch} ({state})")
+        git_line = f"- git: branch {branch} ({state})"
     elif repo_state == "error":
-        lines.append("- git: state unknown (probe failed)")
+        git_line = "- git: state unknown (probe failed)"
     else:
-        lines.append("- git: not a repository")
-    return "\n".join(lines)
+        git_line = "- git: not a repository"
+    _GIT_FACTS_CACHE[workspace] = (now, git_line)
+    return git_line
 
 
 def _shell_name() -> str:
+    # Prefer explicit shell hints so alternate shells are described correctly.
+    for var in ("MANTRA_SHELL", "SHELL", "ComSpec"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
     if os.name == "nt":
-        return "cmd.exe via subprocess (PowerShell available; no Unix coreutils)"
-    return os.environ.get("SHELL", "/bin/sh")
+        return "native shell via subprocess (no Unix coreutils assumed)"
+    return "/bin/sh"
 
 
 def _git(workspace: str, *args: str) -> str:
@@ -179,13 +203,17 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
     # Serialize concurrent appends in this process.
     with _memory_lock:
         existing = _read_file(memory_path)
+        # A single appended entry longer than the cap must not wipe the
+        # file: cap the entry itself first, and refuse when nothing of
+        # it survives (D2).
+        if len(entry) > cap:
+            body = entry.rstrip("\n")
+            body = body[-cap:] if len(body) > cap else body
+            entry = (body + "\n") if len(body) + 1 <= cap else body
+            if not entry.strip():
+                return False
         combined = (existing + "\n" + entry).lstrip("\n") if existing else entry
-        while len(combined) > cap:
-            lines = combined.split("\n")
-            combined = "\n".join(lines[1:])
-            if "\n" not in combined and len(combined) > cap:
-                combined = combined[-cap:]
-                break
+        combined = _prune_to_cap(combined, cap)
         parent = os.path.dirname(memory_path)
         if parent:
             try:
@@ -232,12 +260,7 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
             fresh = _read_file(memory_path)
             if fresh != existing:
                 combined = (fresh + "\n" + entry).lstrip("\n") if fresh else entry
-                while len(combined) > cap:
-                    lines = combined.split("\n")
-                    combined = "\n".join(lines[1:])
-                    if "\n" not in combined and len(combined) > cap:
-                        combined = combined[-cap:]
-                        break
+                combined = _prune_to_cap(combined, cap)
             # Unique temp name in the same directory: no fixed path for a
             # planted symlink to hijack.
             try:
@@ -330,7 +353,20 @@ _STOP_WORDS = frozenset({
 _META_RE = re.compile(r"\|\s*(?:status=([a-z]+)|stale=(\d{4}-\d{2}-\d{2})|source=([^\s|]+))")
 
 
+def _prune_to_cap(combined: str, cap: int) -> str:
+    """Drop oldest lines until the body fits cap; never returns empty (D2)."""
+    while len(combined) > cap:
+        lines = combined.split("\n")
+        if len(lines) <= 2:
+            # A single over-long line (with its trailing newline): tail-
+            # truncate instead of collapsing to an empty file.
+            return combined[-cap:]
+        combined = "\n".join(lines[1:])
+    return combined
+
+
 def _cap_body(body: str, cap: int) -> str:
+    # Drop oldest lines until the body fits cap, keeping the newest tail.
     if len(body) <= cap:
         return body
     lines = body.split("\n")
@@ -373,6 +409,10 @@ def _words(text: str) -> set[str]:
 
 def _line_words(line: str) -> set[str]:
     """Significant words of a memory line's CONTENT.
+
+    Assumes the canonical entry shape (``- date | task-id | reason | status=``)
+    that the writer enforces; hand-written lines in another shape still
+    work, only with their metadata counted as topic words.
 
     Metadata is excluded: the date, task-id tokens, key=value markers and
     the ``done:``/``error:`` reason prefix carry no topic signal and would

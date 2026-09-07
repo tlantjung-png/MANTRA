@@ -3,10 +3,10 @@
 Covers: bundle launches keep the operator's request, token rules are
 enforced, a failed call keeps one identical retry, keyless local endpoints
 work, the sampling-temperature field sheds on rejection, name resolution
-honours its timeout, the atomic-write guarantee has no direct-write
-backdoor, corrupt credentials quarantine once, the session listing caches,
-the memory-file fence covers redirects, and the startup card cannot survive
-the first turn or a resize.
+honours its timeout, atomic writes to the settings/sessions stores report
+failure instead of direct-writing, corrupt credentials quarantine once,
+the session listing caches, the memory-file fence covers redirects, and
+the startup card cannot survive the first turn or a resize.
 """
 
 from __future__ import annotations
@@ -321,7 +321,9 @@ class ResolveTimeoutTest(unittest.TestCase):
 
 
 class AtomicWriteNoBackdoorTest(unittest.TestCase):
-    """M-7: a failed atomic replace reports failure instead of direct-writing."""
+    """M-7: settings/sessions atomic replace reports failure instead of
+    direct-writing (LocalSandbox.write_file keeps its own re-validated
+    fallback, which is not covered here)."""
 
     def test_settings_write_failure_returns_false(self):
         old = os.environ.get("MANTRA_SETTINGS")
@@ -415,10 +417,16 @@ class SessionListingCacheTest(unittest.TestCase):
         try:
             sessions_module.save("changing", {"messages": [{"role": "user", "content": "one"}]})
             before = sessions_module.list_sessions()
+            before_keys = set(sessions_module._LISTING_CACHE)
             sessions_module.save("changing", {"messages": [{"role": "user", "content": "two"}]})
             after = sessions_module.list_sessions()
             self.assertEqual(after[0]["summary"], "two")
-            self.assertNotEqual(before[0]["mtime"], 0.0)
+            # The re-save must produce a new stat key: a stale cache hit
+            # would still show the old summary.
+            self.assertTrue(
+                set(sessions_module._LISTING_CACHE) - before_keys,
+                "re-saved file was served from the stale listing cache",
+            )
         finally:
             sessions_module._LISTING_CACHE.clear()
             if old is None:

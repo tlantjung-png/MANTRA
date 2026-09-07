@@ -2,13 +2,13 @@
 
 ## Prerequisites
 
-A supported interpreter version is required as declared in the project manifest. Network access to a compatible language model service is required for live operation. For isolated execution, a container runtime must be available on the host and its command-line interface must be executable. Version-control tooling is expected on the host for workspace initialization and change inspection.
+A supported interpreter version is required as declared in the project manifest (Python 3.10 or newer). Network access to a compatible language model service is required for live operation. Version-control tooling is expected on the host for workspace initialization and change inspection. A container runtime is required only when the container sandbox is used; its command-line interface must be executable on the host.
 
 ## Installation
 
-The project is installed via the standard packaging mechanism using the manifest in the repository root. Package discovery is limited to the source directory. No runtime dependencies are declared for core operation. An optional parsing library is required only when using the alternative configuration format.
+The project is installed via the standard packaging mechanism using the manifest in the repository root, with a setuptools backend. Package discovery is limited to the source directory. No runtime dependencies are declared for core operation. An optional parsing library is required only when using the alternative configuration format.
 
-After installation, two entry points are available: the interactive console and the headless runner. The interactive console can also be invoked directly from the source tree without installation through the provided launcher, which retries with the source directory on the module search path if the first attempt fails.
+After installation, two entry points are available: the interactive console and the headless runner. The interactive console can also be invoked directly from the source tree without installation through the provided launcher. The launcher first probes whether the package is importable, and when the probe fails it retries with the source directory prepended to the module search path; the probe also rejects a foreign core package from site-packages so a different package cannot hijack the console.
 
 The console can be launched with overrides for workspace location, model, endpoint address, reasoning effort, and approval mode, and with flags to disable styling or to handle a single message non-interactively.
 
@@ -26,7 +26,7 @@ User-wide endpoint selections live in a hand-editable file in the home directory
 
 A workspace directory holds the repository under test. If the directory lacks version-control initialization, an empty repository is initialized automatically. The workspace is reused across turns in interactive mode, and its location can be overridden at launch.
 
-Repository-specific instructions are discovered by searching the workspace root for well-known filenames in a defined preference order, and the first match is used. Per-workspace memory is stored in a hidden directory and capped; oversized single lines are truncated.
+Repository-specific instructions are discovered by searching the workspace root for well-known filenames in a defined preference order, and the first match is used. Per-workspace memory is stored in a hidden directory under the workspace and capped; oversized single lines are truncated.
 
 The system prompt is assembled from the base instruction, environment facts, known-failure knowledge, the durable memory tail, and any repository instructions, with a total cap that is re-applied after per-turn additions.
 
@@ -34,6 +34,6 @@ The interactive console requires a terminal for full functionality. When standar
 
 ## Verification
 
-The test suite is discovered in a dedicated test directory with the module search path adjusted to include the source directory. Running the suite exercises offline paths without network access or credentials, covering the orchestration loop, history truncation and budgeting, configuration validation including unknown-key rejection, the read-before-edit contract, memory capping, instruction discovery, the streaming parser with malformed-chunk limits, model discovery filtering, approval classification including wrapper handling, session persistence with legacy fallback, file-tool safety checks including the resume arithmetic after a byte-budget cut, and the byte-exact input decoder of the terminal layer.
+The test suite is discovered in a dedicated test directory with the module search path adjusted to include the source directory, and is run with pytest. Running the suite exercises offline paths without network access or credentials, covering the orchestration loop, history truncation and budgeting, configuration validation including unknown-key rejection, the read-before-edit contract, memory capping, instruction discovery, the streaming parser with malformed-chunk limits, model discovery filtering, approval classification including wrapper handling, session persistence with legacy fallback, file-tool safety checks, and the byte-exact input decoder of the terminal layer. The read tool's resume-offset behavior after a byte-budget cut, including the line recount when a cut lands mid-line, is covered by the suite.
 
 Interactive-layer tests cover workspace persistence, conversation continuity, turn-aware truncation, approval prompts, abort handling, and prompt forwarding, with explicit background opt-in. Live probes are available for end-to-end verification with valid credentials and are not required for the offline suite.

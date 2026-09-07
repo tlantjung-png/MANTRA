@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -14,6 +15,25 @@ from core.types import ExecResult, Sandbox
 _EXEC_TIMEOUT = 600.0
 _MAX_READ_BYTES = 500_000
 _MAX_EXEC_BYTES = 1_000_000
+
+
+def _read_pipe_into(stream, buf: bytearray, cap: int, done: threading.Event) -> None:
+    """Append streamed bytes to ``buf`` until EOF or ``cap``; set ``done``.
+
+    Runs in a daemon thread so the pump keeps watching the deadline and
+    the abort signal while output is read incrementally; the cap keeps
+    memory bounded for chatty in-container commands.
+    """
+    try:
+        while len(buf) < cap:
+            chunk = stream.read(cap - len(buf) + 1)
+            if not chunk:
+                break
+            buf.extend(chunk[: cap - len(buf)])
+    except (OSError, ValueError):
+        pass
+    finally:
+        done.set()
 
 
 class DockerSandbox(Sandbox):
@@ -87,7 +107,7 @@ class DockerSandbox(Sandbox):
                 if not self._is_safe_repo_url(repo_str):
                     raise SandboxError(f"repo_url rejected: {repo_str!r}")
                 result = self._exec_no_shell(
-                    ["git", "clone", repo_str, "."], timeout=300
+                    ["git", "clone", repo_str, "."], timeout=task.get("clone_timeout", 300)
                 )
                 if result.exit_code != 0:
                     raise SandboxError(f"git clone failed: {result.stderr[:2000]}")
@@ -102,7 +122,7 @@ class DockerSandbox(Sandbox):
                         raise SandboxError(f"git checkout failed for {commit_str}")
 
             setup_cmd = task.get("setup_cmd")
-            if setup_cmd and self.exec(setup_cmd, timeout=600).exit_code != 0:
+            if setup_cmd and self.exec(setup_cmd, timeout=task.get("setup_timeout", 600)).exit_code != 0:
                 raise SandboxError(f"setup_cmd failed in container {self._container_id}")
         except Exception:
             try:
@@ -128,52 +148,73 @@ class DockerSandbox(Sandbox):
                 ["docker", "exec", self._container_id, "sh", "-lc", command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
             )
-            interval = 0.1
-            limit = min(timeout_f, _EXEC_TIMEOUT)  # clamp: no exec runs forever
-            deadline = time.monotonic() + limit
-            while True:
-                if abort is not None and abort.is_set():
-                    try:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                    except OSError:
-                        pass
-                    raise AbortError("interrupted by operator")
-                try:
-                    stdout, stderr = proc.communicate(timeout=interval)
-                    if stdout and len(stdout) > _MAX_EXEC_BYTES:
-                        stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                    if stderr and len(stderr) > _MAX_EXEC_BYTES:
-                        stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                    return ExecResult(
-                        exit_code=proc.returncode,
-                        stdout=stdout or "",
-                        stderr=stderr or "",
-                    )
-                except subprocess.TimeoutExpired:
-                    if time.monotonic() >= deadline:
-                        try:
-                            proc.kill()
-                            stdout, stderr = proc.communicate(timeout=2)
-                        except (OSError, subprocess.SubprocessError):
-                            stdout, stderr = "", ""  # output lost with the killed process
-                        if stdout and len(stdout) > _MAX_EXEC_BYTES:
-                            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                        if stderr and len(stderr) > _MAX_EXEC_BYTES:
-                            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                        return ExecResult(
-                            exit_code=-1, stdout=stdout or "", stderr=stderr or "", timed_out=True
-                        )
-                    continue
         except OSError as exc:
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
+        return self._pump(proc, timeout_f)
+
+    def _pump(self, proc: subprocess.Popen, timeout_f: float) -> ExecResult:
+        """Collect output incrementally until exit, cap, deadline, or abort.
+
+        Reader threads fill capped buffers as bytes arrive, so a chatty
+        command never buffers its full output in RAM. A timeout or abort
+        kills the docker exec client and then reaps in-container children
+        so the runaway command cannot keep the container's CPU/memory
+        reservation past the turn.
+        """
+        abort = getattr(self, "abort", None)
+        out_buf = bytearray()
+        err_buf = bytearray()
+        out_done = threading.Event()
+        err_done = threading.Event()
+        t_out = threading.Thread(
+            target=_read_pipe_into,
+            args=(proc.stdout, out_buf, _MAX_EXEC_BYTES, out_done),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_read_pipe_into,
+            args=(proc.stderr, err_buf, _MAX_EXEC_BYTES, err_done),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+        timed_out = False
+        interval = 0.1
+        limit = min(timeout_f, _EXEC_TIMEOUT)  # clamp: no exec runs forever
+        deadline = time.monotonic() + limit
+        try:
+            while True:
+                if abort is not None and abort.is_set():
+                    self._kill_exec(proc)
+                    raise AbortError("interrupted by operator")
+                if out_done.is_set() and err_done.is_set():
+                    break
+                if len(out_buf) >= _MAX_EXEC_BYTES or len(err_buf) >= _MAX_EXEC_BYTES:
+                    self._kill_exec(proc)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    self._kill_exec(proc)
+                    break
+                time.sleep(interval)
+        finally:
+            # After a kill the pipes close once the exec client is gone;
+            # the reader threads then hit EOF and release the handles.
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+        stdout = out_buf.decode("utf-8", errors="replace")
+        stderr = err_buf.decode("utf-8", errors="replace")
+        if len(out_buf) >= _MAX_EXEC_BYTES:
+            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+        if len(err_buf) >= _MAX_EXEC_BYTES:
+            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+        if timed_out:
+            return ExecResult(exit_code=-1, stdout=stdout, stderr=stderr, timed_out=True)
+        exit_code = proc.poll()
+        if exit_code is None:
+            exit_code = -1
+        return ExecResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
 
     def _is_safe_path(self, path: str) -> bool:
         if not path or "\x00" in path or "\n" in path or "\r" in path or ":" in path:
@@ -223,7 +264,7 @@ class DockerSandbox(Sandbox):
         script = (
             'p=$(readlink -f -- "$1"); '
             'case "$p" in '
-            '"$2"/*) ;; '
+            '"$2"|"$2"/*) ;; '
             '*) exit 9 ;; '
             'esac; '
             'cat "$p"'
@@ -312,14 +353,37 @@ class DockerSandbox(Sandbox):
                 )
             self._container_id = None
 
+    def _kill_exec(self, proc: subprocess.Popen) -> None:
+        """Kill the docker exec client, then reap the in-container command.
+
+        Killing the client does not stop what runs inside the container,
+        so the reap runs after the kill on every timeout/abort path.
+        """
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self._kill_container_children()
+
     def _kill_container_children(self) -> None:
         """Best-effort reap of in-container processes after a timeout/abort.
 
         Killing the docker exec client does not stop the command running
         inside the container, so ask the container to reap its own
-        children. ``kill -TERM -1`` is the portable path (slim images have
-        no procps/pkill); ``pkill -P 1`` is kept as a fallback. Never
-        raises: this is best effort only.
+        children. Only children of PID 1 are signalled; PID 1 itself is
+        the ``sleep infinity`` keeper and must survive, so a broadcast
+        to every process is never used. Never raises: best effort only.
         """
         if self._container_id is None:
             return
@@ -331,7 +395,9 @@ class DockerSandbox(Sandbox):
                     self._container_id,
                     "sh",
                     "-lc",
-                    "kill -TERM -1 2>/dev/null; pkill -P 1 2>/dev/null; true",
+                    "pkill -TERM -P 1 2>/dev/null; "
+                    "for p in $(ps -o pid= --ppid 1 2>/dev/null); do kill -TERM \"$p\" 2>/dev/null; done; "
+                    "sleep 1; pkill -KILL -P 1 2>/dev/null; true",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -356,52 +422,10 @@ class DockerSandbox(Sandbox):
                 ["docker", "exec", self._container_id, *args],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
             )
-            interval = 0.1
-            limit = min(timeout_f, _EXEC_TIMEOUT)  # clamp: no exec runs forever
-            deadline = time.monotonic() + limit
-            while True:
-                if abort is not None and abort.is_set():
-                    try:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                    except OSError:
-                        pass
-                    raise AbortError("interrupted by operator")
-                try:
-                    stdout, stderr = proc.communicate(timeout=interval)
-                    if stdout and len(stdout) > _MAX_EXEC_BYTES:
-                        stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                    if stderr and len(stderr) > _MAX_EXEC_BYTES:
-                        stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                    return ExecResult(
-                        exit_code=proc.returncode,
-                        stdout=stdout or "",
-                        stderr=stderr or "",
-                    )
-                except subprocess.TimeoutExpired:
-                    if time.monotonic() >= deadline:
-                        try:
-                            proc.kill()
-                            stdout, stderr = proc.communicate(timeout=2)
-                        except (OSError, subprocess.SubprocessError):
-                            stdout, stderr = "", ""  # output lost with the killed process
-                        if stdout and len(stdout) > _MAX_EXEC_BYTES:
-                            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                        if stderr and len(stderr) > _MAX_EXEC_BYTES:
-                            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
-                        return ExecResult(
-                            exit_code=-1, stdout=stdout or "", stderr=stderr or "", timed_out=True
-                        )
-                    continue
         except OSError as exc:
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
+        return self._pump(proc, timeout_f)
 
     @staticmethod
     def _is_safe_repo_url(url: str) -> bool:

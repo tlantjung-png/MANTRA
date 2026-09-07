@@ -70,10 +70,9 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         WebFetchTool,
     )
 }
-# Canonical name normalization: add alias without underscore by normalizing
-# incoming names at lookup time rather than duplicating entries. Keep alias
-# entry for backward compat (tests index TOOL_REGISTRY directly) but also
-# normalize on lookup to avoid divergence.
+# Normalize incoming names (case/dashes) and map "webfetch" -> "web_fetch"
+# at lookup time; the direct alias entry below keeps
+# TOOL_REGISTRY["webfetch"] working for tests that index the registry.
 _TOOL_ALIASES: dict[str, str] = {"webfetch": "web_fetch"}
 
 
@@ -82,7 +81,6 @@ def _normalize_tool_name(name: str) -> str:
     return _TOOL_ALIASES.get(n, n)
 
 
-# Keep backward-compat alias entry so TOOL_REGISTRY["webfetch"] works for direct indexing
 TOOL_REGISTRY["webfetch"] = WebFetchTool
 
 
@@ -99,8 +97,22 @@ def build_llm(config: dict) -> LLMClient:
     if script_file:
         from core.scripted import ScriptedLLMClient, load_script_file
 
-        return ScriptedLLMClient(load_script_file(script_file))
-    return _construct(cls, config)
+        try:
+            script = load_script_file(script_file)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ConfigError(
+                f"cannot load MANTRA_SCRIPT file {script_file!r}: {exc}"
+            ) from exc
+        # Still validate the base config so typos do not pass silently.
+        _construct(cls, config, extra_keys=frozenset({"provider"}))
+        import sys as _sys
+
+        print(
+            f"warning: MANTRA_SCRIPT overrides llm provider '{kind}' for tests",
+            file=_sys.stderr,
+        )
+        return ScriptedLLMClient(script)
+    return _construct(cls, config, extra_keys=frozenset({"provider"}))
 
 
 def build_sandbox(config: dict) -> Sandbox:
@@ -108,7 +120,7 @@ def build_sandbox(config: dict) -> Sandbox:
     cls = SANDBOX_REGISTRY.get(kind)
     if cls is None:
         raise ConfigError(f"unknown sandbox provider '{kind}' (known: {sorted(SANDBOX_REGISTRY)})")
-    return _construct(cls, config)
+    return _construct(cls, config, extra_keys=frozenset({"provider"}))
 
 
 def build_evaluator(config: dict) -> Evaluator:
@@ -116,7 +128,7 @@ def build_evaluator(config: dict) -> Evaluator:
     cls = EVALUATOR_REGISTRY.get(kind)
     if cls is None:
         raise ConfigError(f"unknown evaluator '{kind}' (known: {sorted(EVALUATOR_REGISTRY)})")
-    return _construct(cls, config)
+    return _construct(cls, config, extra_keys=frozenset({"type"}))
 
 
 def build_logger(config: dict) -> Logger:
@@ -124,7 +136,7 @@ def build_logger(config: dict) -> Logger:
     cls = LOGGER_REGISTRY.get(kind)
     if cls is None:
         raise ConfigError(f"unknown logger '{kind}' (known: {sorted(LOGGER_REGISTRY)})")
-    return _construct(cls, config)
+    return _construct(cls, config, extra_keys=frozenset({"type"}))
 
 
 def build_tools(names: list[str]) -> list[Tool]:
@@ -151,11 +163,12 @@ def build_tools(names: list[str]) -> list[Tool]:
     return tools
 
 
-def _construct(cls, config: dict):
+def _construct(cls, config: dict, extra_keys: frozenset[str] = frozenset({"provider", "type"})):
     """Build component; forward only matching params, reject unknown keys."""
     params = _constructor_params(cls)
-    # Known keys are constructor params plus the discriminant keys
-    known = set(params.keys()) | {"provider", "type"}
+    # Known keys are constructor params plus the section's discriminator
+    # key; a stray key from another section is rejected, not ignored.
+    known = set(params.keys()) | set(extra_keys)
     unknown = [k for k in config.keys() if k not in known]
     if unknown:
         raise ConfigError(
@@ -164,7 +177,7 @@ def _construct(cls, config: dict):
         )
     kwargs = {}
     for key, value in config.items():
-        if key in ("provider", "type"):
+        if key in extra_keys:
             continue
         if key in params:
             kwargs[key] = value

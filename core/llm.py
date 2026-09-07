@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 
 _MAX_RESPONSE_BYTES = 5_000_000
 _MAX_CONTENT_PARTS_BYTES = 2_000_000
+# Tool-call argument fragments accumulate per slot; cap them like content
+# so a garbage stream of tool chunks cannot grow memory without bound.
+_MAX_TOOL_ARGS_BYTES = 2_000_000
 # A single SSE event's data, accumulated across continuation lines, may
 # not grow without bound: a garbage stream without blank-line terminators
 # must flush through the malformed backstop instead of buffering forever.
@@ -33,6 +36,32 @@ IncompleteRead = http.client.IncompleteRead
 # operator to invent a key for a local inference server, after the setup
 # flow told them none is needed, is a contradiction.
 KEYLESS_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def _normalize_content(content: Any) -> str | None:
+    """Normalize a model reply to plain text.
+
+    Reasoning-model endpoints return content as a list of parts; accept a
+    plain string, join the text of list parts, and reject anything else
+    with LLMError so a foreign shape cannot leak into the agent's message.
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(part.get("text") or "")
+            else:
+                raise LLMError(
+                    f"model content part has unexpected type: {type(part).__name__}"
+                )
+        return "".join(parts) or None
+    raise LLMError(f"model content has unexpected type: {type(content).__name__}")
 
 
 def is_keyless_base_url(base_url: str) -> bool:
@@ -74,14 +103,27 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
     """
     content_parts: list[str] = []
     content_bytes = 0
-    # index -> fragments accumulating by tool index
-    tool_acc: dict[int, dict[str, str]] = {}
+    args_bytes = 0
+    # key -> fragments accumulating per tool call; keyed by index when
+    # present, else by id so an index-less gateway keeps calls separate.
+    tool_acc: dict[Any, dict[str, str]] = {}
     usage: dict | None = None
     malformed = 0
     malformed_total = 0
     seen_done = False
     data_lines: list[str] = []
     event_size = 0
+
+    def _slot_key(call: dict) -> Any:
+        """Slot key for a tool-call fragment: index when present, else id."""
+        if call.get("index") is not None:
+            try:
+                return int(call["index"])
+            except (TypeError, ValueError):
+                return 0
+        if call.get("id"):
+            return ("id", str(call["id"]))
+        return 0
 
     def _count_malformed() -> None:
         nonlocal malformed, malformed_total
@@ -93,7 +135,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             raise LLMError(f"stream contained too many malformed chunks total ({malformed_total}) — possible protocol mismatch")
 
     def _apply_chunk(chunk: Any) -> None:
-        nonlocal malformed, usage, content_bytes
+        nonlocal malformed, usage, content_bytes, args_bytes
         if not isinstance(chunk, dict):
             _count_malformed()
             return  # tolerate keep-alive / noise
@@ -128,11 +170,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
         for call in delta.get("tool_calls") or []:
             if not isinstance(call, dict):
                 raise LLMError(f"stream tool_call not an object: {call!r}")
-            try:
-                idx = int(call.get("index", 0))
-            except (TypeError, ValueError):
-                idx = 0
-            slot = tool_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+            slot = tool_acc.setdefault(_slot_key(call), {"id": "", "name": "", "args": ""})
             if call.get("id"):
                 cid = str(call["id"])
                 # Keep first id only.
@@ -142,8 +180,20 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             if not isinstance(fn, dict):
                 raise LLMError(f"stream tool_call function not an object: {call!r}")
             if fn.get("name"):
-                name_part = str(fn["name"])
-                slot["name"] = slot["name"] + name_part
+                new_name = str(fn["name"])
+                cur = slot["name"]
+                if not cur:
+                    slot["name"] = new_name
+                elif new_name == cur:
+                    # Some gateways repeat the full name per chunk; drop.
+                    pass
+                elif cur.endswith(new_name) and len(new_name) < len(cur):
+                    # Another form of repetition: the gateway sends the
+                    # accumulated name again. Drop the no-op extension.
+                    pass
+                else:
+                    # Treat as a name fragment that extends the name.
+                    slot["name"] = cur + new_name
             if fn.get("arguments") is not None:
                 arg_part = fn["arguments"]
                 # Some gateways send parsed dict.
@@ -151,6 +201,9 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
                     arg_part = json.dumps(arg_part)
                 elif not isinstance(arg_part, str):
                     arg_part = str(arg_part)
+                args_bytes += len(arg_part.encode("utf-8"))
+                if args_bytes > _MAX_TOOL_ARGS_BYTES:
+                    raise LLMError("stream tool arguments exceed cap")
                 slot["args"] += arg_part
 
     def _flush_event() -> None:
@@ -195,7 +248,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
     if not seen_done:
         raise LLMError("stream ended without DONE")
     tool_calls = []
-    for i, slot in sorted(tool_acc.items()):
+    for i, slot in enumerate(tool_acc.values()):
         name = slot["name"].strip()
         if not name:
             raise LLMError(f"stream tool_call {i} missing name")
@@ -225,6 +278,8 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
 
 
 class OpenAICompatClient(LLMClient):
+    """OpenAI-compatible chat-completions client with streaming, retries, and a Responses-API fallback."""
+
     def __init__(
         self,
         model: str,
@@ -283,6 +338,13 @@ class OpenAICompatClient(LLMClient):
                 "environment variable, open a new terminal so it loads, or "
                 "store the key once with: /model key"
             )
+        if has_key and not is_keyless_base_url(self.base_url):
+            # A key crossing plain HTTP is sent in cleartext; warn once per
+            # process so local http:// servers stay usable but remote ones
+            # are flagged. Imported lazily to keep the module graph acyclic.
+            from core.agent.keys import warn_insecure_transport
+
+            warn_insecure_transport(self.base_url, has_key)
 
         use_stream = self.stream and on_delta is not None
         # Once a fragment has reached the callback, retrying would replay
@@ -294,25 +356,37 @@ class OpenAICompatClient(LLMClient):
             def stream_cb(piece: str) -> None:
                 emitted["delta"] = True
                 on_delta(piece)
+        # Snapshot the downgrade flags once: they are updated under the
+        # lock by the 400-shedding paths below, and the payload must be
+        # built from one consistent view of them.
+        with self._lock:
+            usage_supported = self._usage_supported
+            reasoning_supported = self._reasoning_supported
+            temperature_supported = self._temperature_supported
+            token_field = self._token_field
+            token_budget = self._token_budget
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            self._token_field: self._token_budget,
+            token_field: token_budget,
         }
-        if self._temperature_supported:
+        if temperature_supported:
             payload["temperature"] = self.temperature
         if tools:
             payload["tools"] = tools
         if use_stream:
             payload["stream"] = True
-            if self._usage_supported:
+            if usage_supported:
                 payload["stream_options"] = {"include_usage": True}
-        if self._reasoning_supported and self.reasoning_effort:
+        if reasoning_supported and self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
 
         last_error = ""
         for attempt in range(1, self.max_retries + 1):
-            body = json.dumps(payload).encode("utf-8")
+            try:
+                body = json.dumps(payload).encode("utf-8")
+            except TypeError as exc:
+                raise LLMError(f"cannot serialize chat payload: {exc}") from exc
             try:
                 if use_stream:
                     response = self._request_stream(body, stream_cb)
@@ -416,10 +490,62 @@ class OpenAICompatClient(LLMClient):
     def _headers(self) -> dict[str, str]:
         # Environment first, stored credential second.
         api_key = resolve_key(self.api_key_env) or ""
-        headers = {"Content-Type": "application/json", "User-Agent": "MANTRA/1.0 (https://opencode.ai)"}
+        headers = {"Content-Type": "application/json", "User-Agent": "MANTRA/1.0 (coding harness; +https://github.com/mantra)"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
+
+    def _handle_http_error(
+        self,
+        exc: urllib.error.HTTPError,
+        body: bytes,
+        on_delta: DeltaCallback | None = None,
+    ) -> LLMResponse:
+        """Shared 400-downgrade and Responses-fallback handling.
+
+        Both request paths land here: a field the server blamed is
+        re-raised with a fresh body so chat() can shed it; anything else
+        on 400/404/500 may fall back to the Responses API and otherwise
+        re-raises the original error.
+        """
+        import io as _io
+
+        detail = ""
+        raw_detail = b""
+        try:
+            raw_detail = exc.read()
+            detail = raw_detail.decode(errors="replace").lower()[:500]
+        except (OSError, AttributeError, ValueError):
+            pass  # body unreadable; the status code alone drives the retry
+        if any(
+            self._blamed(detail, field)
+            for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options", "temperature")
+        ):
+            # Do not fallback for parameter downgrade cases that chat() handles
+            raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io.BytesIO(raw_detail))
+        if exc.code not in (400, 404, 500):
+            raise
+        if self._responses_unavailable:
+            # The alternate endpoint was already probed and missing:
+            # surface the original error so the retry loop in chat()
+            # can treat a transient 5xx as retryable.
+            raise
+        try:
+            # Probe: does {base}/responses exist? Try it before surfacing the error
+            return self._request_via_responses(body, on_delta)
+        except Exception as fb_exc:
+            self._responses_unavailable = True
+            if exc.code == 500:
+                # 5xx is often transient: re-raise the original error so
+                # the caller's retry loop can try the chat endpoint again.
+                raise urllib.error.HTTPError(
+                    exc.url, exc.code, exc.msg, exc.hdrs, _io.BytesIO(raw_detail)
+                ) from None
+            # A 400/404 will not improve on retry — chain the errors.
+            raise LLMError(
+                f"chat completions failed (HTTP {exc.code}): {detail[:300] or 'no detail'}; "
+                f"fallback to responses also failed: {fb_exc}"
+            ) from exc
 
     def _request(self, body: bytes) -> LLMResponse:
         # No provider-specific probe here — try chat first, fall back agnostically on 400/500 below
@@ -441,47 +567,7 @@ class OpenAICompatClient(LLMClient):
                     raise LLMError("LLM response exceeds size cap")
                 raw = raw_bytes.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
-            # Do not fallback for parameter downgrade cases that chat() handles
-            detail = ""
-            raw_detail = b""
-            try:
-                raw_detail = exc.read()
-                detail = raw_detail.decode(errors="replace").lower()[:500]
-            except (OSError, AttributeError, ValueError):
-                pass  # body unreadable; the status code alone drives the retry
-            if any(
-                self._blamed(detail, field)
-                for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options", "temperature")
-            ):
-                # Re-raise with fresh body so outer handler can still read it
-                import io as _io
-                raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io.BytesIO(raw_detail))
-            # Agnostic fallback: if chat fails and provider offers Responses API, try it
-            # Preserve original error for diagnostics if fallback also fails
-            _orig_exc = exc
-            _orig_detail = detail
-            if exc.code in (400, 500):
-                if self._responses_unavailable:
-                    # The alternate endpoint was already probed and missing:
-                    # surface the original error so the retry loop in chat()
-                    # can treat a transient 5xx as retryable.
-                    raise
-                try:
-                    # Probe: does {base}/responses exist? Try it before surfacing 400/500
-                    resp = self._request_via_responses(body)
-                    return resp
-                except Exception as _fb_exc:
-                    self._responses_unavailable = True
-                    if exc.code == 400:
-                        # A 400 will not improve on retry — chain the errors.
-                        raise LLMError(
-                            f"chat completions failed (HTTP {exc.code}): {_orig_detail[:300] or 'no detail'}; "
-                            f"fallback to responses also failed: {_fb_exc}"
-                        ) from _orig_exc
-                    # 5xx is often transient: re-raise the original error so
-                    # the caller's retry loop can try the chat endpoint again.
-                    raise _orig_exc
-            raise
+            return self._handle_http_error(exc, body)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -541,12 +627,12 @@ class OpenAICompatClient(LLMClient):
                 raise LLMError(f"tool arguments wrong type for '{name}': {type(args_raw).__name__}")
             tool_calls.append(ToolCall(id=str(fid) if fid else "", name=name.strip(), arguments=arguments))
         return LLMResponse(
-            content=message.get("content"),
+            content=_normalize_content(message.get("content")),
             tool_calls=tool_calls,
             usage=data.get("usage") or None,
         )
 
-    def _request_via_responses(self, body: bytes) -> LLMResponse:
+    def _request_via_responses(self, body: bytes, on_delta: DeltaCallback | None = None) -> LLMResponse:
         """Agnostic fallback: translate chat payload to Responses API (OpenAI Responses)."""
         try:
             payload = json.loads(body.decode("utf-8", errors="replace"))
@@ -571,7 +657,10 @@ class OpenAICompatClient(LLMClient):
                 else:
                     parts.append(f"Assistant: {content}")
             elif role == "tool":
-                parts.append(f"Tool {m.get('name','')} result: {content[:2000]}")  # cap: history is flattened into one prompt
+                text = str(content)
+                if len(text) > 12000:
+                    text = text[:12000] + "\n... [truncated for responses fallback]"
+                parts.append(f"Tool {m.get('name','')} result: {text}")
         prompt = "\n\n".join(parts) if parts else (payload.get("input") or "")
         # Build responses payload
         resp_payload: dict[str, Any] = {
@@ -623,8 +712,8 @@ class OpenAICompatClient(LLMClient):
         except json.JSONDecodeError as exc:
             raise LLMError(f"{self.base_url}/responses did not return JSON: {exc}") from exc
         # Responses output differs from chat: extract plain text from
-        # message items. The stream fallback is non-streaming, so the
-        # whole text is emitted as one delta by the caller.
+        # message items. The streamed fallback emits the whole text as
+        # one delta so the UI still shows the reply.
         text = ""
         for item in data.get("output") or []:
             if item.get("type") == "message":
@@ -633,6 +722,13 @@ class OpenAICompatClient(LLMClient):
                         text += part.get("text") or ""
                     elif part.get("type") == "text":
                         text += part.get("text") or ""
+        if text and on_delta is not None:
+            try:
+                on_delta(text)
+            except AbortError:
+                raise
+            except Exception:
+                pass  # observer errors never fail the fallback
         # Tool calls in responses: output items type function_call
         tool_calls = []
         for item in data.get("output") or []:
@@ -723,35 +819,4 @@ class OpenAICompatClient(LLMClient):
 
                 return parse_sse_stream(_line_iter(), on_delta)
         except urllib.error.HTTPError as exc:
-            # Do not fallback for downgrade cases
-            detail = ""
-            raw2 = b""
-            try:
-                raw2 = exc.read()
-                detail = raw2.decode(errors="replace").lower()[:500]
-            except (OSError, AttributeError, ValueError):
-                pass  # body unreadable; the status code alone drives the retry
-            if any(
-                self._blamed(detail, field)
-                for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options", "temperature")
-            ):
-                import io as _io2
-                raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs, _io2.BytesIO(raw2))
-            _orig = exc
-            _orig_detail2 = detail
-            if exc.code in (400, 500):
-                if self._responses_unavailable:
-                    raise
-                try:
-                    return self._request_via_responses(body)
-                except Exception as _fb2:
-                    self._responses_unavailable = True
-                    if exc.code == 400:
-                        raise LLMError(
-                            f"streaming chat failed (HTTP {exc.code}): {_orig_detail2[:300] or 'no detail'}; "
-                            f"fallback also failed: {_fb2}"
-                        ) from _orig
-                    # Transient 5xx: re-raise the original error so the
-                    # caller's retry loop can try the chat endpoint again.
-                    raise _orig
-            raise
+            return self._handle_http_error(exc, body, on_delta)

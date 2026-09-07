@@ -40,6 +40,7 @@ class EditLedger:
         return self._key(path) in self._partial
 
     def forget_all(self) -> None:
+        # Called by the console at the start of each turn.
         self._seen.clear()
         self._partial.clear()
 

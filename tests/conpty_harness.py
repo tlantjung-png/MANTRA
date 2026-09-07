@@ -28,7 +28,6 @@ import atexit
 import ctypes
 import os
 import subprocess
-import tempfile
 import threading
 import time
 
@@ -350,7 +349,7 @@ class _ConsoleSession:
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
 
-    # ── I/O ───────────────────────────────────────────────────
+    # I/O
 
     def _pump(self) -> None:
         buf = ctypes.create_string_buffer(65536)
@@ -389,7 +388,7 @@ class _ConsoleSession:
         # there. Tests that assert on wrapping must use the probed
         # default size.
 
-    # ── input helpers (what a terminal sends) ─────────────────
+    # Input helpers: what a terminal sends.
 
     def type_text(self, text: str) -> None:
         self.send(text)
@@ -413,7 +412,7 @@ class _ConsoleSession:
     def wheel(self, direction: int, col: int, row: int) -> None:
         self.send(f"\x1b[<{direction};{col};{row}M")
 
-    # ── teardown ──────────────────────────────────────────────
+    # Teardown.
 
     def close(self) -> None:
         self._alive = False

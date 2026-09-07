@@ -79,5 +79,74 @@ class ParseDiffTest(unittest.TestCase):
         self.assertEqual(parse_diff("random text\nno diffs here\n"), [])
 
 
+class EdgeMarkerTest(unittest.TestCase):
+    """Malformed-input corners a hostile or odd producer generates."""
+
+    def test_no_newline_marker_is_ignored(self):
+        files = parse_diff(
+            "diff --git a/x.txt b/x.txt\n"
+            "--- a/x.txt\n+++ b/x.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-one\n"
+            "\\ No newline at end of file\n"
+            "+two\n"
+            "\\ No newline at end of file\n"
+        )
+        self.assertEqual(len(files), 1)
+        kinds = [l.kind for l in files[0].hunks[0].lines]
+        self.assertEqual(kinds, ["del", "add"])
+        self.assertEqual([l.text for l in files[0].hunks[0].lines], ["one", "two"])
+
+    def test_binary_files_differ_yields_no_hunks(self):
+        files = parse_diff(
+            "diff --git a/img.png b/img.png\n"
+            "index 111..222 100644\n"
+            "Binary files a/img.png and b/img.png differ\n"
+        )
+        self.assertEqual(files, [])
+
+    def test_rename_from_to_lines_are_skipped(self):
+        files = parse_diff(
+            "diff --git a/old.py b/new.py\n"
+            "similarity index 100%\n"
+            "rename from old.py\n"
+            "rename to new.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].path, "new.py")
+        self.assertEqual(files[0].added, 1)
+
+    def test_combined_cc_header_is_ignored_gracefully(self):
+        # The parser has no combined-diff mode: a --cc header produces no file.
+        files = parse_diff(
+            "diff --cc a/x b/x\n"
+            "index 111,222..333\n"
+            "--- a/x\n"
+            "+++ b/x\n"
+            "@@ -1,2 +1,2 @@\n"
+            " ctx\n"
+            "-old\n"
+            "+new\n"
+        )
+        self.assertEqual(files, [])
+
+    def test_malformed_hunk_header_is_skipped(self):
+        files = parse_diff(
+            "diff --git a/x b/x\n"
+            "@@ garbage @@\n"
+            "-one\n"
+            "+two\n"
+            "@@ -5,1 +5,1 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+        self.assertEqual(len(files), 1)
+        self.assertEqual(len(files[0].hunks), 1)  # malformed header dropped
+        self.assertEqual(files[0].hunks[0].old_start, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

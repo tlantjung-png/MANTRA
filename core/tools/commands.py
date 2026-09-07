@@ -22,6 +22,7 @@ import uuid
 from typing import Any
 
 from core.agent.approvals import _redact_sensitive
+from core.sandbox import _filtered_env
 from core.types import ExecResult, Sandbox
 from core.types import Tool
 
@@ -49,8 +50,9 @@ _LOG_BYTE_CEILING = 10 * 1024 * 1024
 
 
 # Process-group isolation for background tasks, matching the sandbox's
-# foreground behavior: a timeout or abort kills the whole tree, not just
-# the shell, so orphaned descendants cannot outlive the task.
+# foreground behavior: a timeout, abort, or kill_shell task_id kill hits
+# the whole tree, not just the shell, so orphaned descendants cannot
+# outlive the task.
 _POPEN_GROUP_KWARGS: dict = {}
 if os.name == "nt":
     _POPEN_GROUP_KWARGS["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -170,24 +172,69 @@ def _finish_task(
     duration: float = 0.0,
 ) -> None:
     """Write the closing block to the task log and mark the task done."""
+    log_error: str | None = None
     try:
         with open(log_path, "a", encoding="utf-8", errors="replace") as f:
             if note:
                 f.write(f"\n[{note}]\n")
             f.write(f"\nexit_code: {exit_code}\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        # D14: a failed log write must be visible, not swallowed.
+        log_error = f"log write failed: {exc}"
     with _TASKS_LOCK:
         if task_id in _TASKS:
             _TASKS[task_id].update({
                 "exit_code": exit_code,
                 "stdout": "",
-                "stderr": note,
+                "stderr": (note + (f"; {log_error}" if log_error else "")) or log_error or "",
                 "timed_out": timed_out,
                 "done": True,
                 "end_time": time.monotonic(),
                 "duration": duration,
+                # D13: the task is done; release the Popen handle and pid
+                # so finished entries cannot pin process handles.
+                "process": None,
+                "pid": None,
+                "log_error": log_error or _TASKS[task_id].get("log_error"),
             })
+    # D21: completed workspace task logs are pruned here (keeping the most
+    # recent), so list_dir stops exposing finished task logs.
+    _prune_done_logs(log_path)
+
+
+_DONE_LOG_KEEP = 5
+
+
+def _prune_done_logs(log_path: str) -> None:
+    """Prune completed workspace task logs, keeping the most recent.
+
+    Only logs whose task entries are marked done are candidates, so a
+    still-running background task's log is never touched.
+    """
+    marker = os.sep + ".mantra" + os.sep + "logs" + os.sep
+    if marker not in log_path.replace("/", os.sep):
+        return
+    try:
+        logs_dir = os.path.dirname(log_path)
+        done_paths: list[tuple[float, str]] = []
+        with _TASKS_LOCK:
+            for info in _TASKS.values():
+                if not info.get("done"):
+                    continue
+                lp = info.get("log_path") or ""
+                if lp and os.path.dirname(lp) == logs_dir and os.path.exists(lp):
+                    try:
+                        done_paths.append((os.path.getmtime(lp), lp))
+                    except OSError:
+                        pass
+        done_paths.sort(reverse=True)
+        for _, old in done_paths[_DONE_LOG_KEEP:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 class RunCommandTool(Tool):
     name = "run_command"
@@ -308,8 +355,8 @@ class RunCommandTool(Tool):
                 pass
         except Exception:
             # Last resort: a unique file in the system temp directory. The
-            # workspace is never polluted with stray logs — the operator
-            # would see the file in every listing and change report.
+            # primary path writes under .mantra/logs, which list_dir
+            # exposes; completed logs there are pruned at _finish_task.
             log_path = os.path.join(tempfile.gettempdir(), f"mantra_{task_id}.log")
             try:
                 with open(log_path, "w", encoding="utf-8") as _lf:
@@ -350,6 +397,9 @@ class RunCommandTool(Tool):
                     # Same isolation as the foreground path: the task runs
                     # in its own process group so a timeout or abort can
                     # kill the whole tree instead of orphaning descendants.
+                    # The env is filtered so background children do not
+                    # inherit the harness's credential-shaped variables.
+                    env=_filtered_env(os.environ),
                     **_POPEN_GROUP_KWARGS,
                 )
             except Exception as exc:
@@ -392,8 +442,12 @@ class RunCommandTool(Tool):
                                     if task_id in _TASKS:
                                         _TASKS[task_id]["truncated"] = True
                                 break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # D14: a failed log append must be visible to
+                    # shell_output, not swallowed silently.
+                    with _TASKS_LOCK:
+                        if task_id in _TASKS:
+                            _TASKS[task_id]["log_error"] = f"output pump failed: {exc}"
 
             pumper = threading.Thread(target=_pump, daemon=True)
             pumper.start()
@@ -498,10 +552,18 @@ class RunCommandTool(Tool):
 
     def _format_result(self, result: ExecResult, command: str) -> str:
         # Honest exits: signal deaths map to 128+n; grep/Select-String
-        # exiting 1 means "no matches", not an error.
+        # exiting 1 means "no matches", not an error. Timed-out runs read
+        # 143; screen refusals and cap kills surface as -1, not a signal
+        # death.
         exit_code = result.exit_code
+        if exit_code == -1 and result.timed_out:
+            # Timed-out kills are reported 143-style (treated as SIGTERM).
+            exit_code = 143
+        elif exit_code == -1:
+            # Screen refusal / invalid timeout / cap kill: keep raw -1.
+            exit_code = -1
         # Handle Python negative signal codes (e.g., -9 -> 137)
-        if exit_code is not None and exit_code < 0:
+        elif exit_code is not None and exit_code < 0:
             exit_code = 128 - exit_code  # -9 -> 137
         elif exit_code is None:
             exit_code = 128
@@ -512,6 +574,8 @@ class RunCommandTool(Tool):
             exit_note = " (SIGKILL, 128+9)"
         elif display_code == 143:
             exit_note = " (SIGTERM, 128+15)"
+        elif display_code == -1:
+            exit_note = " (blocked/refused — not a signal death)"
         elif display_code == 128 and (os.name != "nt" or (result.exit_code is not None and result.exit_code < 0)):
             exit_note = " (signal death, 128)"
         elif display_code == 1 and re.search(r"(^|\s|;)grep(\.exe)?\b", command, re.IGNORECASE):
@@ -542,9 +606,13 @@ class RunCommandTool(Tool):
         MAX_TOTAL = 16000
         full_log_path = None
         if combined_len > MAX_TOTAL:
-            # Write full log to temp
+            # Write full log to temp with owner-only perms (may hold secrets)
             try:
                 fd, full_log_path = tempfile.mkstemp(prefix="mantra_cmd_", suffix=".log")
+                try:
+                    os.chmod(full_log_path, 0o600)
+                except OSError:
+                    pass
                 _register_full_log(full_log_path)
                 with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
                     f.write(f"$ {_redact_sensitive(command)}\n")
@@ -631,6 +699,11 @@ class ShellOutputTool(Tool):
 
         log_path = task.get("log_path")
         if not log_path or not os.path.exists(log_path):
+            # D14: a task whose log write failed explains itself instead
+            # of looking like the log merely vanished.
+            log_err = task.get("log_error")
+            if log_err:
+                return f"ERROR: log not found for {task_id} ({log_err})"
             return f"ERROR: log not found for {task_id}"
 
         # Wait handling
@@ -666,7 +739,9 @@ class ShellOutputTool(Tool):
         try:
             with open(log_path, "rb") as f:
                 f.seek(from_offset)
-                raw = f.read(50000)  # cap per read, in bytes
+                # Cap a single read; the cursor advances by what was
+                # actually read.
+                raw = f.read(50000)
                 next_offset = from_offset + len(raw)
             data = raw.decode("utf-8", errors="replace")
         except OSError as exc:
@@ -680,9 +755,11 @@ class ShellOutputTool(Tool):
                 "\n[log truncated — output exceeded the byte ceiling and was dropped]"
                 if truncated else ""
             )
+            log_err = task.get("log_error")
+            fail_note = f"\n[task log write failed: {log_err}]" if log_err else ""
             if done:
-                return f"<<<UNTRUSTED_TASK_OUTPUT\n(no new output, task done)\n>>>\nnext_offset: {next_offset}{trunc_note}"
-            return f"<<<UNTRUSTED_TASK_OUTPUT\n(no new output)\n>>>\nnext_offset: {next_offset}{trunc_note}"
+                return f"<<<UNTRUSTED_TASK_OUTPUT\n(no new output, task done)\n>>>\nnext_offset: {next_offset}{trunc_note}{fail_note}"
+            return f"<<<UNTRUSTED_TASK_OUTPUT\n(no new output)\n>>>\nnext_offset: {next_offset}{trunc_note}{fail_note}"
 
         with _TASKS_LOCK:
             truncated = bool(_TASKS.get(task_id, {}).get("truncated"))
@@ -724,14 +801,22 @@ class KillShellTool(Tool):
                 return f"ERROR: no such task {task_id!r}"
             proc = task.get("process")
             if proc and proc.poll() is None:
+                # Tree-kill, matching the timeout/abort paths, and mark
+                # the task interrupted so the worker cannot outlive it.
+                _kill_task_tree(proc)
                 try:
-                    proc.terminate()
-                    time.sleep(0.5)
-                    if proc.poll() is None:
-                        proc.kill()
-                    return f"OK: killed task {task_id} (sigterm→sigkill)"
-                except Exception as exc:
-                    return f"ERROR: kill failed: {exc}"
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                start = task.get("start_time") or time.monotonic()
+                _finish_task(
+                    task_id,
+                    task.get("log_path") or "",
+                    proc.returncode if proc.returncode is not None else -1,
+                    note="interrupted by operator",
+                    duration=time.monotonic() - start,
+                )
+                return f"OK: killed task {task_id}"
             return f"OK: task {task_id} already done (exit {task.get('exit_code')})"
 
         # Try pid
@@ -772,10 +857,9 @@ class KillShellTool(Tool):
                     if forced is not None:
                         os.kill(pid_int, forced)
                     return f"OK: killed pid {pid_int} (sigterm→sigkill)"
-                # win32: os.kill with SIGTERM already terminated the
-                # process outright, and no SIGKILL constant exists here —
-                # report success instead of a spurious error.
-                return f"OK: killed pid {pid_int}"
+                # win32: os.kill with SIGTERM is TerminateProcess — an
+                # immediate hard kill, not a signal handshake.
+                return f"OK: killed pid {pid_int} (terminated)"
             except Exception as exc:
                 return f"ERROR: kill pid failed: {exc}"
 
@@ -865,7 +949,9 @@ class KillShellTool(Tool):
                     forced = getattr(signal, "SIGKILL", None)
                     if forced is not None:
                         os.kill(found, forced)
-                return f"OK: killed port {port_int} (pid {found})"
+                    return f"OK: killed port {port_int} (pid {found})"
+                # win32: os.kill is TerminateProcess — immediate hard kill.
+                return f"OK: killed port {port_int} (pid {found}, terminated)"
             except Exception as exc:
                 return f"ERROR: kill port failed: {exc}"
 
@@ -873,6 +959,8 @@ class KillShellTool(Tool):
 
 
 class GitDiffTool(Tool):
+    """Show the uncommitted diff of the repository."""
+
     name = "git_diff"
     description = "Show the current uncommitted diff of the repository."
     parameters: dict[str, Any] = {"type": "object", "properties": {}}

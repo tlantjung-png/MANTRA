@@ -18,7 +18,7 @@ allow|git status|Safe read-only status
 allow|git log|Safe read-only log
 # Cache-prefix guards: AGENTS.md and the per-project MEMORY.md are loaded
 # into the provider prompt prefix, and rewriting either mid-session
-# invalidates the prefix cache (a full-prefix re-bill on the next call).
+# invalidates the prompt prefix cache for subsequent turns (and the cost of a full re-bill).
 # Shell-layer writes are forbidden; deliberate updates go through the
 # instruction-audit / update-memory flows at session boundaries.
 forbidre|(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md|Mid-session AGENTS.md edits invalidate the provider prefix cache; defer to session boundaries

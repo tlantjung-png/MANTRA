@@ -20,9 +20,11 @@ silently regress:
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from core.agent.loop import AgentLoop
 from core.agent.approvals import ApprovalPolicy, classify_command
@@ -259,11 +261,18 @@ class ShellOutputCursorTest(unittest.TestCase):
         )
         self.assertIn("background task", start)
         task_id = start.split()[2]
-        # Wait for completion.
+        # Wait for completion. The harness writes an exit_code footer once
+        # the child exits ("task done" only appears on a later read that
+        # finds no new bytes); either marker means the task finished.
+        seen_done = False
         for _ in range(100):
             out = reader.execute(sandbox, task_id=task_id, from_offset=0, wait="exit", timeout=5.0)
-            if "task done" in out:
+            if "exit_code:" in out or "task done" in out:
+                seen_done = True
                 break
+        # The loop must have seen the done marker, not just stopped polling:
+        # parsing the offset below would otherwise raise on raw output.
+        self.assertTrue(seen_done, msg="background task never reported completion")
         self.assertIn("h\u00e9llo w\u00f6rld \u2713", out)
         next_offset = int(out.rsplit("next_offset:", 1)[1].split()[0])
         # A follow-up read at the emitted byte offset sees no new output.
@@ -395,6 +404,30 @@ class WriteByteCapTest(unittest.TestCase):
         sandbox.setup({})
         sandbox.write_file("ok.txt", "a" * 10_000)
         self.assertTrue(os.path.isfile(os.path.join(ws, "ok.txt")))
+
+
+class AuditLogTest(unittest.TestCase):
+    """Every approval check writes a redacted line to the audit log."""
+
+    def test_allowed_and_denied_calls_are_logged_with_redaction(self):
+        log_path = os.path.join(tempfile.mkdtemp(prefix="mantra-audit-"), "pre-tool-use.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(log_path), True)
+        with mock.patch.dict(os.environ, {"MANTRA_PRE_TOOL_USE_LOG": log_path}):
+            policy = ApprovalPolicy(mode="auto", ask=lambda p: "n")
+            # mutating write -> auto mode allows
+            self.assertTrue(policy.check("write_file", {"path": "a.py", "content": "x"}))
+            # destructive command -> auto mode denies
+            self.assertFalse(policy.check("run_command", {"command": "rm -rf x --api-key=sk-abcdefghijklmnopqrstuvwxyz123"}))
+            # non-mutating read -> allowed
+            self.assertTrue(policy.check("read_file", {"path": "a.py"}))
+        with open(log_path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(any("tool=write_file" in l and "risk=mutating" in l for l in lines))
+        self.assertTrue(any("tool=run_command" in l and "risk=destructive" in l for l in lines))
+        joined = "\n".join(lines)
+        self.assertIn("REDACTED", joined)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz123", joined)
 
 
 if __name__ == "__main__":

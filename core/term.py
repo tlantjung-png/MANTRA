@@ -31,16 +31,41 @@ def _char_width(ch: str) -> int:
     return 1
 
 
-def enable_vt() -> None:
-    """Enable virtual-terminal processing on the Windows console.
+class _WidthScanner:
+    """Per-scan ZWJ-aware width; one instance per string being measured.
 
-    ``os.system("")`` is the classic hack but depends on a cmd.exe child
-    initialising the shared console; setting the mode on the process's
-    own stdout handle is direct and works where the hack does not
-    (hosts that keep conhost in legacy mode). No-op elsewhere.
+    A character after a ZWJ belongs to the same grapheme cluster and
+    adds no width of its own, so the state must live with the scan. A
+    module-level flag made unrelated measurements order-dependent; the
+    scanner keeps the state local to a single string's measurement.
     """
-    if os.name != "nt":
-        return
+
+    __slots__ = ("_prev_zwj",)
+
+    def __init__(self) -> None:
+        self._prev_zwj = False
+
+    def feed(self, ch: str) -> int:
+        """Width of one char, honoring a ZWJ from the previous char."""
+        if self._prev_zwj:
+            # Following a ZWJ: this char is a continuation of one emoji
+            # sequence, so it contributes no extra columns.
+            self._prev_zwj = False
+            return 0
+        self._prev_zwj = ch == "\u200d"
+        return _char_width(ch)
+
+
+def _enable_vt_console_mode() -> None:
+    """Best-effort: set ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout.
+
+    Without it, legacy conhost prints ANSI escapes literally — including
+    the ESC[?2004h bracketed-paste request the editor emits — so pastes
+    would never be wrapped and cursor/color control would garble the TUI.
+    Windows Terminal parses VT regardless, so this only ever helps
+    (conhost) and is a no-op there. The other mode flags are preserved
+    untouched.
+    """
     try:
         import ctypes
         from ctypes import wintypes
@@ -54,13 +79,27 @@ def enable_vt() -> None:
             return
         if not mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
             kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-    except Exception:
+    except Exception:  # pragma: no cover - non-console runtime
         pass
+
+
+def enable_vt() -> None:
+    """Enable virtual-terminal processing on the Windows console.
+
+    ``os.system("")`` is the classic hack but depends on a cmd.exe child
+    initialising the shared console; setting the mode on the process's
+    own stdout handle is direct and works where the hack does not
+    (hosts that keep conhost in legacy mode). No-op elsewhere.
+    """
+    if os.name != "nt":
+        return
+    _enable_vt_console_mode()
 
 
 def visible_len(text: str) -> int:
     """Printed width ignoring escapes; wide chars count as 2."""
-    return sum(_char_width(c) for c in _ANSI_RE.sub("", text))
+    scanner = _WidthScanner()
+    return sum(scanner.feed(c) for c in _ANSI_RE.sub("", text))
 
 
 def selection_in_progress() -> bool:
@@ -197,25 +236,29 @@ def is_interactive() -> bool:
 
 
 def safe_write(text: str) -> None:
-    """Write to stdout without ever raising on unencodable characters.
+    """Write to stdout, replacing characters the stream cannot encode.
 
-    Model output, typed input and hand-authored labels can all contain
-    characters a narrow locale cannot encode (e.g. "→" under latin-1).
-    The stream's own encoding is kept - a latin-1 terminal must keep
-    receiving latin-1 bytes - and only the characters that do not fit
-    are replaced, so output degrades instead of crashing the console.
+    A closed pipe (BrokenPipeError) is swallowed so a piped process can
+    exit cleanly instead of crashing with a traceback. On an unencodable
+    character, only the remainder after the failure point is rewritten
+    with replacements, so the already-written prefix is not duplicated.
     """
     out = sys.stdout
     try:
         out.write(text)
-    except UnicodeEncodeError:
+    except UnicodeEncodeError as exc:
+        # exc.start is where encoding failed; the prefix before it was
+        # already emitted by the stream, so only the rest is re-encoded.
+        remainder = text[exc.start:]
         enc = getattr(out, "encoding", None) or "utf-8"
         try:
             out.write(
-                text.encode(enc, errors="replace").decode(enc, errors="replace")
+                remainder.encode(enc, errors="replace").decode(enc, errors="replace")
             )
         except Exception:  # pragma: no cover - closed or exotic stream
             pass
+    except OSError:
+        pass  # broken pipe or closed stream: the output is going away
 
 
 _utf8_configured = False
@@ -237,29 +280,12 @@ def force_utf8_output() -> None:
     if os.name == "nt":
         try:
             import ctypes
-            from ctypes import wintypes
 
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleOutputCP(65001)
             kernel32.SetConsoleCP(65001)
-            # Enable VT output processing on the output handle. Without
-            # it, legacy conhost prints ANSI escapes literally - including
-            # the ESC[?2004h bracketed-paste request the editor emits - so
-            # pastes would never be wrapped and cursor/color control would
-            # garble the TUI. Windows Terminal parses VT regardless, so
-            # this only ever helps (conhost) and is a no-op there. The
-            # other mode flags are preserved untouched.
-            try:
-                handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-                mode = wintypes.DWORD()
-                if (
-                    handle not in (None, 0, -1)
-                    and kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-                ):
-                    if not mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                        kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-            except Exception:  # pragma: no cover - non-console runtime
-                pass
+            # Enable VT output processing on the output handle.
+            _enable_vt_console_mode()
         except Exception:  # pragma: no cover - non-console or exotic runtime
             pass
         target_encoding = "utf-8"

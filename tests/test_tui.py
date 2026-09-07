@@ -512,13 +512,25 @@ def _make_app(script, backend=None):
     return app, session, backend
 
 
+import atexit
 import shutil  # noqa: E402
 import tempfile  # noqa: E402
 
-# Workspaces _make_app (and the popup test) create under TEMP; removed in
-# AppIntegrationTest.tearDown so the suite leaves no stray directories
-# (each one may contain a git repo, which would otherwise linger forever).
+# Workspaces _make_app (and the popup test) create under TEMP; the atexit
+# hook removes them on process exit so cross-module _make_app users
+# (test_fix, test_review) never leave stray directories behind (each one
+# may contain a git repo). AppIntegrationTest.tearDown still clears them
+# eagerly within this module's own runs.
 _TEMP_WORKSPACES: list[str] = []
+
+
+def _cleanup_temp_workspaces() -> None:
+    for ws in list(_TEMP_WORKSPACES):
+        shutil.rmtree(ws, ignore_errors=True)
+    _TEMP_WORKSPACES.clear()
+
+
+atexit.register(_cleanup_temp_workspaces)
 
 
 class AppIntegrationTest(unittest.TestCase):

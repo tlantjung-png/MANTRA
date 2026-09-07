@@ -27,7 +27,7 @@ When landing a chain of dependent PRs (each based on the one below):
 2. Fetch live PR metadata and exact head OIDs; establish the bottom-to-top order from the live base references, not branch names or an earlier report.
 3. Link same-author chains additively in bottom-to-top order; if authors differ or an existing stack conflicts, ask before mutating GitHub state. Never dissolve, reorder, or rebuild an existing stack automatically.
 4. Preflight the merge range: every selected PR open, non-draft, in order, and compliant with review and check requirements — a ready top layer does not prove its dependencies are ready.
-5. Merge the whole stack, or an explicitly bounded prefix, through the stack API (`gh stack merge --yes --merge`). Do not bypass merge requirements or fall back to per-PR merges.
+5. Merge the whole stack, or an explicitly bounded prefix, through the stack API (`gh stack merge --yes --merge`; note that `gh` - the GitHub command-line interface - is an external dependency and is not bundled with or verified by this repository). Do not bypass merge requirements or fall back to per-PR merges.
 6. Wait for every selected PR to report MERGED; a queued request is not a completed landing.
 7. After any history rewrite, re-fetch live heads and re-audit unresolved review threads, approvals, mergeability, and checks; never use raw `--force`.
 8. Delete branches only in a separate final pass, after each PR reports MERGED and no open PR still uses the branch as its base.

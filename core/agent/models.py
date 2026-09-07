@@ -95,7 +95,7 @@ def fetch_models(
         # A key crosses the network in cleartext on plain http; warn once
         # per process so local http servers stay usable.
         warn_insecure_transport(base, True)
-    headers = {"Accept": "application/json", "User-Agent": "MANTRA/1.0 (https://opencode.ai)"}
+    headers = {"Accept": "application/json", "User-Agent": "MANTRA/1.0 (coding harness; +https://github.com/mantra)"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -105,9 +105,19 @@ def fetch_models(
             try:
                 raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
             except TypeError:
-                # Some response objects (and test doubles) expose an
-                # argument-less read.
-                raw_bytes = response.read()
+                # Fallback for response objects whose read() takes no size
+                # argument: pull bounded chunks so a hostile read(n) cannot
+                # defeat the cap. A truly argument-less reader is the last
+                # resort; its result is still size-checked below (D15).
+                raw_bytes = b""
+                try:
+                    while len(raw_bytes) <= _MAX_RESPONSE_BYTES:
+                        chunk = response.read(64 * 1024)
+                        if not chunk:
+                            break
+                        raw_bytes += chunk
+                except TypeError:
+                    raw_bytes = response.read()
             if len(raw_bytes) > _MAX_RESPONSE_BYTES:
                 raise LLMError("model catalogue response exceeds size cap")
             raw = raw_bytes.decode("utf-8", errors="replace")

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from core.term import visible_len, _char_width
+from core.term import visible_len, _WidthScanner
 
 from core.tui.buffer import Buffer
 from core.tui.clipboard import paste_text
@@ -317,8 +317,9 @@ class Composer:
     def _clip(text: str, width: int) -> str:
         out = []
         used = 0
+        scanner = _WidthScanner()
         for ch in text:
-            w = max(1, _char_width(ch))
+            w = max(1, scanner.feed(ch))
             if used + w > width:
                 break
             out.append(ch)
@@ -334,8 +335,9 @@ class Composer:
         result: list[str] = []
         used = 0
         col = 0
+        scanner = _WidthScanner()
         for ch in text:
-            w = max(1, _char_width(ch))
+            w = max(1, scanner.feed(ch))
             if col >= keep and used + w <= width:
                 result.append(ch)
                 used += w

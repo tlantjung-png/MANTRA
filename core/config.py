@@ -8,13 +8,15 @@ import os
 
 from core.agent.exceptions import ConfigError
 
-# Reasoning efforts; null omits the field.
+# Reasoning efforts; null omits the field. Non-standard values may be
+# rejected by some servers and are shed on a 400 by the client's
+# downgrade path.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 DEFAULTS = {
     "system_prompt": None,  # loop default if unset
     "max_steps": 30,
-    # Message budget lives under context only.
+    # Message limits (not tokens) live under "context".
     "llm": {
         "provider": "openai",
         "model": "gpt-4o",
@@ -39,7 +41,7 @@ DEFAULTS = {
     ],
     "evaluator": {"type": "command", "test_cmd": "python -m pytest tests/ -q"},
     "logging": {"type": "jsonl", "path": "logs/mantra-run.jsonl"},
-    # Strictest approval for interactive use.
+    # Default approval is the strictest interactive mode.
     "approvals": "default",  # default | auto | yolo | plan
     "context": {"max_messages": 200, "max_chars": 240000},
     "auto_compact_tokens": 60000,  # compact when history exceeds; 0 disables
@@ -118,6 +120,35 @@ _DISCRIMINATOR_KEYS = {
     "logging": "type",
 }
 
+# Value types for the component sections. These sections are forwarded to
+# the registry, so a wrong type would only surface deep inside a
+# constructor (or at request time); validate here instead. Fields not
+# listed keep whatever the component constructor accepts.
+_COMPONENT_VALUE_TYPES = {
+    "llm": {
+        "model": (str,),
+        "api_key_env": (str,),
+        "base_url": (str,),
+        "temperature": (int, float),
+        "max_tokens": (int,),
+        "stream": (bool,),
+    },
+    "sandbox": {
+        "image": (str,),
+        "mem_limit": (str,),
+        "workdir": (str,),
+    },
+    "evaluator": {
+        "timeout": (int, float),
+        "test_cmd": (str,),
+    },
+    "logging": {
+        "path": (str,),
+    },
+}
+
+_TYPE_LABELS = {str: "a string", int: "an integer", float: "a number", bool: "true or false"}
+
 
 def merge_defaults(data: dict) -> dict:
     if not isinstance(data, dict):
@@ -169,6 +200,24 @@ def merge_defaults(data: dict) -> dict:
         raise ConfigError(
             f"config sections must be objects: {', '.join(wrong_type)}"
         )
+    for section, fields in _COMPONENT_VALUE_TYPES.items():
+        section_data = merged.get(section)
+        if not isinstance(section_data, dict):
+            continue
+        for field, expected in fields.items():
+            if field not in section_data:
+                continue
+            value = section_data[field]
+            if isinstance(value, bool) and bool not in expected:
+                raise ConfigError(
+                    f"config {section}.{field} must be "
+                    f"{'/'.join(_TYPE_LABELS[t] for t in expected)}, got {value!r}"
+                )
+            if not isinstance(value, expected):
+                raise ConfigError(
+                    f"config {section}.{field} must be "
+                    f"{'/'.join(_TYPE_LABELS[t] for t in expected)}, got {value!r}"
+                )
     tools = merged.get("tools")
     if not isinstance(tools, list) or not tools:
         raise ConfigError("config must list at least one tool")

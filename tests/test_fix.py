@@ -1,6 +1,7 @@
 """Tests for /fix: last-failure capture, the fix prompt, the indicator,
 and the attention bell."""
 
+import atexit
 import io
 import os
 import tempfile
@@ -8,7 +9,12 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-os.environ.setdefault("MANTRA_SETTINGS", tempfile.mkdtemp())
+# Isolate the settings store for direct runs of this file; suite runs
+# already redirect it in tests/__init__.py. The temp dir is removed at
+# process exit instead of leaking.
+_SETTINGS_TMP = tempfile.TemporaryDirectory(prefix="mantra-fix-settings-")
+os.environ.setdefault("MANTRA_SETTINGS", os.path.join(_SETTINGS_TMP.name, "config.json"))
+atexit.register(_SETTINGS_TMP.cleanup)
 
 from core.config import merge_defaults  # noqa: E402
 from core.console import ConsoleSession, dispatch  # noqa: E402

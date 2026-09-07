@@ -57,11 +57,16 @@ class SessionFrame:
 
 
 def render_session_panel(state: SessionPanelState, width: int, height: int) -> SessionFrame:
-    """Build the drawable frame for the session list."""
+    """Build the drawable frame for the session list.
+
+    Each entry renders two rows (name+meta, summary), so the visible
+    entry count is bounded by half the row budget.
+    """
     total = len(state.entries)
-    viewport = max(1, height - 2)
-    start = min(state.offset, max(0, total - viewport))
-    visible = state.entries[start: start + viewport]
+    body_rows = max(2, height - 2)  # header + footer + body
+    entry_budget = max(1, body_rows // 2)
+    start = min(state.offset, max(0, total - entry_budget))
+    visible = state.entries[start: start + entry_budget]
 
     rows: list[ReviewRow] = []
     for i, entry in enumerate(visible):

@@ -61,7 +61,11 @@ class _HeadlessApprover:
 
 
 def _resolve_path(path: str) -> str:
-    """Resolve path against cwd or project root."""
+    """Resolve input paths against cwd then project root.
+
+    Relative logging paths are instead anchored to the project root in
+    main() so the same config works from any working directory.
+    """
     if os.path.exists(path):
         return path
     candidate = os.path.join(PROJECT_ROOT, path)
@@ -72,8 +76,8 @@ def _resolve_path(path: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mantra", description="MANTRA coding-agent harness")
-    parser.add_argument("--config", required=True, help="Path to config.json / config.yaml")
-    parser.add_argument("--task", required=True, help="Path to task JSON file")
+    parser.add_argument("--config", required=True, help="Path to config file (resolved against cwd then project root; relative log paths inside anchor to project root)")
+    parser.add_argument("--task", required=True, help="Path to task JSON file (resolved against cwd then project root)")
     args = parser.parse_args(argv)
     # UTF-8 streams keep event output and verdicts encodable even when the
     # run is piped through a narrow console or redirected to a file.
@@ -134,7 +138,10 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=config.get("max_steps", 30),
         approver=_HeadlessApprover(approval_mode),
     )
-    result = loop.run(task)
+    try:
+        result = loop.run(task)
+    finally:
+        logger.close()  # flush and release the append handle
 
     verdict = "PASS" if result.passed else "FAIL"
     print(

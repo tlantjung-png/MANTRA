@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import socket
 import sys
 import unittest
 from unittest import mock
@@ -20,6 +21,7 @@ from core.sandbox import LocalSandbox
 from core.tools.web import (
     WebFetchTool,
     _inflate,
+    _resolve_and_pin,
     html_to_text,
 )
 from core.registry import TOOL_REGISTRY, build_tools
@@ -136,6 +138,19 @@ class InflateTest(unittest.TestCase):
     def test_bad_payload_is_returned_untouched(self):
         self.assertEqual(_inflate(b"not gzip", "gzip"), b"not gzip")
 
+    def test_inflate_caps_the_expanded_size(self):
+        # A small compressed payload expanding far past the cap must be
+        # clipped at the cap, not expanded fully (decompression bomb).
+        bomb = gzip.compress(b"A" * 100_000)
+        data, truncated = _inflate(bomb, "gzip", cap=1000)
+        self.assertEqual(len(data), 1000)
+        self.assertTrue(truncated)
+
+    def test_inflate_under_cap_is_not_truncated(self):
+        data, truncated = _inflate(gzip.compress(b"small"), "gzip", cap=1000)
+        self.assertEqual(data, b"small")
+        self.assertFalse(truncated)
+
 
 class FetchTest(unittest.TestCase):
     def setUp(self):
@@ -228,13 +243,31 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(schema["function"]["parameters"]["required"], ["url"])
 
 
+class ResolveAndPinTest(unittest.TestCase):
+    def test_private_resolved_ip_is_refused(self):
+        # A hostname that resolves to a private address must be refused
+        # even though the name itself is not loopback (DNS-rebinding guard).
+        private = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 80))]
+        with mock.patch("core.tools.web._resolve_limited", return_value=private):
+            self.assertIsNone(_resolve_and_pin("internal.example"))
+
+    def test_public_resolved_ip_is_pinned(self):
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        with mock.patch("core.tools.web._resolve_limited", return_value=public):
+            self.assertEqual(_resolve_and_pin("example.com"), "93.184.216.34")
+
+
 class RegistryTest(unittest.TestCase):
     def test_both_spellings_resolve_to_the_same_tool(self):
         self.assertIs(TOOL_REGISTRY["web_fetch"], TOOL_REGISTRY["webfetch"])
 
     def test_it_builds_and_executes_through_the_registry(self):
+        # Build through the registry, then execute through that same
+        # instance: a scheme refusal needs no network and no urlopen patch.
         tools = build_tools(["web_fetch"])
         self.assertEqual([t.name for t in tools], ["web_fetch"])
+        out = tools[0].execute(LocalSandbox(), url="ftp://example.com/x")
+        self.assertIn("unsupported scheme", out)
 
     def test_it_is_not_treated_as_a_mutating_tool(self):
         # A fetch cannot change the workspace, so it must not be gated

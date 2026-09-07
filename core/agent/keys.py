@@ -30,6 +30,22 @@ def credentials_path() -> Path:
 _QUARANTINED: set[str] = set()
 
 
+def _quarantine_once(path: Path) -> None:
+    """Copy a corrupt or unreadable store aside once per process (like settings)."""
+    if str(path) in _QUARANTINED:
+        return
+    _QUARANTINED.add(str(path))
+    try:
+        import shutil
+        import time
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_suffix(path.suffix + f".corrupt-{stamp}")
+        shutil.copy2(path, backup)
+    except OSError:
+        pass
+
+
 def _load() -> dict[str, Any]:
     path = credentials_path()
     if not path.is_file():
@@ -37,23 +53,16 @@ def _load() -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
+        # An unreadable file is as unusable as a corrupt one: quarantine
+        # it once so a later write never destroys the only copy (D14).
+        _quarantine_once(path)
         return {}
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         # Quarantine the corrupt file once, before treating it as empty
         # (like settings); later reads skip straight to the empty store.
-        if str(path) not in _QUARANTINED:
-            _QUARANTINED.add(str(path))
-            try:
-                import shutil
-                import time
-
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                backup = path.with_suffix(path.suffix + f".corrupt-{stamp}")
-                shutil.copy2(path, backup)
-            except OSError:
-                pass
+        _quarantine_once(path)
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -179,11 +188,27 @@ def warn_insecure_transport(base_url: str, has_key: bool) -> None:
     )
 
 
+# Cached store read, keyed by (mtime_ns, size). Redaction and resolution
+# hot paths otherwise re-read and re-parse the file on every call (D9).
+_STORED_KEYS_CACHE: tuple[tuple[int, int] | None, dict[str, str]] | None = None
+
+
 def stored_keys() -> dict[str, str]:
     """Every stored key name mapped to its value."""
+    path = credentials_path()
+    try:
+        stat = path.stat()
+        stat_key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stat_key = None
+    global _STORED_KEYS_CACHE
+    if _STORED_KEYS_CACHE is not None and _STORED_KEYS_CACHE[0] == stat_key:
+        return dict(_STORED_KEYS_CACHE[1])
     data = _load()
     keys = data.get("keys")
-    return dict(keys) if isinstance(keys, dict) else {}
+    result = dict(keys) if isinstance(keys, dict) else {}
+    _STORED_KEYS_CACHE = (stat_key, result)
+    return result
 
 
 _CRED_LOCK = threading.Lock()
@@ -298,6 +323,6 @@ def mask(key: str | None) -> str:
     """A form safe to print: enough to recognise, not enough to use."""
     if not key:
         return "(none)"
-    if len(key) <= 8:
-        return "*" * len(key)
+    if len(key) <= 12:
+        return "****"
     return f"{key[:4]}…{key[-4:]}"

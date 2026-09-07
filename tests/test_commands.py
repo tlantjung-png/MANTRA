@@ -7,7 +7,7 @@ Four rules this file exists to hold in place:
 * ``/reasoning`` is folded into ``/model``, because effort is a property
   of the model and not a separate setting to keep in step;
 * ``/provider`` is gone - there are no built-in endpoints, and
-  ``/connect`` is the only way setup happens;
+  setup happens through ``/model`` (which absorbed ``/connect``);
 * what the user adds lives in one hand-editable file.
 """
 

@@ -14,7 +14,7 @@ Use for architecture, component, dependency, lifecycle, or data-flow visualizati
 ## Procedure
 
 1. Read the actual modules, inputs, outputs, state, and ownership boundaries.
-2. Run the source scan as a precursor when the goal is to understand a whole repository; use its entry-point and importance digest to choose what to read first.
+2. When the goal is to understand a whole repository, use the real primitives - search_code for symbol and definition lookups, list_dir for structure, read_file for entry points - to choose what to read first.
 3. Decide the audience and one visual story.
 4. Map only verified components and relationships.
 5. Produce an offline self-contained artifact with clear direction and labels.

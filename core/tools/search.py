@@ -35,6 +35,7 @@ def _load_ignore_matcher(root: str):
             with open(os.path.join(root, ignore_name), "r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     line = line.strip()
+                    # Negated patterns (!) are ignored by design.
                     if not line or line.startswith("#") or line.startswith("!"):
                         continue
                     dir_only = line.endswith("/")
@@ -170,6 +171,7 @@ class SearchCodeTool(Tool):
                 return []
         try:
             out = []
+            line_cap_hit = False
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
                 for lineno, line in enumerate(handle):
                     if query in line:
@@ -178,7 +180,10 @@ class SearchCodeTool(Tool):
                             break
                     # Avoid scanning huge files line-by-line indefinitely
                     if lineno > 10000:
+                        line_cap_hit = True
                         break
+            if line_cap_hit:
+                out.append(f"... [truncated — {rel} exceeds 10000 scanned lines; narrow the query]")
         except OSError:
             return []
         return out

@@ -548,7 +548,7 @@ class Backend:
                         continue
                     if flags & 0x0001:  # move
                         if buttons:
-                            self.events.put(Mouse("drag", self._primary_button(buttons, last_buttons), x, y, frozenset()))
+                            self.events.put(Mouse("drag", self._primary_button(buttons, last_buttons), x, y, mods_of(m.dwControlKeyState)))
                         continue
                     # Click press/release (flags == 0 or double-click flag)
                     changed = buttons ^ last_buttons

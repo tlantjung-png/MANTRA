@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from core.term import _char_width
+from core.term import _WidthScanner
 
 # A wide (CJK/fullwidth) character occupies two cells; the second cell
 # stores this marker so the diff never splits a wide glyph.
@@ -23,9 +23,9 @@ _ANSI_RE = re.compile(r"\033\[([0-9;?]*)([ -/]*[@-~])|\033\][^\x07\x1b]*(?:\x07|
 _SGR_RE = re.compile(r"\033\[([0-9;]*)m")
 
 # Control bytes must never reach the terminal through a cell: a bare ESC
-# or C1 byte would be written raw by the renderer. Layout controls the
-# buffer never renders (\n \r \t) are not matched.
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# or C1 byte would be written raw by the renderer. Tab (\t) and newline
+# (\n) are skipped so they can never enter a cell.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class StyleTable:
@@ -153,12 +153,15 @@ class Buffer:
             return x
         limit = self.cols if max_width is None else min(self.cols, x + max_width)
         cx = x
+        # Per-scan ZWJ state so a ZWJ sequence inside this text is counted
+        # as one grapheme without leaking into other set_str calls.
+        scanner = _WidthScanner()
         for ch in text:
             if cx >= limit:
                 break
             if _CTRL_RE.match(ch):
                 continue  # control bytes must never reach the terminal
-            w = _char_width(ch)
+            w = scanner.feed(ch)
             if w == 0:
                 continue  # combining marks: skip (rare in our content)
             if w >= 2:

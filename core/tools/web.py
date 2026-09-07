@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 import ipaddress
 import re
@@ -73,11 +74,14 @@ class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
-        self._depth = 0
+        # Stack of open skip-tag names, not a bare depth counter: a
+        # mismatched </style> after <script> must not expose the script's
+        # content early (D11).
+        self._skip_stack: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
         if tag in self._SKIP:
-            self._depth += 1
+            self._skip_stack.append(tag)
         elif tag in self._BREAK:
             self.parts.append("\n")
 
@@ -87,14 +91,15 @@ class _TextExtractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP:
-            # An unmatched close tag would otherwise leave the depth
-            # stuck above zero and blank out the rest of the page.
-            self._depth = max(0, self._depth - 1)
+            # An unmatched close tag would otherwise leave the stack
+            # stuck and blank out the rest of the page.
+            if self._skip_stack and self._skip_stack[-1] == tag:
+                self._skip_stack.pop()
         elif tag in self._BREAK:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self._depth:
+        if not self._skip_stack:
             self.parts.append(data)
 
     def text(self) -> str:
@@ -283,33 +288,34 @@ def _parse_alternative_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
     return None
 
 
+# Shared, bounded DNS resolver pool (D8): stalled lookups occupy a worker
+# instead of abandoning a daemon thread per fetch.
+# Non-daemon workers are intentional: daemon threads would be killed
+# mid-lookup at interpreter exit. Use atexit to join idle workers cleanly.
+_RESOLVER_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="mantra-dns"
+)
+import atexit as _atexit
+
+_atexit.register(_RESOLVER_POOL.shutdown, wait=False, cancel_futures=True)
+
+
 def _resolve_limited(host: str, timeout: float) -> list[tuple] | None:
     """Resolve ``host`` with a hard wall-clock bound.
 
-    The lookup runs on a daemon thread that is abandoned, not joined,
-    when it overruns the budget: a stalled resolver then costs exactly
-    the timeout instead of the operating system's full retry window,
-    and the discarded thread's result is simply never read. Returns
-    the address list, or None on timeout or failure.
+    The lookup runs on a shared, bounded thread pool, so a stalled
+    resolver costs exactly the timeout instead of the operating system's
+    full retry window — without leaking a daemon thread per fetch.
+    Returns the address list, or None on timeout or failure.
     """
-    results: list[tuple] = []
-    done = threading.Event()
-
-    def _run() -> None:
-        try:
-            results.extend(
-                socket.getaddrinfo(
-                    host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
-                )
-            )
-        except OSError:
-            pass  # resolver failure treated as "no addresses"; caller re-checks
-        finally:
-            done.set()
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
-    if not done.wait(timeout):
+    future = _RESOLVER_POOL.submit(
+        socket.getaddrinfo, host, None,
+        family=socket.AF_UNSPEC, type=socket.SOCK_STREAM,
+    )
+    try:
+        results = future.result(timeout=timeout)
+    except (OSError, UnicodeError, ValueError, TimeoutError):
+        # resolver failure treated as "no addresses"; caller re-checks
         return None
     return results or None
 
@@ -541,6 +547,8 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS variant: dial the pinned address, keep SNI + cert checks on the hostname."""
+
     def __init__(self, *args: Any, pinned_ip: str | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._pinned_ip = pinned_ip
@@ -586,6 +594,22 @@ class _PinningHandler(HTTPRedirectHandler, HTTPHandler, HTTPSHandler):
             return self._blocked(req)
         return self.do_open(_partial(_PinnedHTTPSConnection, pinned_ip=pinned), req)
 
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Reject redirect targets whose scheme is not http/https.
+
+        The stdlib redirect handler follows any Location scheme, which
+        would let a public server bounce the fetch to file://, ftp:// or
+        data:// with no private-host checks on that hop (D1).
+        """
+        scheme = urllib.parse.urlsplit(newurl).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise HTTPError(
+                newurl, code,
+                f"blocked: redirect to unsupported scheme {scheme!r}",
+                headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
     def _blocked(self, req: Any) -> HTTPError:
         host = urllib.parse.urlsplit(req.full_url).hostname
         return HTTPError(req.full_url, 403, self._BLOCKED_MSG.format(host=host), None, None)
@@ -615,10 +639,13 @@ try:
     # Routed through the validating opener so each hop is checked, not
     # just the URL the chain happens to end on. Tests rebind this name.
     urlopen = _make_opener().open
-except Exception:  # pragma: no cover - defensive: any opener-build failure
-    # degrades to the plain stdlib opener (redirect pinning lost, fetch
-    # still possible) rather than disabling the tool entirely.
-    urlopen = stdlib_urlopen
+    _OPENER_FAILED = False
+except Exception:  # pragma: no cover - fail closed, never fetch unvalidated
+    # Fail closed: retain redirect and DNS pinning guarantees rather than
+    # fetching through an unvalidated opener.
+    def urlopen(request, timeout=None):  # type: ignore[no-redef]
+        raise URLError("fetch unavailable: secure opener failed to initialise")
+    _OPENER_FAILED = True
 
 
 class WebFetchTool(Tool):
@@ -696,7 +723,7 @@ class WebFetchTool(Tool):
                 content_type = response.headers.get("Content-Type", "")
                 encoding = response.headers.get_content_charset()
                 compressed = response.headers.get("Content-Encoding", "")
-                status = getattr(response, "status", None) or response.getcode()
+                status = getattr(response, "status", None) or getattr(response, "getcode", lambda: None)()
         except HTTPError as exc:
             # The body of an error response often says which header was
             # wrong, so surface the status and let the agent carry on.

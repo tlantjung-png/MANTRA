@@ -1,6 +1,7 @@
-"""Tests for the one-step BYOK flow (``/connect``) and the startup screen.
+"""Tests for the one-step BYOK flow (now ``/model``, which absorbed
+``/connect``) and the startup screen.
 
-``/connect`` is the only setup a user needs: give a URL and a key, and
+``/model`` is the only setup a user needs: give a URL and a key, and
 the endpoint lists its own models into a menu. There is no provider
 table to learn and no second command - the endpoint, the key and the
 model list are saved to one hand-editable file. Every test here

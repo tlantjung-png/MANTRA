@@ -48,8 +48,12 @@ def _quarantine(target: Path) -> None:
         import time
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = target.with_suffix(target.suffix + f".corrupt-{stamp}")
-        shutil.copy2(target, backup)
+        for attempt in range(100):
+            suffix = f".corrupt-{stamp}" if attempt == 0 else f".corrupt-{stamp}-{attempt}"
+            backup = target.with_suffix(target.suffix + suffix)
+            if not backup.exists():
+                shutil.copy2(target, backup)
+                return
     except OSError:
         pass
 
@@ -73,6 +77,7 @@ def load_all() -> dict[str, Any]:
         _quarantine(target)
         return _empty()
     if not isinstance(data, dict) or not isinstance(data.get("workflows"), dict):
+        _quarantine(target)
         return _empty()
     return data
 
@@ -184,12 +189,12 @@ def _save_all(data: dict[str, Any]) -> bool:
 
 
 def get(name: str) -> dict[str, Any] | None:
-    """One workflow by name, or None."""
+    """One launchable workflow by name, or None."""
     found = load_all()["workflows"].get(slug(name))
     if not isinstance(found, dict):
         return None
     steps = found.get("steps")
-    if not isinstance(steps, list):
+    if not isinstance(steps, list) or not steps:
         return None
     return found
 

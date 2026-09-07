@@ -173,6 +173,10 @@ class ReadFileTool(Tool):
             if not _is_strict_positive_int(offset, allow_zero=True):
                 return f"ERROR: offset must be a non-negative integer, got {offset!r}"
             offset = int(offset)
+        elif isinstance(offset, float):
+            # A float would silently truncate via int(); reject it like
+            # the string form (D18).
+            return f"ERROR: offset must be an integer, got {offset!r}"
         elif not isinstance(offset, int):
             try:
                 offset = int(offset)
@@ -182,6 +186,8 @@ class ReadFileTool(Tool):
             if not _is_strict_positive_int(limit, allow_zero=True):
                 return f"ERROR: limit must be a non-negative integer, got {limit!r}"
             limit = int(limit)
+        elif isinstance(limit, float):
+            return f"ERROR: limit must be an integer, got {limit!r}"
         elif not isinstance(limit, int):
             try:
                 limit = int(limit)
@@ -283,7 +289,7 @@ class ReadFileTool(Tool):
             skipped = 0
             unreadable = 0
             for rel in sorted(files):
-                res = self._execute_single(sandbox, rel, 0, 400)  # per-file window
+                res = self._execute_single(sandbox, rel, offset, limit)
                 # Strip notes for bulk, keep content. A per-file note can be
                 # legitimate ("file is empty"), so only errors count as
                 # unreadable here.
@@ -292,9 +298,9 @@ class ReadFileTool(Tool):
                     continue
                 chunk = f"--- {rel} ---\n{res}\n"
                 if total + len(chunk) > 100_000:
-                    # Count only the files actually dropped by the cap:
-                    # errors and notes were never cap-skipped.
-                    skipped = max(0, len(files) - len(out_parts) - 1)
+                    # Count the files not shown at all (the current one
+                    # included); errors and notes were never cap-skipped.
+                    skipped = len(files) - len(out_parts)
                     break
                 out_parts.append(chunk)
                 total += len(chunk)
@@ -309,19 +315,22 @@ class ReadFileTool(Tool):
 
     def _execute_bulk_list(self, sandbox: Sandbox, paths: list[str], limit: int) -> str:
         out_parts: list[str] = []
+        file_count = 0
         total = 0
         for rel in paths[:20]:
             res = self._execute_single(sandbox, rel.strip(), 0, 400)
             if res.startswith("ERROR"):
                 out_parts.append(f"--- {rel} ---\n{res}\n")
+                file_count += 1
                 continue
             chunk = f"--- {rel} ---\n{res}\n"
             if total + len(chunk) > 100_000:
-                out_parts.append(f"... aggregate cap 100KB, {len(paths)-len(out_parts)} more skipped")
+                out_parts.append(f"... aggregate cap 100KB, {len(paths) - file_count} more skipped")
                 break
             out_parts.append(chunk)
+            file_count += 1
             total += len(chunk)
-        return f"READ {len(out_parts)}/{len(paths)} files\n" + "\n".join(out_parts)
+        return f"READ {file_count}/{len(paths)} files\n" + "\n".join(out_parts)
 
     def _execute_single(self, sandbox: Sandbox, path: str, offset: int, limit: int) -> str:
         # Dedup check: an unchanged window of an unchanged file returns the
@@ -334,7 +343,7 @@ class ReadFileTool(Tool):
                 full_check = os.path.join(root, path)
                 st = os.stat(full_check)
                 cached = self._dedup.get(dedup_key)
-                if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
                     # Self-expiring: consume record
                     del self._dedup[dedup_key]
                     return cached[2]
@@ -347,8 +356,8 @@ class ReadFileTool(Tool):
         candidates = [path] + _candidate_spellings(path)[1:]
         for cand in candidates:
             try:
-                # Check sandbox confinement via sandbox.read_file
-                # For local sandbox we can also check device block already done
+                # Confinement is enforced by sandbox.read_file; device
+                # blocking already ran above.
                 content = sandbox.read_file(cand)
                 if cand != path:
                     path = cand  # use successful spelling
@@ -447,8 +456,9 @@ class ReadFileTool(Tool):
             while cut > 0 and cut < len(raw) and (raw[cut] & 0xC0) == 0x80:
                 cut -= 1
             text = raw[:cut].decode("utf-8", errors="replace")
-            # Ensure we cut at line boundary if possible
-            text = text.rsplit("\n", 1)[0]
+            # Prefer a line boundary; keep the raw chunk when no newline exists.
+            cut_text = text.rsplit("\n", 1)[0]
+            text = cut_text if cut_text else text
             truncated_by_bytes = True
 
         # Build header with resume info
@@ -488,10 +498,14 @@ class ReadFileTool(Tool):
             if root is not None and len(result) <= _DEDUP_CACHE_MAX_CHARS:
                 full = os.path.join(root, path)
                 st = os.stat(full)
-                self._dedup[dedup_key] = (st.st_mtime, st.st_size, result)
-                # Prune cache
+                # Delete before insert so a re-read (file changed since the
+                # cached entry) moves the key to the end of the dict: the
+                # eviction below pops the first key, which is then the least
+                # recently used rather than merely the first ever inserted.
+                self._dedup.pop(dedup_key, None)
+                self._dedup[dedup_key] = (st.st_mtime_ns, st.st_size, result)
+                # Prune cache: pop the least recently used entry.
                 if len(self._dedup) > 100:
-                    # remove oldest
                     self._dedup.pop(next(iter(self._dedup)))
         except Exception:
             pass
@@ -570,6 +584,13 @@ class EditFileTool(Tool):
     ) -> str:
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
+        # Same harness/device blocklist as read_file and write_file; an
+        # edit must not reach device paths or ADS/CON/PRN forms.
+        blocked = _is_blocked_path_harness(path)
+        if blocked:
+            return f"ERROR: refusing to edit path {path!r}: {blocked}"
+        if _is_blocked_device(path):
+            return f"ERROR: refusing to edit device path {path}"
         if old_string == "":
             return "ERROR: old_string must be non-empty"
         if len(old_string) > _MAX_READ_CHARS or len(new_string) > _MAX_WRITE_CHARS:
@@ -656,7 +677,13 @@ class ListDirTool(Tool):
             return "ERROR: invalid path"
         root = getattr(sandbox, "root", None)
         if root is None:
-            # No direct view: use shell with safe quoting.
+            # No direct view: use shell with safe quoting. Mirror the
+            # direct path's traversal guard: ".." components and absolute
+            # paths are refused before they reach the container shell.
+            if any(c == ".." for c in path.replace("\\", "/").split("/")):
+                return "ERROR: path must stay inside the workspace"
+            if path.startswith("/") or re.match(r"^[a-zA-Z]:[\\/]", path):
+                return "ERROR: path must stay inside the workspace"
             if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
                 return "ERROR: path contains unsupported characters for shell listing"
             quoted = shlex.quote(path)

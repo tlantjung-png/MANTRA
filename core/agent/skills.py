@@ -175,7 +175,9 @@ def load_all() -> dict[str, Skill]:
     current_roots = tuple(str(r) for r in roots())
     now = time.monotonic()
     if _cache_all is not None and _cache_all_roots == current_roots and (now - _cache_all_ts) < _CACHE_TTL:
-        return dict(_cache_all)  # Defensive copy: callers must not corrupt the cache.
+        import copy as _copy
+
+        return _copy.deepcopy(_cache_all)  # Deep copy: callers must not corrupt the cache.
     found: dict[str, Skill] = {}
     for root in roots():
         if not root.is_dir():
@@ -277,7 +279,9 @@ def load_bundles() -> dict[str, list[str]]:
     current_roots = tuple(str(r) for r in roots())
     now = time.monotonic()
     if _cache_bundles is not None and _cache_bundles_roots == current_roots and (now - _cache_bundles_ts) < _CACHE_TTL:
-        return dict(_cache_bundles)
+        import copy as _copy
+
+        return _copy.deepcopy(_cache_bundles)
     bundles: dict[str, list[str]] = {}
     for root in roots():
         if not root.is_dir():
@@ -323,7 +327,9 @@ def routing_table() -> dict[str, dict[str, str]]:
     current_roots = tuple(str(r) for r in roots())
     now = time.monotonic()
     if _cache_routing is not None and _cache_routing_roots == current_roots and (now - _cache_routing_ts) < _CACHE_TTL:
-        return dict(_cache_routing)
+        import copy as _copy
+
+        return _copy.deepcopy(_cache_routing)
     table: dict[str, dict[str, str]] = {}
     for root in roots():
         if not root.is_dir():

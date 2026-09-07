@@ -110,9 +110,11 @@ class SessionPanelTest(unittest.TestCase):
         store = tempfile.mkdtemp(prefix="mantra-sessions-")
         prior = os.environ.get("MANTRA_SESSIONS")
         os.environ["MANTRA_SESSIONS"] = store
-        self.addCleanup(os.environ.pop, "MANTRA_SESSIONS", None)
+        # addCleanup is LIFO: register the setdefault BEFORE the pop so the
+        # pop runs first and the prior value is restored while the key is absent.
         if prior is not None:
             self.addCleanup(os.environ.setdefault, "MANTRA_SESSIONS", prior)
+        self.addCleanup(os.environ.pop, "MANTRA_SESSIONS", None)
         return store
 
     def test_bridge_opens_and_lists_saved_sessions(self):

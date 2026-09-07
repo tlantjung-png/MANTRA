@@ -15,7 +15,7 @@ Use for questions about which skill to use, a skill-library overview, ambiguous 
 
 1. Classify the request by function rather than provider or implementation language.
 2. Ask one targeted question when two routes remain genuinely ambiguous.
-3. Route a multi-skill task as a complete chain, using the bundle catalog when a named bundle fits.
+3. Route a multi-skill task as a complete chain, composing the individual skills in order. Note that no bundle catalog ships yet (the bundle loader returns an empty map and the console reports no bundles found), so there are no named bundles to route through.
 4. Load the selected skill's full procedure before executing a real task.
 5. End the routed workflow with a verification skill when code or operational changes are involved.
 

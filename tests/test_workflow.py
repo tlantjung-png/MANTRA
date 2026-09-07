@@ -111,6 +111,11 @@ class CommandTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         for var in ("MANTRA_SETTINGS", workflows._OVERRIDE_ENV):
+            prior = os.environ.get(var)
+            if prior is not None:
+                # addCleanup is LIFO: this runs after the pop below,
+                # restoring whatever the harness had set.
+                self.addCleanup(os.environ.setdefault, var, prior)
             self.addCleanup(os.environ.pop, var, None)
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
         os.environ[workflows._OVERRIDE_ENV] = os.path.join(self.tmp, "workflows.json")

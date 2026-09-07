@@ -12,7 +12,7 @@ from core.agent.context import ContextManager
 from core.agent.events import EventBus
 from core.agent.approvals import _redact_sensitive
 from core.agent.exceptions import AbortError, LLMError, SandboxError, ToolError
-from core.agent.repairs import repair_arguments, validate_arguments
+from core.agent.repairs import canonical_command, repair_arguments, validate_arguments
 from core.types import EvaluationResult, Evaluator
 from core.types import LLMClient
 from core.types import Logger
@@ -90,6 +90,9 @@ class AgentLoop:
         self.context = context
         self._seed_context(context, task)
         # Share abort signal so sandbox exec can be interrupted.
+        # Remember any prior value so a reused sandbox does not leak it.
+        _had_abort = hasattr(self.sandbox, "abort")
+        _prior_abort = getattr(self.sandbox, "abort", None)
         try:
             setattr(self.sandbox, "abort", self.abort)
         except Exception:
@@ -332,6 +335,15 @@ class AgentLoop:
                 self.sandbox.cleanup()
             except Exception:  # noqa: BLE001 - cleanup must not mask results
                 pass
+            finally:
+                # Restore the sandbox abort slot for reuse.
+                try:
+                    if _had_abort:
+                        setattr(self.sandbox, "abort", _prior_abort)
+                    elif hasattr(self.sandbox, "abort"):
+                        delattr(self.sandbox, "abort")
+                except Exception:
+                    pass
 
         elapsed = time.monotonic() - started
         result = RunResult(
@@ -385,7 +397,9 @@ class AgentLoop:
         try:
             args = call.arguments if isinstance(call.arguments, dict) else {}
             if call.name == "run_command":
-                key = f"run_command|{str(args.get('command', '')).strip()}"
+                # Alias spellings share the canonical key, matching the
+                # repair pass and approvals (D4).
+                key = f"run_command|{canonical_command(args)}"
             elif call.name in ("read_file", "list_dir"):
                 rest = {k: v for k, v in args.items() if k != "path"}
                 rest_json = json.dumps(rest, sort_keys=True, ensure_ascii=False, default=str)
@@ -431,13 +445,13 @@ class AgentLoop:
         prior_failed = key in recent_failed
         if cnt >= 3:
             observation = f"STOP RETRYING: you already called {call.name} with the same arguments {cnt} times. Use the previous result. If you need a different result, change the arguments (a different path, offset, or command)."
-            metrics["tool_errors"] += 1
+            metrics["blocked_repeats"] = metrics.get("blocked_repeats", 0) + 1
         elif cnt == 2 and not prior_failed:
             observation = f"ERROR: you already called {call.name} {call.arguments} — the result is already in history above. Do not repeat. Use it or try a different file (e.g. README.md, pyproject.toml)."
-            metrics["tool_errors"] += 1
+            metrics["blocked_repeats"] = metrics.get("blocked_repeats", 0) + 1
         else:
-            observation = self._dispatch_tool(task_id, step, call, metrics)
-            if str(observation).startswith("ERROR"):
+            observation, ok = self._dispatch_tool(task_id, step, call, metrics)
+            if not ok or str(observation).startswith("ERROR"):
                 recent_failed.add(key)
             else:
                 recent_failed.discard(key)
@@ -466,7 +480,7 @@ class AgentLoop:
 
     def _dispatch_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]
-    ) -> str:
+    ) -> tuple[str, bool]:
         """Approve and execute one tool; failures become observations."""
         try:
             if self.approver is not None and not self.approver.check(call.name, call.arguments):
@@ -477,17 +491,25 @@ class AgentLoop:
                 )
                 return (
                     f"ERROR: the operator denied '{call.name}'. Do not retry it; "
-                    "explain what you would have done and ask, or use another approach."
+                    "explain what you would have done and ask, or use another approach.",
+                    False,
                 )
         except Exception as exc:  # noqa: BLE001 - approver must not crash run
             metrics["tool_errors"] += 1
-            return f"ERROR: approval check failed for '{call.name}': {exc}"
+            return f"ERROR: approval check failed for '{call.name}': {exc}", False
         return self._execute_tool(task_id, step, call, metrics)
 
     def _execute_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]
-    ) -> str:
-        """Dispatch one tool call; every failure becomes an observation."""
+    ) -> tuple[str, bool]:
+        """Dispatch one tool call; every failure becomes an observation.
+
+        Returns (observation, ok) where ``ok`` is structural: the tool
+        raised, was unknown, or got invalid arguments. A normal return is
+        a success even when its text starts with "ERROR" (file content
+        can legitimately begin that way), so metrics are not skewed by
+        content (D11).
+        """
         # Registry aliases (e.g. webfetch -> web_fetch) are normalised at
         # build time, so look up the canonical form here or an aliased call
         # would be reported as an unknown tool.
@@ -500,8 +522,8 @@ class AgentLoop:
             tool = self.tools.get(canonical)
         if tool is None:
             metrics["tool_errors"] += 1
-            return f"ERROR: unknown tool '{call.name}'"
-        # Validate-then-repair (Command Code harness engineering)
+            return f"ERROR: unknown tool '{call.name}'", False
+        # Validate-then-repair: repair only on issue paths, then re-validate.
         args = dict(call.arguments) if isinstance(call.arguments, dict) else {}
         schema = getattr(tool, "parameters", None)
         issues = validate_arguments(args, schema)
@@ -530,7 +552,8 @@ class AgentLoop:
                 return (
                     f"ERROR: invalid arguments for '{call.name}': {'; '.join(issues)}. "
                     f"Expected {schema.get('properties', {}) if schema else 'valid args'}. "
-                    f"Fix and retry the same tool call."
+                    f"Fix and retry the same tool call.",
+                    False,
                 )
         # Event/log payloads must not carry raw secrets: file contents and
         # command text can embed credentials, so arguments are redacted and
@@ -547,15 +570,18 @@ class AgentLoop:
             {"task_id": task_id, "step": step, "tool": call.name, "args": redacted},
         )
         started = time.monotonic()
+        ok = True
         try:
             observation = tool.execute(self.sandbox, **args)
         except AbortError:
             raise
         except TypeError as exc:
             observation = f"ERROR: bad arguments for '{call.name}': {exc}"
+            ok = False
         except Exception as exc:  # noqa: BLE001 - surface to the agent
             observation = f"ERROR: tool '{call.name}' failed: {exc}"
-        if str(observation).startswith("ERROR"):
+            ok = False
+        if not ok:
             metrics["tool_errors"] += 1
         # Include edit result so UI can show diffs.
         result_payload: dict = {
@@ -563,7 +589,7 @@ class AgentLoop:
             "step": step,
             "tool": call.name,
             "seconds": round(time.monotonic() - started, 3),
-            "ok": not str(observation).startswith("ERROR"),
+            "ok": ok,
         }
         if call.name in ("edit_file", "write_file"):
             result_payload["result"] = observation
@@ -577,7 +603,7 @@ class AgentLoop:
             except Exception:
                 pass
         self._emit("tool_result", result_payload)
-        return observation
+        return observation, ok
 
     def _seed_context(self, context: ContextManager, task: dict[str, Any]) -> None:
         """Seed first turn or refresh the pinned prompt for an ongoing one.

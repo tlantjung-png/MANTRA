@@ -339,5 +339,80 @@ class DispatchTest(SessionTestBase):
         self.assertNotIn("/resume", HELP_TEXT)
 
 
+class PathSanitizerTest(unittest.TestCase):
+    """Session names must never escape the store directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        prior = os.environ.get(sessions._OVERRIDE_ENV)
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, sessions._OVERRIDE_ENV, prior)
+        self.addCleanup(os.environ.pop, sessions._OVERRIDE_ENV, None)
+        os.environ[sessions._OVERRIDE_ENV] = self.tmp
+
+    def test_traversal_names_stay_inside_the_store_dir(self):
+        saved = sessions.save("../../outside", {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertIsNotNone(saved)
+        # The written file lives directly in the store, never in a parent.
+        self.assertEqual(
+            os.path.realpath(os.path.dirname(saved)), os.path.realpath(self.tmp)
+        )
+        self.assertEqual(sessions.load("../../outside")["messages"][0]["content"], "hi")
+
+    def test_path_like_names_are_sanitized_into_the_store(self):
+        for name in ("../x", "..\\x", "/etc/passwd", "a/b"):
+            target = sessions._path(name)
+            self.assertEqual(target.parent, sessions.sessions_dir(), name)
+            self.assertNotIn("..", str(target), name)
+
+
+class SafeSessionPathTest(unittest.TestCase):
+    """The resume-path allowlist guards what can be loaded as a session."""
+
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="mantra-path-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
+        self.sessions_store = tempfile.mkdtemp(prefix="mantra-path-store-")
+        self.addCleanup(shutil.rmtree, self.sessions_store, True)
+        prior = os.environ.get(sessions._OVERRIDE_ENV)
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, sessions._OVERRIDE_ENV, prior)
+        self.addCleanup(os.environ.pop, sessions._OVERRIDE_ENV, None)
+        os.environ[sessions._OVERRIDE_ENV] = self.sessions_store
+
+    def test_paths_inside_allowed_dirs_are_ok(self):
+        from core.console import _is_safe_session_path
+
+        self.assertTrue(
+            _is_safe_session_path(os.path.join(self.workspace, "a", "b.json"), self.workspace)
+        )
+        self.assertTrue(
+            _is_safe_session_path(os.path.join(self.workspace, ".mantra", "memory.md"), self.workspace)
+        )
+        self.assertTrue(
+            _is_safe_session_path(os.path.join(self.sessions_store, "x.json"), self.workspace)
+        )
+
+    def test_paths_outside_are_refused(self):
+        from core.console import PROJECT_ROOT, _is_safe_session_path
+
+        outside = os.path.join(PROJECT_ROOT, "core", "console.py")
+        self.assertFalse(_is_safe_session_path(outside, self.workspace))
+
+    def test_case_variant_is_allowed_on_every_platform(self):
+        from core.console import _is_safe_session_path
+
+        # The allowlist lowercases both sides unconditionally, so a
+        # case-variant path inside the workspace is accepted on POSIX and
+        # Windows alike (Windows realpath additionally normalizes case).
+        upper = os.path.join(
+            os.path.dirname(self.workspace).upper(),
+            os.path.basename(self.workspace).upper(),
+            "f.json",
+        )
+        self.assertTrue(_is_safe_session_path(upper, self.workspace))
+
+
 if __name__ == "__main__":
     unittest.main()

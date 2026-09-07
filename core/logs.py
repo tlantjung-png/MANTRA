@@ -14,6 +14,22 @@ from core.types import Logger
 # at ``<path>.1`` and replaced on the next rotation.
 _ROTATE_BYTES = 1_000_000
 
+# Grace period before a lock may be probed for staleness, and the hard
+# ceiling past which it is removed even if the holder pid looks alive: no
+# legitimate write holds the inter-process lock anywhere near that long,
+# so an apparently-live holder is a pid-reuse or a wedged writer.
+_LOCK_GRACE_SECONDS = 5.0
+_LOCK_HARD_CEILING_SECONDS = 60.0
+
+if os.name == "nt":  # pragma: no cover - Windows-only
+    import ctypes
+
+    # use_last_error captures the Win32 last-error per call; without it
+    # ctypes.get_last_error() would read a stale value and the not-found
+    # probe could misreport a dead process as alive, wedging the stale
+    # lock forever.
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
 
 def _pid_alive(pid: int) -> bool:
     """True only when the pid is verified alive.
@@ -26,17 +42,20 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        if os.name == "nt":
+        if os.name == "nt":  # pragma: no cover - Windows-only
             import ctypes
 
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
+            handle = _KERNEL32.OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION, False, pid
             )
             if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                _KERNEL32.CloseHandle(handle)
                 return True
-            return False
+            # Access-denied means the process exists but is protected or
+            # owned by another user: treat it as alive. Only a not-found
+            # probe (invalid parameter, error 87) counts as dead.
+            return ctypes.get_last_error() != 87
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
@@ -48,7 +67,14 @@ def _pid_alive(pid: int) -> bool:
 
 
 class JsonlLogger(Logger):
-    """One JSON per line; never raises."""
+    """One JSON per line; never raises.
+
+    Contract: one writer per log file. The inter-process lock also
+    tolerates a second writer, but a rotation by one process replaces the
+    file while the other's handle keeps appending to the old inode; the
+    inode check in ``_ensure_handle`` reopens the new file on the next
+    write.
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -57,6 +83,10 @@ class JsonlLogger(Logger):
             os.makedirs(parent, exist_ok=True)
         self._lock = threading.Lock()
         self._handle: Any = None
+        # Records skipped because the inter-process lock could not be
+        # acquired in time, or a write failed. The logger never raises,
+        # so this counter is the only visibility into silent loss.
+        self._dropped = 0
         # mtime of the inter-process lock this process holds, or None. A
         # lock carrying our own pid is released within the write below; one
         # still present with the same mtime past the grace period is a
@@ -66,6 +96,21 @@ class JsonlLogger(Logger):
     def _ensure_handle(self) -> Any:
         """Lazily opened append handle; reopened after a rotation."""
         if self._handle is None:
+            self._handle = open(self.path, "a", encoding="utf-8")
+            return self._handle
+        try:
+            current_ino = os.stat(self.path).st_ino
+            handle_ino = os.fstat(self._handle.fileno()).st_ino
+        except OSError:
+            return self._handle
+        if current_ino != handle_ino:
+            # Another process rotated the log aside while our handle was
+            # open; records would land on the unlinked inode, so reopen
+            # the file that now carries the log name.
+            try:
+                self._handle.close()
+            except OSError:
+                pass
             self._handle = open(self.path, "a", encoding="utf-8")
         return self._handle
 
@@ -92,9 +137,9 @@ class JsonlLogger(Logger):
             pass
 
     def log(self, event: str, payload: dict[str, Any]) -> None:
-        # Payload spreads last, so it can override ts/event; default=str
-        # stringifies values that JSON cannot serialize.
-        record = {"ts": round(time.time(), 3), "event": event, **payload}
+        # Caller payload spreads first so ts/event cannot be spoofed;
+        # default=str stringifies values that JSON cannot serialize.
+        record = {**payload, "ts": round(time.time(), 3), "event": event}
         line = json.dumps(record, default=str) + "\n"
         # Inter-process lock to avoid interleaved lines. Use atomic exclusive
         # create as the arbiter; the holder's pid is embedded so a stale
@@ -110,7 +155,7 @@ class JsonlLogger(Logger):
                 return None
 
         def _break_stale() -> None:
-            """Break a lock whose holder is gone.
+            """Break a lock whose holder is gone or wedged.
 
             mtime alone cannot tell a paused-but-live holder from a dead
             one, so the holder's pid is probed for liveness before the
@@ -118,11 +163,23 @@ class JsonlLogger(Logger):
             when it matches the one this process acquired (recorded
             mtime) and the grace period has passed: a live hold is
             released within the write below, so a still-present lock is
-            a crash leftover.
+            a crash leftover. Past the hard ceiling the lock is removed
+            unconditionally — no legitimate hold lasts that long, so an
+            alive pid there is reuse, not a paused writer.
             """
             try:
                 stat = os.stat(lock_path)
-                if time.time() - stat.st_mtime < 5.0:
+                age = time.time() - stat.st_mtime
+                if age < _LOCK_GRACE_SECONDS:
+                    return
+                if age >= _LOCK_HARD_CEILING_SECONDS:
+                    try:
+                        stat2 = os.stat(lock_path)
+                        if stat2.st_mtime != stat.st_mtime:
+                            return
+                        os.remove(lock_path)
+                    except OSError:
+                        pass
                     return
                 pid = _lock_holder_pid()
                 if pid == os.getpid():
@@ -165,7 +222,7 @@ class JsonlLogger(Logger):
                 time.sleep(0.02)
                 try:
                     s = os.stat(lock_path)
-                    if time.time() - s.st_mtime >= 5.0:
+                    if time.time() - s.st_mtime >= _LOCK_GRACE_SECONDS:
                         _break_stale()
                 except OSError:
                     pass
@@ -173,11 +230,14 @@ class JsonlLogger(Logger):
                 break
         if not acquired:
             # Another process holds the inter-process lock: skip this
-            # record rather than risk interleaved, corrupt lines. A lock
-            # recording our own pid cannot be a live hold from this
-            # process — the holder removes it within the write below —
-            # so it must be a crash leftover; leaving it would drop every
-            # later record too.
+            # record rather than risk interleaved, corrupt lines, and
+            # count the loss so it is not invisible. A lock recording our
+            # own pid cannot be a live hold from this process — the
+            # holder removes it within the write below — so it must be a
+            # crash leftover; leaving it would drop every later record
+            # too.
+            with self._lock:
+                self._dropped += 1
             try:
                 if _lock_holder_pid() == os.getpid():
                     os.remove(lock_path)
@@ -192,7 +252,7 @@ class JsonlLogger(Logger):
                     handle.write(line)
                     handle.flush()
                 except OSError:
-                    pass
+                    self._dropped += 1
         finally:
             self._held_lock_mtime = None
             if acquired and fd is not None:
@@ -204,6 +264,11 @@ class JsonlLogger(Logger):
                     os.remove(lock_path)
                 except OSError:
                     pass
+
+    @property
+    def dropped(self) -> int:
+        """Number of records skipped (lock contention or failed write)."""
+        return self._dropped
 
     def close(self) -> None:
         """Flush and release the append handle. Idempotent; never raises."""

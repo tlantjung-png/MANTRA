@@ -34,3 +34,8 @@ Format:
 - symptom: tool-call JSON rejected with "Failed to parse arguments for tool" when a command or a probe string carries an unquoted bare Windows path, an unquoted glob, or Bash-style quoting; inline python -c probes with nested quotes also die on the shell (KF-3). The cluster recurs across sessions (16+ rejections in the unified log on one day).
 - rule: quote EVERY string value in tool-call JSON; use the exact parameter names of the tool's schema; prefer a temp .ps1/.py file for any probe needing variables, regexes, or nested quotes; never use Bash-only separators (&&, ;, |) inside Windows PowerShell command strings.
 - date: 2026-09-06
+
+## KF-6 | parallel subagent quota exhaustion on large code remdiations
+- symptom: a subagent running a long-running code-editing task (audit + remediation across 50+ files) hits the upstream pre-deduct quota and fails mid-execution with HTTP 403; the edits it completed are on disk but no final report is written.
+- rule: when remediating more than ~30 files, launch smaller, single-zone subagents with explicit completion checkpoints (one zone per subagent, each reports in a single write at the end). Verify the artifact exists before treating the work as complete. Always have the parent session budget reserve for cleanup of any unfinished zones.
+- date: 2026-09-07

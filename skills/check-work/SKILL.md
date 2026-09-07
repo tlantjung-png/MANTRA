@@ -25,7 +25,7 @@ Use after implementation, review, documentation, operational, or research work w
 5. When coverage tooling applies (for example vitest `related` plus `--coverage.include` in JavaScript projects), name both the owning tests and the source scope; do not lower thresholds or narrow the include to hide an uncovered affected file. Coverage-diff tooling cannot discover behavior reached only through configuration, dynamic loading, subprocesses, workers, or external providers — select those owners explicitly.
 6. Run the build, tests, diagnostics, and focused edge checks that the project defines.
 7. Collect every check's result, then run the **Reduce** phase below to reconcile all results into one structured verdict.
-8. Confirm the deliverable is materialized on disk, such as a file or a committed change, not only relayed in chat. Use the deliverable checker with the task's stated deliverable paths where they are known.
+8. Confirm the deliverable is materialized on disk, such as a file or a committed change, not only relayed in chat. Use the file tools (read_file / list_dir) on the task's stated deliverable paths where they are known to confirm the content is present.
 9. Review correctness, adequacy, excess, regressions, and edge cases.
 10. If a check fails, describe the exact issue and repeat verification after a correction, up to three cycles.
 

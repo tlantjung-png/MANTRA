@@ -34,6 +34,25 @@ _ENCODED_TRAVERSAL_RE = re.compile(r"(%2e%2e|%252e|\\u002e|\\x2e)", re.IGNORECAS
 _MAX_READ_BYTES = 500_000
 _MAX_EXEC_BYTES = 1_000_000
 
+# Defense-in-depth: children of the host sandbox must not inherit the
+# harness's credential-shaped environment variables. Approvals remain the
+# real gate — this only stops a model-issued command from trivially
+# printing secrets. PATH/SystemRoot/HOME etc. are kept as-is.
+_SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+# Known MANTRA_* variables that are secret stores (the marker filter
+# already catches most of these by name).
+_MANTRA_SECRET_ENV = frozenset({"MANTRA_CREDENTIALS"})
+
+
+def _filtered_env(env: dict) -> dict:
+    """Return ``env`` minus credential-shaped variables."""
+    return {
+        name: value
+        for name, value in env.items()
+        if not any(marker in name.upper() for marker in _SECRET_ENV_MARKERS)
+        and name.upper() not in _MANTRA_SECRET_ENV
+    }
+
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """Terminate the child and its whole tree; best effort, never raises."""
@@ -97,17 +116,42 @@ def _strip_quoted(s: str) -> str:
     s = re.sub(r"'[^']*'", _repl, s)
     return s
 
-def _contains_traversal(command: str) -> bool:
-    """Heuristic: is the command likely to escape the workspace?
+_WRAPPER_WORDS = ("cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe")
+_WRAPPER_FLAGS = ("/c", "/k", "-c", "-command", "-encodedcommand")
 
-    Defence in depth only: the host sandbox uses shell=True and cannot
-    guarantee containment. Quoted spans are data, not shell-resolved paths.
+
+def _wrapper_payload(command: str) -> str | None:
+    """Nested command inside a wrapper invocation, if any.
+
+    Only the known shell wrappers (cmd/powershell/pwsh) followed by a
+    flag (/c, -c, -Command) are unwrapped; every other command keeps its
+    quoted spans as plain data.
     """
-    if not command:
+    tokens = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', command)
+    if not tokens:
+        return None
+    first = re.split(r"[\\/]", tokens[0].strip('"\'').lower())[-1]
+    if first not in _WRAPPER_WORDS:
+        return None
+    seen_flag = False
+    for tok in tokens[1:]:
+        low = tok.strip('"\'').lower()
+        if not seen_flag:
+            if low in _WRAPPER_FLAGS:
+                seen_flag = True
+            continue
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+            return tok[1:-1]
+    return None
+
+
+def _scan_traversal_core(text: str) -> bool:
+    """Scan a single command string for workspace-escape patterns."""
+    if not text:
         return False
     # Skip checks for URL like strings inside the command to avoid
     # flagging https:// as an absolute path. Strip URL schemes before test.
-    stripped = re.sub(r"https?://[^\s]+", "", command, flags=re.IGNORECASE)
+    stripped = re.sub(r"https?://[^\s]+", "", text, flags=re.IGNORECASE)
     stripped = re.sub(r"file://[^\s]+", "", stripped, flags=re.IGNORECASE)
     # Decode common URL-encoding that can hide ".." (e.g. %2e%2e, %252e).
     try:
@@ -143,6 +187,9 @@ def _contains_traversal(command: str) -> bool:
     for target in (stripped_unquoted, decoded_unquoted):
         if re.search(r"(?:^|[\s\"'/\\:])\.\.(?:$|[\s\"'/\\])", target):
             return True
+        # cmd.exe also accepts "cd.." with no separator before the dots.
+        if re.search(r"(?i)(?:^|[\s;&|()])cd\.\.(?:$|[\s\\/])", target):
+            return True
     # Check absolute paths in arguments only, not the executable name.
     # Split into tokens and check from the second token onwards; quoted
     # spans are excluded for the same reason as above.
@@ -172,6 +219,22 @@ def _contains_traversal(command: str) -> bool:
                     if len(token) > 1 and not token.startswith("//"):
                         return True
     return False
+
+
+def _contains_traversal(command: str) -> bool:
+    """Heuristic: is the command likely to escape the workspace?
+
+    Defence in depth only: the host sandbox uses shell=True and cannot
+    guarantee containment. Quoted spans are data, not shell-resolved paths,
+    except inside wrapper invocations (cmd /c "...") where the quotes hold
+    a nested command that is scanned separately.
+    """
+    if not command:
+        return False
+    wrapper = _wrapper_payload(command)
+    if wrapper is not None and _scan_traversal_core(wrapper):
+        return True
+    return _scan_traversal_core(command)
 
 
 class LocalSandbox(Sandbox):
@@ -261,6 +324,7 @@ class LocalSandbox(Sandbox):
                 cwd=self.root,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=_filtered_env(os.environ),
                 # Binary pipes: the reader threads decode incrementally,
                 # so the output cap bounds memory for chatty commands.
                 **_POPEN_GROUP_KWARGS,
@@ -317,12 +381,30 @@ class LocalSandbox(Sandbox):
             # reader threads then hit EOF and release the handles.
             t_out.join(timeout=2)
             t_err.join(timeout=2)
+        # Both pipes EOF does not prove the child exited (a descendant can
+        # close its inherited handles and keep running); verify liveness
+        # and tree-kill a survivor so no process is orphaned.
+        if not timed_out and proc.poll() is None:
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         stdout = out_buf.decode("utf-8", errors="replace")
         stderr = err_buf.decode("utf-8", errors="replace")
         if len(out_buf) >= _MAX_EXEC_BYTES:
-            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+            cut = out_buf[:_MAX_EXEC_BYTES]
+            while cut and (cut[-1] & 0xC0) == 0x80:
+                cut = cut[:-1]
+            stdout = cut.decode("utf-8", errors="replace") + "\n... [truncated]"
         if len(err_buf) >= _MAX_EXEC_BYTES:
-            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+            cut = err_buf[:_MAX_EXEC_BYTES]
+            while cut and (cut[-1] & 0xC0) == 0x80:
+                cut = cut[:-1]
+            stderr = cut.decode("utf-8", errors="replace") + "\n... [truncated]"
         if timed_out:
             return ExecResult(exit_code=-1, stdout=stdout, stderr=stderr, timed_out=True)
         exit_code = proc.poll()
@@ -379,6 +461,13 @@ class LocalSandbox(Sandbox):
         # check and the open.
         import tempfile as _tempfile
 
+        def _atomic_write(tmp_path: str) -> None:
+            if os.path.islink(tmp_path):
+                raise SandboxError(f"path escapes sandbox workspace: {path}")
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+            os.replace(tmp_path, full)
+
         tmp = ""
         try:
             fd, tmp = _tempfile.mkstemp(
@@ -389,24 +478,69 @@ class LocalSandbox(Sandbox):
             tmp = ""
         if not tmp:
             tmp = os.path.join(parent or ".", f".{os.path.basename(full)}.{os.getpid()}.{time.time_ns()}.tmp")
-        if os.path.islink(tmp):
-            raise SandboxError(f"path escapes sandbox workspace: {path}")
+        written = False
         try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(content)
-            os.replace(tmp, full)
+            _atomic_write(tmp)
+            written = True
         except OSError:
-            # Fallback direct write. The symlink checks above ran before
-            # the tmp attempt; re-validate immediately so a path swapped
-            # to a symlink in the meantime cannot redirect the write
-            # outside the workspace.
-            if os.path.islink(full) or (tmp and os.path.islink(tmp)):
+            pass  # retried once below with a fresh temp name
+        if not written:
+            # Retry the atomic tmp+replace once with a second mkstemp
+            # before the direct-write fallback: a transient os.replace
+            # failure must not truncate the file in place.
+            tmp2 = ""
+            try:
+                fd2, tmp2 = _tempfile.mkstemp(
+                    dir=parent or ".", prefix=os.path.basename(full) + ".", suffix=".tmp"
+                )
+                os.close(fd2)
+            except OSError:
+                tmp2 = ""
+            if tmp2:
+                try:
+                    _atomic_write(tmp2)
+                    written = True
+                except OSError:
+                    pass
+                try:
+                    if os.path.exists(tmp2):
+                        os.remove(tmp2)
+                except OSError:
+                    pass
+                if written:
+                    try:
+                        if tmp and os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+        if not written:
+            # Fallback direct write. Re-run the full confinement check so
+            # a parent swapped to a symlink during the tmp attempt cannot
+            # redirect the write outside the workspace.
+            try:
+                full = self._resolve(path)
+                if parent:
+                    real_parent = os.path.realpath(parent)
+                    real_base = os.path.realpath(self.root)
+                    if not (real_parent == real_base or real_parent.startswith(real_base + os.sep)):
+                        raise SandboxError(f"path escapes sandbox workspace: {path}")
+                    cur = parent
+                    while cur and cur != real_base and cur.startswith(real_base):
+                        if os.path.islink(cur):
+                            raise SandboxError(f"path escapes sandbox workspace: {path}")
+                        nxt = os.path.dirname(cur)
+                        if nxt == cur:
+                            break
+                        cur = nxt
+                if os.path.islink(full) or (tmp and os.path.islink(tmp)):
+                    raise SandboxError(f"path escapes sandbox workspace: {path}")
+            except SandboxError:
                 try:
                     if tmp and os.path.exists(tmp):
                         os.remove(tmp)
                 except OSError:
                     pass
-                raise SandboxError(f"path escapes sandbox workspace: {path}")
+                raise
             try:
                 with open(full, "w", encoding="utf-8", newline="\n") as handle:
                     handle.write(content)
@@ -456,6 +590,7 @@ class LocalSandbox(Sandbox):
                 cwd=self.root,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=_filtered_env(os.environ),
                 **_POPEN_GROUP_KWARGS,
             )
         except OSError as exc:

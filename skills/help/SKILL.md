@@ -21,8 +21,8 @@ behavior, or troubleshooting.
    text, `docs/`, `README.md`) before answering.
 3. Explain the present behavior, required inputs, side effects, and limitations.
 4. If the answer depends on version or live state, say so and perform an
-   appropriate read (`/workspace`, `/model`, `/connect list`, `/tools`, `/cost`,
-   `/skills`).
+   appropriate read (`/workspace`, `/model list` - `/model` is the single command
+   that manages providers and models, `/tools`, `/cost`, `/skills`).
 5. Change configuration or create a skill only when the user explicitly asks for
    that action.
 

@@ -9,7 +9,7 @@ user-invocable: true
 
 ## Prerequisites
 
-- Detect the available check tooling first; this repository guarantees PowerShell parsing only - optional analyzers may be absent and are recorded, not installed.
+- Detect the available check tooling first; this is a Python repository, so the guaranteed checks are pytest and Python compile checks (compileall / py_compile). Optional analyzers may be absent and are recorded, not installed. PowerShell parsing applies only to tests/probe-console.ps1 if that probe is kept.
 
 ## Use When
 
@@ -26,7 +26,7 @@ Use for linting, type checking, parser errors, compiler warnings, or a request t
 
 ## Verification
 
-Report the prioritized finding list from Reduce, fixes made, remaining issues, and the exact reason a check was skipped. Include the cross-tool agreement count per finding — a finding confirmed by multiple tools carries more weight than a single-tool finding. For this repository, PowerShell parsing is available but the optional analyzer may not be installed.
+Report the prioritized finding list from Reduce, fixes made, remaining issues, and the exact reason a check was skipped. Include the cross-tool agreement count per finding — a finding confirmed by multiple tools carries more weight than a single-tool finding. For this repository, the checks are pytest and Python compile checks; the optional analyzer may not be installed.
 
 ## Reduce
 

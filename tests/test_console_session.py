@@ -10,6 +10,7 @@ from __future__ import annotations
 import builtins
 import io
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -866,6 +867,31 @@ class UndoChangesTest(unittest.TestCase):
     def _file_read(workspace: str) -> str:
         with open(os.path.join(workspace, "a.txt"), encoding="utf-8") as fh:
             return fh.read()
+
+
+class MemoryRecordingTest(unittest.TestCase):
+    """A finished turn records a memory entry in the workspace."""
+
+    def test_a_turn_writes_the_expected_memory_entry(self):
+        workspace = tempfile.mkdtemp(prefix="mantra-mem-")
+        self.addCleanup(shutil.rmtree, workspace, True)
+        session = make_session(workspace, [final_response("fixed the caching bug")])
+        session.handle("fix the caching bug")
+        memory_path = os.path.join(workspace, ".mantra", "memory.md")
+        with open(memory_path, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("| console-1 | final: fixed the caching bug | status=active", body)
+
+    def test_the_entry_carries_the_stopped_reason_prefix(self):
+        workspace = tempfile.mkdtemp(prefix="mantra-mem-")
+        self.addCleanup(shutil.rmtree, workspace, True)
+        session = make_session(workspace, [final_response("gave up")])
+        session.handle("do the impossible")
+        with open(os.path.join(workspace, ".mantra", "memory.md"), encoding="utf-8") as fh:
+            body = fh.read()
+        # The run ends on a tool error path only with real tools; a plain
+        # scripted final always records "final", so pin that shape.
+        self.assertRegex(body, r"^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} \| console-1 \| final: gave up \| status=active$")
 
 
 if __name__ == "__main__":

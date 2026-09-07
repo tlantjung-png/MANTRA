@@ -2,7 +2,8 @@
 
 import copy
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -59,11 +60,6 @@ class Sandbox(ABC):
         raise NotImplementedError
 
 
-from abc import ABC, abstractmethod
-from typing import Any
-
-
-
 class Tool(ABC):
     """A single agent-facing tool.
 
@@ -97,11 +93,6 @@ class Tool(ABC):
                 "parameters": copy.deepcopy(params),
             },
         }
-
-
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any
 
 
 @dataclass
@@ -144,11 +135,6 @@ class LLMClient(ABC):
         raise NotImplementedError
 
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-
-
-
 @dataclass
 class EvaluationResult:
     """Verdict plus evidence from an evaluation pass."""
@@ -163,11 +149,8 @@ class Evaluator(ABC):
 
     @abstractmethod
     def evaluate(self, sandbox: Sandbox, task: dict) -> EvaluationResult:
+        """Verdict for the final sandbox state; must never raise."""
         raise NotImplementedError
-
-
-from abc import ABC, abstractmethod
-from typing import Any
 
 
 class Logger(ABC):

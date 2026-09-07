@@ -50,6 +50,6 @@ The decision log entry must exist in memory after the choice.
 ## Boundaries
 
 Recommendation only. Workflows launch via `/workflow`; goals via `/goal`; a
-one-shot headless run via `python -m mantra.main --config <cfg> --task <file>`
+one-shot headless run via `mantra-headless --config <cfg> --task <file>`
 with the console's `--config`/`--task` interface. Never auto-launch a workflow or
 goal without the operator running it.

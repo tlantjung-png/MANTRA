@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -121,6 +122,28 @@ def _trim_messages(messages: list[Any]) -> list[Any]:
             trimmed.append(message)
             continue
         content = message.get("content")
+        if isinstance(content, list):
+            # Multimodal content: cap each text block so a huge block
+            # list cannot survive into the transcript (D23).
+            blocks = list(content)
+            changed = False
+            for i, block in enumerate(blocks):
+                if (
+                    isinstance(block, dict)
+                    and isinstance(block.get("text"), str)
+                    and len(block["text"]) > _MAX_MESSAGE_CHARS
+                ):
+                    copy = dict(block)
+                    copy["text"] = block["text"][:_MAX_MESSAGE_CHARS].rstrip() + "\n... [truncated on save]"
+                    blocks[i] = copy
+                    changed = True
+            if changed:
+                copy = dict(message)
+                copy["content"] = blocks
+                trimmed.append(copy)
+            else:
+                trimmed.append(message)
+            continue
         if not isinstance(content, str) or len(content) <= _MAX_MESSAGE_CHARS:
             trimmed.append(message)
             continue
@@ -134,16 +157,6 @@ def _trim_messages(messages: list[Any]) -> list[Any]:
 
 def save(name: str, payload: dict[str, Any]) -> str | None:
     """Write a session. Returns the path, or None when it could not be written."""
-    record = {
-        "version": _VERSION,
-        "name": name,
-        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        # Caller payload spread last, so it can override metadata keys.
-        **payload,
-    }
-    messages = record.get("messages")
-    if isinstance(messages, list):
-        record["messages"] = _trim_messages(messages)
     target = _path(name)
     # Ensure directory exists and has restricted permissions
     try:
@@ -154,16 +167,11 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             pass
     except OSError:
         pass
-    try:
-        content = json.dumps(record, ensure_ascii=False, indent=2)
-    except (TypeError, ValueError):
-        # A payload value json cannot encode must not raise out of save():
-        # the caller autosaves every turn, and one bad value is not worth
-        # losing the session over; skip the write instead.
-        return None
     # Inter-process lock: two consoles autosaving the same session name
     # must not interleave. If the lock cannot be taken in time, skip the
     # save rather than write a half-written transcript over a good one.
+    # The lock is held across the whole build-and-write so no other
+    # writer can slip a save in between read and replace (D8).
     lock_path = target.with_suffix(target.suffix + ".lock")
     if lock_path.exists():
         _break_stale_lock(lock_path)
@@ -187,12 +195,29 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             break
     if not acquired:
         return None
-    # Unique temp name: no fixed path for a planted symlink, no shared
-    # file for two writers to interleave into.
     import tempfile
 
     tmp_name = None
     try:
+        record = {
+            # Caller payload first so canonical metadata cannot be spoofed.
+            **payload,
+            "version": _VERSION,
+            "name": name,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        messages = record.get("messages")
+        if isinstance(messages, list):
+            record["messages"] = _trim_messages(messages)
+        try:
+            content = json.dumps(record, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            # A payload value json cannot encode must not raise out of save():
+            # the caller autosaves every turn, and one bad value is not worth
+            # losing the session over; skip the write instead.
+            return None
+        # Unique temp name: no fixed path for a planted symlink, no shared
+        # file for two writers to interleave into.
         fd, tmp_name = tempfile.mkstemp(
             dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
         )
@@ -204,6 +229,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             pass
         os.replace(tmp_name, target)
         tmp_name = None
+        return str(target)
     except OSError:
         # No direct-write fallback: a non-atomic write to the target path
         # could follow a planted symlink. The transcript is still in
@@ -226,7 +252,6 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
                 lock_path.unlink(missing_ok=True)
             except OSError:
                 pass
-    return str(target)
 
 
 def _legacy_path(name: str) -> Path:
@@ -296,6 +321,8 @@ def _summarise(messages: list[Any]) -> str:
 # files get a new stat key and are re-read; the cache is size-capped.
 _LISTING_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _LISTING_CACHE_MAX = 512
+# Guards cache mutations: the TUI and console may list concurrently (D22).
+_LISTING_CACHE_LOCK = threading.Lock()
 
 
 def _listing_metadata(file: Path) -> dict[str, Any] | None:
@@ -309,9 +336,10 @@ def _listing_metadata(file: Path) -> dict[str, Any] | None:
         # picker open is exactly what the size cap prevents.
         return None
     key = (str(file), stat.st_mtime_ns, stat.st_size)
-    cached = _LISTING_CACHE.get(key)
+    with _LISTING_CACHE_LOCK:
+        cached = _LISTING_CACHE.get(key)
     if cached is not None:
-        return cached
+        return dict(cached)
     try:
         with open(file, "r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -335,10 +363,11 @@ def _listing_metadata(file: Path) -> dict[str, Any] | None:
         "messages": len(messages),
         "summary": data.get("summary") or _summarise(messages),
     }
-    if len(_LISTING_CACHE) >= _LISTING_CACHE_MAX:
-        _LISTING_CACHE.pop(next(iter(_LISTING_CACHE)), None)
-    _LISTING_CACHE[key] = metadata
-    return metadata
+    with _LISTING_CACHE_LOCK:
+        if len(_LISTING_CACHE) >= _LISTING_CACHE_MAX:
+            _LISTING_CACHE.pop(next(iter(_LISTING_CACHE)), None)
+        _LISTING_CACHE[key] = dict(metadata)
+    return dict(metadata)
 
 
 def list_sessions(limit: int = 20) -> list[dict[str, Any]]:

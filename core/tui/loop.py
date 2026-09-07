@@ -62,5 +62,7 @@ class Presenter:
                     # loop; force a full repaint next time since the
                     # screen may be mid-frame.
                     self.app.force_full_repaint()
+                    self._last_draw = now
+                    continue
                 self._last_draw = now
                 self.app.dirty = False

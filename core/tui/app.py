@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 import time
 from typing import Any
@@ -38,6 +39,36 @@ _REVIEW_STYLE_SGR = {
 
 def _styled(text: str, sgr: str | None) -> str:
     return f"\x1b[{sgr}m{text}\x1b[0m" if sgr else text
+
+
+_KEY_LOOK_RE = re.compile(r"^sk-[A-Za-z0-9_-]{10,}$|^gho_[A-Za-z0-9]{20,}$|^ghp_[A-Za-z0-9]{20,}$|^xox[abp]-[A-Za-z0-9-]{10,}$|^AIza[0-9A-Za-z_-]{30,}$|^[A-Za-z0-9]{32,}$")
+
+
+def _redact_model_line_keys(text: str) -> str:
+    """Mask key-shaped tokens before a /model line is echoed or stored."""
+    parts = text.split()
+    if len(parts) < 2 or parts[0] != "/model":
+        return text
+    # /model <saved-endpoint>            — single arg, no key to redact.
+    if len(parts) == 2:
+        return text
+    if parts[1] == "key" and len(parts) >= 4:
+        # /model key <name> <key>  — redact the value.
+        return f"{parts[0]} {parts[1]} {parts[2]} {'*' * max(8, len(parts[3]))}"
+    # /model <url> [key] [model]  — when the 3rd positional argument looks
+    # like a key (a long opaque token), redact it; otherwise leave alone.
+    if len(parts) >= 3 and _KEY_LOOK_RE.match(parts[2]) and not parts[2].startswith(("http://", "https://")):
+        masked = "*" * max(8, len(parts[2]))
+        tail = f" {parts[3]}" if len(parts) >= 4 else ""
+        return f"{parts[0]} {parts[1]} {masked}{tail}"
+    # Also handle the case where the URL is omitted and the second
+    # argument is a saved endpoint: the key would be parts[3] in
+    # /model <endpoint> <key> <model> form.
+    if len(parts) >= 4 and not parts[1].startswith(("http://", "https://")) and not parts[1].startswith("key") and _KEY_LOOK_RE.match(parts[3]):
+        masked = "*" * max(8, len(parts[3]))
+        tail = f" {parts[4]}" if len(parts) >= 5 else ""
+        return f"{parts[0]} {parts[1]} {parts[2]} {masked}{tail}"
+    return text
 from core.term import ansi_strip as strip_ansi
 
 from core.tui.backend import Backend, Key, Mouse, Paste, Resize
@@ -296,6 +327,7 @@ class TuiApp:
 
         self.overlay: Any = None          # menu / question / line prompt
         self._overlay_reply: queue.Queue | None = None
+        self._overlay_lock = threading.Lock()  # serialize concurrent prompts
         self.queued = ""                  # prompt submitted mid-turn
         self._last_ctrl_c = 0.0
         self._drag_autoscroll = 0
@@ -409,8 +441,13 @@ class TuiApp:
         text = text.strip()
         if not text:
             return
-        if not self._history or self._history[-1] != text:
-            self._history.append(text)
+        # /model lines can carry an API key as the 2nd or 3rd positional
+        # argument; echo and history see the redacted form, but the
+        # actual command dispatched to the harness must keep the real key
+        # so the endpoint switch can store and use it.
+        display_text = _redact_model_line_keys(text) if text.startswith("/model") else text
+        if not self._history or self._history[-1] != display_text:
+            self._history.append(display_text)
         self._history_idx = len(self._history)
         # The busy check and the queue write are one critical section, so a
         # prompt arriving while a turn's finally-block is ending is either
@@ -426,7 +463,7 @@ class TuiApp:
             self._turn_started = time.monotonic()
             self._spinner_i = 0
         stamp = time.strftime("%H:%M")
-        self.feed_output(f"\033[2m{stamp}\033[0m  {text}\n")
+        self.feed_output(f"\033[2m{stamp}\033[0m  {display_text}\n")
         self.transcript.flush_partial()
         self.mark_dirty()
         self.run_detached(lambda: self._run_turn(text))
@@ -463,20 +500,22 @@ class TuiApp:
 
     # ── blocking interactive helpers (worker-thread side) ─────
 
+    def _prompt_with_overlay(self, overlay: Any) -> Any:
+        # Serialize prompts so concurrent callers cannot overwrite the
+        # shared reply slot and orphan the first waiter.
+        with self._overlay_lock:
+            reply: queue.Queue = queue.Queue()
+            self.overlay = overlay
+            self._overlay_reply = reply
+            self.mark_dirty()
+            return reply.get()
+
     def ask_line(self, label: str, secret: bool = False, default: str = "") -> str:
-        reply: queue.Queue = queue.Queue()
-        self.overlay = LinePrompt(label, secret=secret, default=default)
-        self._overlay_reply = reply
-        self.mark_dirty()
-        answer = reply.get()
+        answer = self._prompt_with_overlay(LinePrompt(label, secret=secret, default=default))
         return answer if answer is not None else ""
 
     def ask_approval(self, prompt: str) -> str:
-        reply: queue.Queue = queue.Queue()
-        self.overlay = QuestionCard("allow?", prompt, choices="yna")
-        self._overlay_reply = reply
-        self.mark_dirty()
-        answer = reply.get()
+        answer = self._prompt_with_overlay(QuestionCard("allow?", prompt, choices="yna"))
         return answer or "n"
 
     def choose(
@@ -487,25 +526,18 @@ class TuiApp:
         allow_delete: bool = False,
         on_delete: Any = None,
     ) -> str | None:
-        reply: queue.Queue = queue.Queue()
-        self.overlay = MenuOverlay(
-            title,
-            options,
-            allow_filter=allow_filter,
-            allow_delete=allow_delete,
-            on_delete=on_delete,
+        return self._prompt_with_overlay(
+            MenuOverlay(
+                title,
+                options,
+                allow_filter=allow_filter,
+                allow_delete=allow_delete,
+                on_delete=on_delete,
+            )
         )
-        self._overlay_reply = reply
-        self.mark_dirty()
-        result = reply.get()
-        return result
 
     def confirm(self, title: str, body: str) -> bool:
-        reply: queue.Queue = queue.Queue()
-        self.overlay = QuestionCard(title, body, choices="yn")
-        self._overlay_reply = reply
-        self.mark_dirty()
-        return (reply.get() or "n") == "y"
+        return (self._prompt_with_overlay(QuestionCard(title, body, choices="yn")) or "n") == "y"
 
     def _finish_overlay(self, value: Any) -> None:
         self.overlay = None
@@ -599,6 +631,10 @@ class TuiApp:
             if isinstance(self.overlay, LinePrompt):
                 self.overlay.insert(event.text)
                 self.mark_dirty()
+                return
+            # A modal (menu / question card) is open: drop the paste rather
+            # than routing it to the hidden composer buffer (D5).
+            if self.overlay is not None and not isinstance(self.overlay, LinePrompt):
                 return
             self.composer.consume_paste(event.text)
             self._history_idx = len(self._history)  # pasting edits, not recall
@@ -1081,23 +1117,28 @@ class TuiApp:
         if panel is None:
             return
         total = len(panel.entries)
-        viewport = max(1, self.rows - 2)
+        # Each entry renders two rows; keep scroll math in entry units.
+        body_rows = max(2, self.rows - 2)
+        entry_viewport = max(1, body_rows // 2)
         if key in ("q", "esc"):
             self.session_panel = None
         elif key in ("up", "k"):
             panel.next(-1, total)
-            panel.offset = min(panel.offset, panel.index)
+            if panel.index < panel.offset:
+                panel.offset = panel.index
         elif key in ("down", "j"):
-            panel.next(1, total)
-            if panel.index >= panel.offset + viewport:
-                panel.offset = panel.index - viewport + 1
+            # j moves the cursor down one entry, scrolling the offset
+            # forward if the cursor would leave the visible window.
+            panel.index = min(panel.index + 1, total - 1)
+            if panel.index >= panel.offset + entry_viewport:
+                panel.offset = panel.index - entry_viewport + 1
         elif key in ("pageup", "pagedown"):
-            step = max(3, viewport - 2)
+            step = max(1, entry_viewport - 1)
             panel.next(-step if key == "pageup" else step, total)
-            panel.offset = max(0, min(total - viewport, panel.index))
+            panel.offset = max(0, min(total - entry_viewport, panel.index))
         elif key in ("home", "end"):
             panel.index = 0 if key == "home" else max(0, total - 1)
-            panel.offset = max(0, panel.index - viewport + 1) if key == "end" else 0
+            panel.offset = max(0, panel.index - entry_viewport + 1) if key == "end" else 0
         elif key in ("enter", "return"):
             entry = panel.entry
             self.session_panel = None
