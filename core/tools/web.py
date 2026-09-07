@@ -302,8 +302,8 @@ def _resolve_limited(host: str, timeout: float) -> list[tuple] | None:
                     host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
                 )
             )
-        except Exception:
-            pass
+        except OSError:
+            pass  # resolver failure treated as "no addresses"; caller re-checks
         finally:
             done.set()
 
@@ -385,8 +385,8 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 _DNS_CACHE[host] = (now, result)
             if result:
                 return True
-    except Exception:
-        pass
+    except (OSError, UnicodeError, ValueError):
+        pass  # resolution failure is not proof of privacy; fail open to fetch
     return False
 
 
@@ -470,8 +470,8 @@ def _check_url_allowed(url: str) -> str | None:
     if hostname:
         try:
             hostname = _fully_decode(hostname)
-        except Exception:
-            pass
+        except (UnicodeError, ValueError):
+            pass  # undecodable host: the raw form is still checked below
     if _is_private_hostname(hostname):
         return f"fetch failed: blocked private or internal host {parsed.hostname!r}"
     if not hostname and parsed.netloc:
@@ -480,8 +480,8 @@ def _check_url_allowed(url: str) -> str | None:
             netloc = _fully_decode(raw)
             if _is_private_hostname(netloc):
                 return f"fetch failed: blocked private or internal host {netloc!r}"
-        except Exception:
-            pass
+        except (UnicodeError, ValueError):
+            pass  # same: raw netloc form was already checked
     return None
 
 
@@ -615,7 +615,9 @@ try:
     # Routed through the validating opener so each hop is checked, not
     # just the URL the chain happens to end on. Tests rebind this name.
     urlopen = _make_opener().open
-except Exception:  # pragma: no cover - defensive
+except Exception:  # pragma: no cover - defensive: any opener-build failure
+    # degrades to the plain stdlib opener (redirect pinning lost, fetch
+    # still possible) rather than disabling the tool entirely.
     urlopen = stdlib_urlopen
 
 

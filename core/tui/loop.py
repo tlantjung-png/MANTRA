@@ -58,8 +58,9 @@ class Presenter:
                 try:
                     self.app.render_frame()
                 except Exception:
-                    # A frame bug must not kill the loop; force a full
-                    # repaint next time since the screen may be mid-frame.
+                    # Deliberately broad: a frame bug must not kill the
+                    # loop; force a full repaint next time since the
+                    # screen may be mid-frame.
                     self.app.force_full_repaint()
                 self._last_draw = now
                 self.app.dirty = False

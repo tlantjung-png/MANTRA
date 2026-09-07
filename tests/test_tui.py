@@ -335,6 +335,148 @@ class BackendParseTest(unittest.TestCase):
                          [Key("ctrl+space", frozenset({"ctrl"}))])
 
 
+class PosixDecoderRegressionTest(unittest.TestCase):
+    """Byte-exact regressions for the streaming input decoder.
+
+    The Windows record path is covered above; these pin the byte-stream
+    path (used on POSIX hosts) so escape, DEL, C1 bytes, modifier
+    arrows, and bracketed pastes keep their fixed behavior.
+    """
+
+    def _parse(self, buf: str):
+        backend = Backend()
+        backend._parse_stream(buf, 0)
+        return backend.events
+
+    def _feed(self, ch: str):
+        backend = Backend()
+        backend._feed_char(ch)
+        return backend.events
+
+    def _drain(self, events) -> list:
+        out = []
+        while events.qsize():
+            out.append(events.get_nowait())
+        return out
+
+    def test_bare_escape_is_the_escape_action_not_text(self):
+        # A lone escape replayed after the sequence timeout must surface
+        # as the escape action, never as a printable byte in the prompt.
+        events = self._feed("\x1b")
+        self.assertEqual(events.qsize(), 1)
+        self.assertEqual(events.get_nowait(), Key("esc"))
+
+    def test_escape_before_control_byte_acts_alone(self):
+        # ESC followed by a control byte: the escape acts by itself and
+        # the control byte keeps its own identity (no raw \x1b Key).
+        events = self._drain(self._parse("\x1b\x03"))
+        self.assertEqual(events, [Key("esc"), Key("ctrl+c")])
+
+    def test_esc_esc_yields_one_escape(self):
+        # ESC ESC used to swallow both bytes; now the first escape fires
+        # and the second waits (then replays as escape on timeout).
+        events = self._drain(self._parse("\x1b\x1b"))
+        self.assertEqual(events, [Key("esc")])
+
+    def test_alt_chord_arrives_with_alt_modifier(self):
+        # ESC + printable byte is an alt-chord, not two dropped bytes.
+        events = self._drain(self._parse("\x1bb"))
+        self.assertEqual(events, [Key("b", frozenset({"alt"}))])
+
+    def test_del_edits_instead_of_typing(self):
+        # DEL (0x7F) is backspace, never a literal character in the
+        # buffer, on both the parse and the replay paths.
+        events = self._drain(self._parse("ab\x7f"))
+        self.assertEqual(events, [Key("a"), Key("b"), Key("backspace")])
+        events = self._drain(self._feed("\x7f"))
+        self.assertEqual(events, [Key("backspace")])
+
+    def test_c1_bytes_are_dropped(self):
+        # C1 controls (0x80-0x9F, e.g. the raw CSI byte 0x9B) must never
+        # be inserted as printable input.
+        events = self._drain(self._parse("a\x9bb"))
+        self.assertEqual(events, [Key("a"), Key("b")])
+
+    def test_modifier_arrows_decode_with_modifiers(self):
+        # xterm "1;<n>" parameters carry modifiers; shifted arrows must
+        # not decode as alt-arrows and ctrl-arrows must keep the composed
+        # name the composer binds.
+        cases = [
+            ("\x1b[1;5D", Key("ctrl+left", frozenset({"ctrl"}))),
+            ("\x1b[1;5C", Key("ctrl+right", frozenset({"ctrl"}))),
+            ("\x1b[1;2C", Key("right", frozenset({"shift"}))),
+            ("\x1b[1;3D", Key("left", frozenset({"alt"}))),
+        ]
+        for seq, expected in cases:
+            with self.subTest(seq=seq):
+                events = self._drain(self._parse(seq))
+                self.assertEqual(events, [expected])
+
+    def test_plain_arrows_unchanged_by_modifier_branch(self):
+        # Guard: unmodified arrow sequences must still decode as before.
+        for seq, expected in (
+            ("\x1b[C", Key("right")),
+            ("\x1b[D", Key("left")),
+            ("\x1bOA", Key("up")),
+        ):
+            with self.subTest(seq=seq):
+                events = self._drain(self._parse(seq))
+                self.assertEqual(events, [expected])
+
+    def test_bracketed_paste_delivered_whole(self):
+        # The paste body (newlines included) is one Paste event; the tail
+        # after the end marker returns to normal key decoding, and no
+        # marker bytes leak into the event stream.
+        events = self._drain(self._parse("\x1b[200~ab\ncd\x1b[201~tail"))
+        self.assertEqual(len(events), 5)
+        first = events[0]
+        self.assertIsInstance(first, Paste)
+        self.assertEqual(first.text, "ab\ncd")
+        self.assertEqual([e.key for e in events[1:]], ["t", "a", "i", "l"])
+
+    def test_unterminated_paste_is_cut_at_cap(self):
+        # A paste whose end marker never arrives is cut off at the cap
+        # and delivered, instead of buffering without bound.
+        from core.tui.backend import _PASTE_CAP
+
+        seq = "\x1b[200~" + "x" * (_PASTE_CAP + 50)
+        events = self._drain(self._parse(seq))
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], Paste)
+        self.assertEqual(events[0].text, "x" * _PASTE_CAP)
+
+    def test_utf8_split_across_reads_becomes_one_character(self):
+        # A multi-byte character split across two reads is reassembled by
+        # the incremental decoder instead of decoding as replacement
+        # characters (which would type garbage into the prompt).
+        import os as _os
+
+        backend = Backend()
+        read_fd, write_fd = _os.pipe()
+        backend._fd = read_fd
+        backend._winch_r = -1
+        thread = threading.Thread(
+            target=backend._read_loop_posix, name="tui-test-input", daemon=True
+        )
+        thread.start()
+        try:
+            _os.write(write_fd, b"\xe6\xbc")  # first half of 漢
+            time.sleep(0.05)
+            _os.write(write_fd, b"\xa2")      # second half
+            self.assertTrue(wait_until(lambda: backend.events.qsize() >= 1, timeout=5))
+            event = backend.events.get_nowait()
+            self.assertIsInstance(event, Key)
+            self.assertEqual(event.key, "漢")
+        finally:
+            backend._stop.set()
+            try:
+                _os.write(write_fd, b" ")  # unblock a pending read
+            except OSError:
+                pass
+            thread.join(timeout=2)
+            _os.close(write_fd)
+
+
 class MenuOverlayTest(unittest.TestCase):
     def test_filter_narrows_and_enter_selects(self):
         menu = MenuOverlay("pick", [Option("alpha"), Option("beta")])
@@ -786,6 +928,221 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertTrue(captured, msg="ctrl+y copied nothing")
         self.assertIn("alpha", captured[0])
         self.assertIn("beta", captured[0])
+
+
+class EndToEndConsoleTest(unittest.TestCase):
+    """The real console application, spawned and driven like a terminal.
+
+    The harness owns the transport (pseudoconsole, or the headless conhost
+    fallback on hosts whose ConPTY sessions never wire up). The child gets
+    a scratch settings file and a dummy key so first-run setup never
+    blocks, a scratch workspace, and a dead endpoint: everything here
+    exercises the UI surface, never the network.
+    """
+
+    def test_help_roundtrip_and_input_wiring(self):
+        if os.name != "nt":
+            self.skipTest("ConPTY is Windows-only")
+        import ctypes
+        import json as jsonlib
+        import shutil as shutillib
+        from conpty_harness import k32, make_console
+
+        work = tempfile.mkdtemp(prefix="mantra-e2e-")
+        self.addCleanup(shutillib.rmtree, work, True)
+        settings = os.path.join(work, "settings.json")
+        with open(settings, "w", encoding="utf-8") as fh:
+            jsonlib.dump(
+                {
+                    "active": {"endpoint": "local", "model": "test-model"},
+                    "endpoints": {
+                        "local": {
+                            "name": "local",
+                            "base_url": "http://localhost:9/v1",
+                            "api_key_env": "MODEL_API_KEY",
+                        }
+                    },
+                    "approvals": "default",
+                },
+                fh,
+            )
+        ws = os.path.join(work, "ws")
+        os.makedirs(ws, exist_ok=True)
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        saved = {name: os.environ.get(name) for name in ("MANTRA_SETTINGS", "MODEL_API_KEY", "PYTHONPATH")}
+        os.environ["MANTRA_SETTINGS"] = settings
+        os.environ["MODEL_API_KEY"] = "dummy-key-for-e2e"
+        os.environ["PYTHONPATH"] = repo + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+        def restore_env():
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.addCleanup(restore_env)
+
+        pty = make_console(
+            cols=110, rows=32,
+            args=[sys.executable, "-m", "core.console", "--workspace", ws],
+            cwd=repo,
+        )
+        self.addCleanup(pty.close)
+
+        # 1. Boot: banner, chrome and composer all render.
+        pty.wait_for("MANTRA", timeout=60)
+        time.sleep(1.0)  # let the composer settle before typing
+
+        # 2. Keys reach the composer and echo (wired input path).
+        base = pty.text()
+        pty.type_text("z")
+        time.sleep(1.0)
+        self.assertIn("z", pty.text()[len(base):], "typed key never echoed by the app")
+
+        # 3. Paced /help round-trip. The app reads stdin in chunks, so a
+        # newline in the same burst as the text can be delivered early;
+        # pacing text and Enter is what a fast human types anyway.
+        # Typing "/help" opens the completion popup (whose description
+        # also contains "show help"), so the first Enter accepts the
+        # completion and only the second one submits the command. The
+        # assertion token is a help row the popup can never render.
+        pty.type_text("\x7f" * 8)  # clear the probe character
+        time.sleep(0.5)
+        pty.type_text("/help")
+        time.sleep(1.0)
+        pty.enter()  # accept the completion
+        time.sleep(0.5)
+        pty.enter()  # submit
+        # The viewport holds only the tail of the long help screen, so
+        # anchor both the wait and the assertions at its last lines:
+        # by the time they appear, the screen finished painting.
+        seen = pty.wait_for("Ctrl+C once stops the current run", timeout=20)
+        self.assertIn("Reference files with @ in any message", seen, "help text incomplete")
+
+        # 4. The child is still healthy after the round-trip.
+        code = ctypes.c_ulong(0)
+        k32.GetExitCodeProcess(pty._hprocess, ctypes.byref(code))
+        self.assertEqual(code.value, 259, "console exited during the help round-trip")  # STILL_ACTIVE
+
+    def test_tool_call_and_approval_card(self):
+        """One compact agent turn that reaches a tool-call gate.
+
+        The scripted LLM yields a single mutating tool call
+        (write_file) instead of a final answer, so the interactive
+        session routes the call to the approval policy and the TUI
+        presents the ``allow?`` QuestionCard. The test types ``y``
+        to confirm, then watches for two side channels of the same
+        event: the approval banner in the transcript and the tool
+        result streamed as the operator sees it.
+
+        The exact wording of the approval prompt is policy output
+        (it changes when the tool set changes), so the assertions
+        anchor on the card title and the affirmative key hints,
+        which are stable and cannot be produced by the composer.
+        """
+        if os.name != "nt":
+            self.skipTest("ConPTY is Windows-only")
+        import ctypes
+        import json as jsonlib
+        import shutil as shutillib
+        from core.scripted import tool_call_response
+        from conpty_harness import k32, make_console
+
+        work = tempfile.mkdtemp(prefix="mantra-e2e-tool-")
+        self.addCleanup(shutillib.rmtree, work, True)
+        settings = os.path.join(work, "settings.json")
+        with open(settings, "w", encoding="utf-8") as fh:
+            jsonlib.dump(
+                {
+                    "active": {"endpoint": "local", "model": "test-model"},
+                    "endpoints": {
+                        "local": {
+                            "name": "local",
+                            "base_url": "http://localhost:9/v1",
+                            "api_key_env": "MODEL_API_KEY",
+                        }
+                    },
+                    "approvals": "default",
+                },
+                fh,
+            )
+        ws = os.path.join(work, "ws")
+        os.makedirs(ws, exist_ok=True)
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        # The scripted conversation: one mutating tool call, then the
+        # final answer. MANTRA_SCRIPT makes build_llm hand the live
+        # console this script, so the turn never touches the network.
+        script = os.path.join(work, "script.json")
+        with open(script, "w", encoding="utf-8") as fh:
+            jsonlib.dump(
+                [
+                    {"tool_calls": [
+                        {"name": "write_file",
+                         "arguments": {"path": "greeting.txt", "content": "hello from the approval test"}}
+                    ]},
+                    {"content": "wrote the greeting file"},
+                ],
+                fh,
+            )
+
+        saved = {name: os.environ.get(name) for name in
+                 ("MANTRA_SETTINGS", "MANTRA_SCRIPT", "MODEL_API_KEY", "PYTHONPATH")}
+        os.environ["MANTRA_SETTINGS"] = settings
+        os.environ["MANTRA_SCRIPT"] = script
+        os.environ["MODEL_API_KEY"] = "dummy-key-for-e2e"
+        os.environ["PYTHONPATH"] = repo + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+        def restore_env():
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.addCleanup(restore_env)
+
+        pty = make_console(
+            cols=110, rows=32,
+            args=[sys.executable, "-m", "core.console",
+                  "--workspace", ws, "--approve", "default"],
+            cwd=repo,
+        )
+        self.addCleanup(pty.close)
+
+        # 1. Boot and clear whatever the banner placed on the composer.
+        pty.wait_for("MANTRA", timeout=60)
+        time.sleep(1.0)
+        pty.type_text("\x7f" * 8)
+        time.sleep(0.5)
+
+        # 2. Submit the scripted prompt. With approvals=default the
+        # mutating tool call gates on the interactive card: the card
+        # title and the affirmative key hints are stable anchors that
+        # the composer or banner can never produce.
+        pty.type_text("write a greeting file")
+        time.sleep(0.25)
+        pty.enter()
+
+        seen_card = pty.wait_for("[y]es   [n]o   [a]lways for this session", timeout=60)
+        self.assertIn("allow?", seen_card, "approval card title missing")
+
+        # 3. Confirm the tool call by typing the answer on the card.
+        pty.type_text("y")
+        time.sleep(0.5)
+        pty.enter()
+
+        # 4. The turn finishes with the scripted final reply and the
+        # ENCHANTER banner - all hermetic, no network involved.
+        result = pty.wait_for("wrote the greeting file", timeout=60)
+        self.assertIn("ENCHANTER", result, "final reply banner missing")
+
+        # 5. The child is still healthy after the full approval turn.
+        code = ctypes.c_ulong(0)
+        k32.GetExitCodeProcess(pty._hprocess, ctypes.byref(code))
+        self.assertEqual(code.value, 259, "console exited during the tool approval test")  # STILL_ACTIVE
 
 
 class ConPtyHarnessTest(unittest.TestCase):

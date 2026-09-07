@@ -108,7 +108,7 @@ class DockerSandbox(Sandbox):
             try:
                 self.cleanup()
             except Exception:
-                pass
+                pass  # cleanup is best effort; the setup error still propagates
             raise
 
     def exec(self, command: str, timeout: float = 120.0) -> ExecResult:
@@ -162,8 +162,8 @@ class DockerSandbox(Sandbox):
                         try:
                             proc.kill()
                             stdout, stderr = proc.communicate(timeout=2)
-                        except Exception:
-                            stdout, stderr = "", ""
+                        except (OSError, subprocess.SubprocessError):
+                            stdout, stderr = "", ""  # output lost with the killed process
                         if stdout and len(stdout) > _MAX_EXEC_BYTES:
                             stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                         if stderr and len(stderr) > _MAX_EXEC_BYTES:
@@ -390,8 +390,8 @@ class DockerSandbox(Sandbox):
                         try:
                             proc.kill()
                             stdout, stderr = proc.communicate(timeout=2)
-                        except Exception:
-                            stdout, stderr = "", ""
+                        except (OSError, subprocess.SubprocessError):
+                            stdout, stderr = "", ""  # output lost with the killed process
                         if stdout and len(stdout) > _MAX_EXEC_BYTES:
                             stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                         if stderr and len(stderr) > _MAX_EXEC_BYTES:

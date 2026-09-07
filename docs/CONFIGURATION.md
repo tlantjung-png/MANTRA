@@ -20,7 +20,7 @@ Tool construction validates unknown names at startup, normalizes aliases, shares
 
 ## User-Wide Settings
 
-User-wide endpoint and model selections are kept in a separate hand-editable document. It enumerates endpoints with base address, credential lookup name, known models, and an optional note, plus the active endpoint, model, and reasoning effort, and skill-routing preferences. The file is written atomically via a temporary file with restricted permissions, with quarantine handling for corrupted files and verified stale-lock handling.
+User-wide endpoint and model selections are kept in a separate hand-editable document. It enumerates endpoints with base address, credential lookup name, known models, and an optional note, plus the active endpoint, model, and reasoning effort, and skill-routing preferences. The file is written atomically via a uniquely named temporary file with restricted permissions, with verified stale-lock handling. When the document cannot be parsed, it is quarantined under a collision-free backup name before anything replaces it, so repeated failures never overwrite the previous backup nor the evidence.
 
 A parallel credentials store holds secret values with restricted permissions and is never written to the main settings file. The store is keyed by lookup name, supports masking for display, and records a schema version. Secrets are resolved first from the process environment and then from the store, with a one-time warning on platforms where permission bits are not enforced. An environment variable override relocates the store for testing.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 
 from core.agent.exceptions import ConfigError
 from core.evaluators import CommandEvaluator
@@ -90,6 +91,15 @@ def build_llm(config: dict) -> LLMClient:
     cls = LLM_REGISTRY.get(kind)
     if cls is None:
         raise ConfigError(f"unknown llm provider '{kind}' (known: {sorted(LLM_REGISTRY)})")
+    # E2E-test hook: MANTRA_SCRIPT points at a scripted-conversation JSON
+    # file; a live console turn then never touches the network. The env
+    # override is deliberate - the harness must not have to rebuild the
+    # whole config to swap the client.
+    script_file = os.environ.get("MANTRA_SCRIPT")
+    if script_file:
+        from core.scripted import ScriptedLLMClient, load_script_file
+
+        return ScriptedLLMClient(load_script_file(script_file))
     return _construct(cls, config)
 
 

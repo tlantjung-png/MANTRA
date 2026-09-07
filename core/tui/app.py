@@ -254,8 +254,8 @@ class TuiApp:
         session.layout = LayoutBridge(self)
         try:
             session.approvals._ask = self.ask_approval
-        except Exception:
-            pass
+        except AttributeError:
+            pass  # duck-typed session without an approvals object (tests)
 
         self.backend = backend if backend is not None else Backend()
         self.renderer: Renderer | None = None
@@ -399,7 +399,10 @@ class TuiApp:
             fn()
         except SystemExit:
             self.stop()
-        except Exception as exc:  # surface it like a turn error
+        except Exception as exc:
+            # Deliberately broad: a detached worker must never die
+            # silently, and any failure it hits is surfaced to the
+            # operator exactly like a turn error.
             self.feed_output(f"\n\033[38;5;167m!! {exc}\033[0m\n")
 
     def submit(self, text: str) -> None:
@@ -409,18 +412,22 @@ class TuiApp:
         if not self._history or self._history[-1] != text:
             self._history.append(text)
         self._history_idx = len(self._history)
-        if self.busy:
-            self.queued = text
-            self.toast_message("queued — runs when the current turn ends")
-            self.mark_dirty()
-            return
+        # The busy check and the queue write are one critical section, so a
+        # prompt arriving while a turn's finally-block is ending is either
+        # seen as busy (queued) or as idle (started) — never both.
+        with self.lock:
+            if self.busy:
+                self.queued = text
+                self.toast_message("queued — runs when the current turn ends")
+                self.mark_dirty()
+                return
+            self.busy = True
+            self.busy_label = "Chanting"
+            self._turn_started = time.monotonic()
+            self._spinner_i = 0
         stamp = time.strftime("%H:%M")
         self.feed_output(f"\033[2m{stamp}\033[0m  {text}\n")
         self.transcript.flush_partial()
-        self.busy = True
-        self.busy_label = "Chanting"
-        self._turn_started = time.monotonic()
-        self._spinner_i = 0
         self.mark_dirty()
         self.run_detached(lambda: self._run_turn(text))
 
@@ -439,11 +446,16 @@ class TuiApp:
         except HarnessError as exc:
             self.feed_output(f"\033[38;5;167m  !! {exc}\033[0m\n")
         finally:
-            self.busy = False
+            # Clear busy and take the queued prompt inside the same lock
+            # submit() checks, so the handoff between the two threads is
+            # atomic: a prompt submitted mid-teardown is either seen as
+            # busy (queued) or as idle (started a fresh turn) — never lost.
+            with self.lock:
+                self.busy = False
+                queued = self.queued
+                self.queued = ""
             self.status_text = ""
             self.mark_dirty()
-        queued = self.queued
-        self.queued = ""
         if queued and self.running:
             # Let the turn's own tail lines settle before the next one.
             time.sleep(0.05)

@@ -90,6 +90,8 @@ class MenuOverlay:
                         try:
                             self.on_delete(target.value)
                         except Exception:
+                            # Caller-supplied hook: keep it isolated so the
+                            # menu still removes the entry locally.
                             pass
                     self.options = [o for o in self.options if o.value != target.value]
                     if self.cursor >= len(self.matches):

@@ -46,8 +46,8 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 capture_output=True,
                 timeout=5,
             )
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError):
+            pass  # taskkill unavailable; the direct proc.kill below still runs
         try:
             proc.kill()
         except OSError:
@@ -114,8 +114,8 @@ def _contains_traversal(command: str) -> bool:
         import urllib.parse as _up
         # Two rounds of unquote to catch double-encoding.
         decoded = _up.unquote(_up.unquote(stripped))
-    except Exception:
-        decoded = stripped
+    except (UnicodeError, ValueError):
+        decoded = stripped  # undecodable: screening continues on the raw form
     if _ENCODED_TRAVERSAL_RE.search(stripped) or _ENCODED_TRAVERSAL_RE.search(decoded):
         return True
     # Block shell expansions that can hide paths: $(...), `...`, ${...}, %VAR%
@@ -373,8 +373,22 @@ class LocalSandbox(Sandbox):
             # Reject symlink target.
             if os.path.islink(full) or os.path.islink(parent):
                 raise SandboxError(f"path escapes sandbox workspace: {path}")
-        # Atomic tmp+replace; ensure tmp not symlink.
-        tmp = full + ".tmp"
+        # Atomic tmp+replace with a unique temp name: a predictable
+        # "<file>.tmp" path is a check-then-open race an attacker can win
+        # by planting a file (or winning the replace) between the symlink
+        # check and the open.
+        import tempfile as _tempfile
+
+        tmp = ""
+        try:
+            fd, tmp = _tempfile.mkstemp(
+                dir=parent or ".", prefix=os.path.basename(full) + ".", suffix=".tmp"
+            )
+            os.close(fd)
+        except OSError:
+            tmp = ""
+        if not tmp:
+            tmp = os.path.join(parent or ".", f".{os.path.basename(full)}.{os.getpid()}.{time.time_ns()}.tmp")
         if os.path.islink(tmp):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
         try:
@@ -386,9 +400,9 @@ class LocalSandbox(Sandbox):
             # the tmp attempt; re-validate immediately so a path swapped
             # to a symlink in the meantime cannot redirect the write
             # outside the workspace.
-            if os.path.islink(full) or os.path.islink(tmp):
+            if os.path.islink(full) or (tmp and os.path.islink(tmp)):
                 try:
-                    if os.path.exists(tmp):
+                    if tmp and os.path.exists(tmp):
                         os.remove(tmp)
                 except OSError:
                     pass
@@ -399,7 +413,7 @@ class LocalSandbox(Sandbox):
             except OSError as exc:
                 raise SandboxError(str(exc)) from exc
             try:
-                if os.path.exists(tmp):
+                if tmp and os.path.exists(tmp):
                     os.remove(tmp)
             except OSError:
                 pass

@@ -124,7 +124,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
                 except AbortError:
                     raise
                 except Exception:
-                    pass  # observer errors never fail the stream
+                    pass  # observer errors never fail the stream (deliberate)
         for call in delta.get("tool_calls") or []:
             if not isinstance(call, dict):
                 raise LLMError(f"stream tool_call not an object: {call!r}")
@@ -209,7 +209,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
 
                 fixed = repair_quoted_escapes_json_text(raw_args)
                 arguments = json.loads(fixed)
-            except Exception:
+            except (json.JSONDecodeError, ValueError, TypeError, ImportError):
                 err = LLMError(
                     f"the response ended mid-tool-call ({name or 'call ' + str(i)}): {exc}"
                 )
@@ -447,8 +447,8 @@ class OpenAICompatClient(LLMClient):
             try:
                 raw_detail = exc.read()
                 detail = raw_detail.decode(errors="replace").lower()[:500]
-            except Exception:
-                pass
+            except (OSError, AttributeError, ValueError):
+                pass  # body unreadable; the status code alone drives the retry
             if any(
                 self._blamed(detail, field)
                 for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options", "temperature")
@@ -533,7 +533,7 @@ class OpenAICompatClient(LLMClient):
 
                         fixed = repair_quoted_escapes_json_text(args_raw or "{}")
                         arguments = json.loads(fixed)
-                    except Exception:
+                    except (json.JSONDecodeError, ValueError, TypeError, ImportError):
                         raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
                 if not isinstance(arguments, dict):
                     raise LLMError(f"tool arguments not an object for '{name}'")
@@ -550,7 +550,7 @@ class OpenAICompatClient(LLMClient):
         """Agnostic fallback: translate chat payload to Responses API (OpenAI Responses)."""
         try:
             payload = json.loads(body.decode("utf-8", errors="replace"))
-        except Exception as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise LLMError(f"could not translate payload for responses: {exc}") from exc
         # Chat messages -> input for Responses API. Include full history so tool results are seen.
         messages = payload.get("messages") or []
@@ -651,7 +651,7 @@ class OpenAICompatClient(LLMClient):
 
                         fixed = repair_quoted_escapes_json_text(args_value or "{}")
                         arguments = json.loads(fixed)
-                    except Exception:
+                    except (json.JSONDecodeError, ValueError, TypeError, ImportError):
                         raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
             elif isinstance(args_value, dict):
                 arguments = args_value
@@ -729,8 +729,8 @@ class OpenAICompatClient(LLMClient):
             try:
                 raw2 = exc.read()
                 detail = raw2.decode(errors="replace").lower()[:500]
-            except Exception:
-                pass
+            except (OSError, AttributeError, ValueError):
+                pass  # body unreadable; the status code alone drives the retry
             if any(
                 self._blamed(detail, field)
                 for field in ("max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options", "temperature")

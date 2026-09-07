@@ -43,7 +43,8 @@ def _copy_windows(text: str) -> bool:
         p.communicate(text, timeout=2)
         if p.returncode == 0:
             return True
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
+        # clip.exe missing or timed out; the Win32 chain is tried next.
         pass
     try:
         import ctypes
@@ -77,6 +78,9 @@ def _copy_windows(text: str) -> bool:
         finally:
             user32.CloseClipboard()
     except Exception:
+        # ctypes/Win32 surface is heterogeneous (AttributeError on exotic
+        # builds, OSError on denied access); any failure just means this
+        # route lost, and the OSC 52 fallback still runs.
         return False
 
 
@@ -96,7 +100,8 @@ def _paste_windows() -> str:
                 txt = txt[:-1]
             if txt:
                 return txt
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
+        # PowerShell missing or timed out; the Win32 chain is tried next.
         pass
     try:
         import ctypes
@@ -120,6 +125,8 @@ def _paste_windows() -> str:
         finally:
             user32.CloseClipboard()
     except Exception:
+        # Same heterogeneity note as the copy chain; an empty string is
+        # the "no clipboard" answer the composer already tolerates.
         return ""
 
 
@@ -140,8 +147,8 @@ def _copy_posix(text: str) -> bool:
             if p is not None:
                 p.kill()
                 p.communicate()
-        except Exception:
-            continue
+        except (OSError, subprocess.SubprocessError):
+            continue  # tool not installed; try the next one
     return False
 
 
@@ -153,8 +160,8 @@ def _paste_posix() -> str:
             out = subprocess.run(cmd, capture_output=True, timeout=1)
             if out.returncode == 0 and out.stdout:
                 return out.stdout.decode("utf-8", errors="replace")
-        except Exception:
-            continue
+        except (OSError, subprocess.SubprocessError):
+            continue  # tool not installed; try the next one
     return ""
 
 

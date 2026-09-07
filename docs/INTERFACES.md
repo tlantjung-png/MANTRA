@@ -10,7 +10,7 @@ The callback, when supplied, receives content fragments as they arrive. The cont
 
 The sandbox contract defines lifecycle and file operations. Provisioning validates inputs, fetches the repository, and runs setup. Execution runs a shell command with a timeout and returns exit status, standard output, standard error, and a timeout flag, with support for external abort that is checked before and during execution.
 
-File operations read and write paths relative to the workspace and reject escapes via resolved path checks, with read operations capped and truncated and write operations validated for size and for parent-chain confinement including symbolic-link checks and re-resolution. Cleanup is idempotent and safe to call multiple times, distinguishing between sandboxes that own their directory and those that were given an existing workspace. A command-screening hook lets sandboxes reject commands before execution so every execution path shares one implementation.
+File operations read and write paths relative to the workspace and reject escapes via resolved path checks, with read operations capped and truncated and write operations validated for size and for parent-chain confinement including symbolic-link checks and re-resolution; writes stage through a uniquely named temporary file before the atomic replace. Cleanup is idempotent and safe to call multiple times, distinguishing between sandboxes that own their directory and those that were given an existing workspace. A command-screening hook lets sandboxes reject commands before execution so every execution path shares one implementation.
 
 ## Tool
 

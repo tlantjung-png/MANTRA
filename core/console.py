@@ -366,7 +366,7 @@ def _render_table(rows: list[list[str]], style: Style) -> str:
     try:
         term_cols = term_size()[0]
     except Exception:
-        term_cols = 80
+        term_cols = 80  # piped output or exotic terminal; a sane default
     budget = max(60, min(100, term_cols - 4)) - 3 * (ncols - 1)
     while sum(widths) > budget:
         widest = max(range(ncols), key=lambda c: widths[c])
@@ -786,10 +786,10 @@ class ConsoleSession:
                             snippet = head[:500].replace("\n", " ")
                             env += f"\n- README: {snippet[:400]}"
                         break
-                    except Exception:
-                        pass
+                    except OSError:
+                        pass  # unreadable candidate readme; try the next
         except Exception:
-            pass
+            pass  # environment probing is advisory; the prompt still assembles
         self.system_prompt = assemble_system_prompt(
             config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
             known_failures_path=KNOWN_FAILURES_PATH,
@@ -996,7 +996,17 @@ class ConsoleSession:
         """Full text of a workspace-relative file, or None when unreadable."""
         if not rel:
             return None
-        full = os.path.join(self.workspace, rel)
+        # The path can arrive from model-supplied tool arguments, so the
+        # join is confined like every other workspace read: a "..", an
+        # absolute path, or a symlink must not widen the snapshot read
+        # beyond the workspace.
+        try:
+            root = os.path.realpath(self.workspace)
+            full = os.path.realpath(os.path.join(root, rel))
+            if not (full == root or full.startswith(root + os.sep)):
+                return None
+        except OSError:
+            return None
         try:
             if not os.path.isfile(full):
                 return None
@@ -1004,7 +1014,7 @@ class ConsoleSession:
                 return None
             with open(full, "r", encoding="utf-8", errors="replace") as fh:
                 return fh.read()
-        except Exception:
+        except OSError:
             return None
 
     def _render_file_change(self, tool: str, result: str) -> str:
@@ -1080,7 +1090,7 @@ class ConsoleSession:
             if layout is not None and getattr(layout, "active", False) and cols >= 30:
                 return int(cols)
         except Exception:
-            pass
+            pass  # duck-typed bridge in an unexpected shape; use the fallback
         return self._OUTPUT_COLS_FALLBACK
 
     def _row_cost(self, line: str) -> int:
@@ -1117,8 +1127,8 @@ class ConsoleSession:
             code = -1
             try:
                 code = int(ln.split(":", 1)[1].split()[0])
-            except Exception:
-                pass
+            except (ValueError, IndexError):
+                pass  # malformed exit_code line: keep the error colour
             color = theme.SAGE if code == 0 else theme.EMBER
             return self.style._wrap(color, "│ " + ln)
         if ln.startswith(("stdout:", "stderr:", "log:", "Note:")):
@@ -1359,6 +1369,8 @@ class ConsoleSession:
                 # floods the viewport.
                 return
         except Exception:
+            # Rendering an observation box is cosmetic: any failure means
+            # the raw observation is shown by the caller instead.
             return
         if shown:
             self._print(shown)
@@ -1523,8 +1535,10 @@ class ConsoleSession:
                     try:
                         self.layout.draw_prompt("")
                     except Exception:
-                        pass
+                        pass  # duck-typed bridge: prompt redraw is cosmetic
                 except Exception:
+                    # The bridge rejected the whole write; fall back to
+                    # plain output so the step line is never lost.
                     self._print(msg)
             else:
                 self._print(msg)
@@ -2247,7 +2261,7 @@ class ConsoleSession:
                 if getattr(self.layout, "_splash_visible", False):
                     self.layout.hide_splash()
             except Exception:
-                pass
+                pass  # duck-typed bridge: splash removal is cosmetic
             self._splash_visible = False
         self.message_count += 1
         self._abort.clear()
@@ -2318,7 +2332,7 @@ class ConsoleSession:
             try:
                 self._flush_deferred_stream()
             except Exception:
-                pass
+                pass  # deferred fragments are best effort; the turn already ended
             if self._streamed_this_run:
                 tail = self._stream_renderer.flush()
                 if tail:
@@ -2328,7 +2342,7 @@ class ConsoleSession:
                         try:
                             self.layout.flush()
                         except Exception:
-                            pass
+                            pass  # duck-typed bridge: flush is cosmetic, never fatal
                     elif self.frame is not None:
                         self.frame.write(tail)
                         self.frame.flush()
@@ -2346,7 +2360,7 @@ class ConsoleSession:
                         try:
                             self.layout.flush()
                         except Exception:
-                            pass
+                            pass  # duck-typed bridge: flush is cosmetic, never fatal
                     else:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
@@ -2356,7 +2370,7 @@ class ConsoleSession:
                         try:
                             self.layout.flush()
                         except Exception:
-                            pass
+                            pass  # duck-typed bridge: flush is cosmetic, never fatal
             elif result is not None and result.final_message:
                 # Same sanitization contract as the streaming path: model
                 # text must never drive the terminal, whether it arrives
@@ -2395,7 +2409,7 @@ class ConsoleSession:
                     if self.layout.following:
                         self.layout.scroll_to_bottom()
                 except Exception:
-                    pass
+                    pass  # duck-typed bridge: auto-scroll is cosmetic
             self._edit_snapshots.clear()
             self._last_edit_path = None
             self._last_command = None
@@ -2413,7 +2427,7 @@ class ConsoleSession:
                 try:
                     self.layout.flush()
                 except Exception:
-                    pass
+                    pass  # duck-typed bridge: flush is cosmetic, never fatal
         return result
 
     def _end_turn(self, result: "RunResult | None") -> None:
@@ -2500,7 +2514,7 @@ class ConsoleSession:
             try:
                 self.layout.draw_chrome()
             except Exception:
-                pass
+                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
 
     def _usage_line(self, result: RunResult) -> str:
         tin = int(result.metrics.get("tokens_in", 0))
@@ -2804,7 +2818,7 @@ class ConsoleSession:
             try:
                 self.layout.hide_splash()
             except Exception:
-                pass
+                pass  # duck-typed bridge: splash removal is cosmetic
             self._splash_visible = False
         if not self._show_tool_output:
             self._print(self.style.dim("  (tool output boxes are hidden in this session — ctrl+o to show)"))
@@ -2830,8 +2844,8 @@ class ConsoleSession:
             if isinstance(content, list):
                 try:
                     content = " ".join(part.get("text","") for part in content if isinstance(part, dict) and part.get("type")=="text") or str(content)
-                except Exception:
-                    content = str(content)
+                except (TypeError, AttributeError):
+                    content = str(content)  # unexpected part shape: stringify
             if role == "user":
                 text = content if isinstance(content, str) else str(content or "")
                 if text.strip():
@@ -2868,7 +2882,7 @@ class ConsoleSession:
             try:
                 self.layout.flush()
             except Exception:
-                pass
+                pass  # duck-typed bridge: flush is cosmetic, never fatal
         return True
 
     def _is_same_workspace(self, saved_ws: str) -> bool:
@@ -2878,7 +2892,8 @@ class ConsoleSession:
             if os.name == "nt":
                 return cur.lower() == saved.lower()
             return cur == saved
-        except Exception:
+        except (OSError, ValueError):
+            # Unresolvable paths (deleted cwd, bad chars): compare raw.
             return (saved_ws or "") == (self.workspace or "")
 
     def show_sessions(self) -> None:
@@ -3094,7 +3109,7 @@ class ConsoleSession:
             try:
                 self.layout.draw_chrome()
             except Exception:
-                pass
+                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
 
     def set_reasoning(self, level: str, quiet: bool = False) -> None:
         """Set the thinking budget for the current model.
@@ -3126,7 +3141,7 @@ class ConsoleSession:
             try:
                 self.layout.draw_chrome()
             except Exception:
-                pass
+                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
 
     def show_reasoning(self) -> None:
         effort = self.config.get("llm", {}).get("reasoning_effort")
@@ -3174,7 +3189,7 @@ class ConsoleSession:
             try:
                 self.layout.draw_chrome()
             except Exception:
-                pass
+                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
         return True
 
     def _warn_if_key_missing(self) -> None:
@@ -3546,11 +3561,17 @@ def _infer_workspace() -> str:
     cwd = os.getcwd()
     if cwd == PROJECT_ROOT:
         return os.path.join(PROJECT_ROOT, "workspace")
+    drive = os.path.splitdrive(cwd)[0]
+    # Drive-root form follows the platform separator; on POSIX splitdrive
+    # returns "", which must not become a protected path or every cwd
+    # would be rejected.
+    drive_root = drive + os.sep if drive else None
     protected = {
         os.path.dirname(_SAFE_HOME.rstrip("\\/")) or _SAFE_HOME,
         _SAFE_HOME,
-        os.path.splitdrive(cwd)[0] + "\\",  # drive root, e.g. C:\
     }
+    if drive_root:
+        protected.add(drive_root)  # drive root, e.g. C:\
     normalized = cwd.rstrip("\\/")
     if any(normalized.lower() == p.lower().rstrip("\\/") for p in protected):
         return os.path.join(PROJECT_ROOT, "workspace")
@@ -3572,13 +3593,19 @@ def _is_safe_session_path(path: str, workspace: str) -> bool:
         # Also allow current project workspace default
         try:
             allowed.append(os.path.realpath(os.path.join(PROJECT_ROOT, "workspace")))
-        except Exception:
-            pass
+        except OSError:
+            pass  # PROJECT_ROOT removed under us; the other allowdirs still apply
+        # Case-insensitive compare: the filesystems this runs on treat
+        # WORKSPACE.TXT and workspace.txt as the same file, and realpath
+        # does not normalize case on Windows.
+        real_lower = real.lower()
         for base in allowed:
-            if real == base or real.startswith(base + os.sep):
+            base = base.rstrip(os.sep)
+            base_lower = base.lower()
+            if real_lower == base_lower or real_lower.startswith(base_lower + os.sep.lower()):
                 return True
         return False
-    except Exception:
+    except OSError:
         return False
 
 
@@ -3614,6 +3641,8 @@ def _read_choice(session: "ConsoleSession", prompt_text: str) -> str:
         try:
             return session.ui.ask_line(prompt_text).strip()
         except Exception:
+            # Duck-typed UI bridge (TUI or console): every caller must
+            # tolerate an empty answer, so any bridge failure means empty.
             return ""
     if not sys.stdin.isatty():
         return ""
@@ -4568,6 +4597,8 @@ def _connect_choose_endpoint(session: "ConsoleSession") -> str | None:
                         remove_key(key_env)
                         key_removed = True
                     except Exception:
+                        # Credential removal must not block endpoint removal;
+                        # flag it so the operator can clean the store by hand.
                         key_removal_failed = True
             if key_removed:
                 session._print(session.style.dim(f"  removed '{name}' (+ key {key_env})"))
@@ -4642,6 +4673,8 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
             if alt:
                 key = alt
     except Exception:
+        # Hidden read failed (no TUI bridge, interrupted): fall back to the
+        # visible prompt so a key can still be entered at all.
         key = _read_choice(session, f"  new api key for {name} (visible, blank cancels)> ").strip()
     if not key:
         session._print(s.dim("  cancelled"))
@@ -4955,6 +4988,8 @@ def _read_secret(
         try:
             return session.ui.ask_line(prompt_text, secret=True)
         except Exception:
+            # Same duck-typed bridge contract as _read_choice: empty on any
+            # failure, never an exception into the command handler.
             return ""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return ""
@@ -5100,8 +5135,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         try:
             session.autosave()
         except Exception:
-            pass
-        session._print("bye")
+            pass  # a failed autosave must not prevent the exit itself
         raise SystemExit(0)
     if command in ("/help", "/"):
         session._print(HELP_TEXT)
@@ -5287,7 +5321,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.reasoning and "reasoning_effort" in act:
                     llm_cfg["reasoning_effort"] = act["reasoning_effort"]
     except Exception:
-        pass
+        pass  # saved-pick restore is advisory; explicit flags still apply
     if args.endpoint:
         url = args.endpoint.rstrip("/")
         if not url.startswith(("http://", "https://")):
@@ -5380,7 +5414,7 @@ def _run_terminal(session: ConsoleSession) -> int:
         try:
             session.autosave()
         except Exception:
-            pass
+            pass  # a failed autosave must not mask the operation it follows
     return 0
 
 

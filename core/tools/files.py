@@ -109,8 +109,8 @@ def _candidate_spellings(path: str) -> list[str]:
         try:
             variants.append(unicodedata.normalize("NFD", v))
             variants.append(unicodedata.normalize("NFC", v))
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            pass  # surrogate-heavy names cannot be normalized; skip the variant
     # dedup preserve order
     seen = set()
     out = []
@@ -248,7 +248,7 @@ class ReadFileTool(Tool):
         if root is None:
             return "ERROR: bulk read not supported in this sandbox"
         try:
-            import pathlib
+            import pathlib  # noqa: F401 - root_str normalization below
             pat = pattern.replace("\\", "/").lstrip("/")
             # Ensure root is str for glob, handle Windows
             root_str = str(pathlib.Path(root))
@@ -284,15 +284,17 @@ class ReadFileTool(Tool):
             unreadable = 0
             for rel in sorted(files):
                 res = self._execute_single(sandbox, rel, 0, 400)  # per-file window
-                # Strip notes for bulk, keep content
-                if res.startswith("ERROR") or res.startswith("Note:"):
+                # Strip notes for bulk, keep content. A per-file note can be
+                # legitimate ("file is empty"), so only errors count as
+                # unreadable here.
+                if res.startswith("ERROR"):
                     unreadable += 1
                     continue
                 chunk = f"--- {rel} ---\n{res}\n"
                 if total + len(chunk) > 100_000:
                     # Count only the files actually dropped by the cap:
                     # errors and notes were never cap-skipped.
-                    skipped = max(0, len(files) - unreadable - len(out_parts))
+                    skipped = max(0, len(files) - len(out_parts) - 1)
                     break
                 out_parts.append(chunk)
                 total += len(chunk)
@@ -300,7 +302,9 @@ class ReadFileTool(Tool):
             if skipped:
                 header += f" (+{skipped} more, aggregate cap 100KB)"
             return header + "\n" + "\n".join(out_parts)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
+            # Only filesystem/pattern failures land here now; a coding bug
+            # surfaces as a crash instead of a suspiciously empty bulk read.
             return f"ERROR: glob failed for {pattern!r}: {exc}"
 
     def _execute_bulk_list(self, sandbox: Sandbox, paths: list[str], limit: int) -> str:
@@ -334,8 +338,8 @@ class ReadFileTool(Tool):
                     # Self-expiring: consume record
                     del self._dedup[dedup_key]
                     return cached[2]
-        except Exception:
-            pass
+        except OSError:
+            pass  # stat failed (vanished file, bad join): treat as a cache miss
 
         # Try reading; on failure try candidate spellings
         content: str | None = None
@@ -434,6 +438,7 @@ class ReadFileTool(Tool):
         # Byte budget
         text = "\n".join(window)
         truncated_by_bytes = False
+        shown_window = len(window)
         if len(text.encode("utf-8", errors="replace")) > _BYTE_BUDGET:
             raw = "\n".join(window).encode("utf-8", errors="replace")
             cut = min(_BYTE_BUDGET, len(raw) - 1)
@@ -447,16 +452,22 @@ class ReadFileTool(Tool):
             truncated_by_bytes = True
 
         # Build header with resume info
-        remaining = total_lines - (offset + len(window))
+        shown_lines = text.split("\n") if text else []
+        if truncated_by_bytes:
+            # The resume offset must advance past what was actually shown.
+            # Recount from the content rather than reusing the window list,
+            # whose entries carry the clamp markers, not the raw text.
+            shown_window = len(shown_lines)
+        remaining = total_lines - (offset + shown_window)
         header = ""
         if offset != 0 or limit != _LINE_WINDOW or truncated_by_bytes or clamped or len(window) < total_lines:
-            header = f"Note: {path!r} ({total_lines} lines, showing {len(window)} lines offset={offset} limit={limit}"
+            header = f"Note: {path!r} ({total_lines} lines, showing {shown_window} lines offset={offset} limit={limit}"
             if truncated_by_bytes:
                 header += f", byte cap {_BYTE_BUDGET//1024}KB hit"
             if clamped:
-                header += f", {sum(1 for l in window if 'truncated' in l)} lines clamped at {_PER_LINE_CLAMP}ch"
+                header += f", {sum(1 for l in window if l.endswith(f'truncated at {_PER_LINE_CLAMP} chars]'))} lines clamped at {_PER_LINE_CLAMP}ch"
             if remaining > 0:
-                header += f", {remaining} more lines remain — retry with offset={offset+len(window)}"
+                header += f", {remaining} more lines remain — retry with offset={offset + shown_window}"
             header += ").\n"
 
         result = header + text

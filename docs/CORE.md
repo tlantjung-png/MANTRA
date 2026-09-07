@@ -47,3 +47,7 @@ The event bus provides synchronous fan-out to subscribed handlers and suppresses
 ## Tool Argument Validation
 
 The tool-repair module validates and repairs tool-call arguments before execution. It resolves aliases against the tool's expected vocabulary, strips nulls, unwraps markdown links, parses schema-typed JSON strings, coerces numeric fields, and repairs single-backslash Windows paths in JSON string literals. Repairs that succeed are logged; arguments that cannot be repaired are returned to the model as an error observation with the expected schema.
+
+## Workspace Boundary Helpers
+
+Pre-edit file snapshots are joined onto the workspace through the same resolved-path confinement as every other workspace read, so a model-supplied tool path can never widen the snapshot read beyond the workspace. Workspace inference refuses to turn the user home, its parent, or a drive root into a working workspace on any platform, with the drive-root check applied only where a drive concept exists. Session save and load compare resolved paths against their allowlist case-insensitively, because the target platforms treat differing case in a path segment as the same file.

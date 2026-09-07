@@ -418,10 +418,11 @@ class AgentLoop:
                 for _k in oldest_keys:
                     recent_calls.pop(_k, None)
                     recent_failed.discard(_k)
-        except Exception:
+        except (TypeError, ValueError):
+            # Key serialization failed; fall back to the unhashed form.
             try:
                 key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)}"
-            except Exception:
+            except (TypeError, ValueError):
                 key = f"{call.name}:{call.arguments}"
             cnt = recent_calls.get(key, 0) + 1
             recent_calls[key] = cnt
@@ -610,13 +611,14 @@ class AgentLoop:
             try:
                 # Try dict conversion, then attr fallback
                 usage = dict(usage_raw)  # type: ignore[arg-type]
-            except Exception:
+            except (TypeError, ValueError):
                 try:
                     # Object with attributes (e.g., OpenAI Usage)
                     usage = {k: getattr(usage_raw, k) for k in dir(usage_raw) if not k.startswith("_") and not callable(getattr(usage_raw, k, None))}
                     if not usage:
                         raise ValueError("empty usage object")
-                except Exception:
+                except (TypeError, AttributeError, ValueError):
+                    # Provider shapes we do not recognize; usage is optional.
                     metrics["usage_unknown"] = metrics.get("usage_unknown", 0) + 1
                     return
             if not isinstance(usage, dict) or not usage:

@@ -91,12 +91,23 @@ def _read() -> dict[str, Any]:
 def _quarantine(file: Path, reason: str) -> str | None:
     """Copy an unreadable file aside before anything replaces it.
 
-    Returns the backup path, or None when there was nothing to save.
+    Returns the backup path, or None when there was nothing to save. The
+    backup name is unique, so a file that stays broken never grows a
+    pile of same-named copies: each surviving write quarantines the
+    previous attempt's backup too.
     """
     if not file.is_file():
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = file.with_suffix(file.suffix + f".corrupt-{stamp}")
+    # Second-resolution stamp collides within the same second; make the
+    # name unique instead of silently overwriting the last backup.
+    counter = 1
+    while backup.exists():
+        backup = file.with_suffix(file.suffix + f".corrupt-{stamp}-{counter}")
+        counter += 1
+        if counter > 100:
+            return None
     try:
         shutil.copy2(file, backup)
         return str(backup)

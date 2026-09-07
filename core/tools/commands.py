@@ -48,12 +48,50 @@ _MAX_FULL_LOGS = 50
 _LOG_BYTE_CEILING = 10 * 1024 * 1024
 
 
+# Process-group isolation for background tasks, matching the sandbox's
+# foreground behavior: a timeout or abort kills the whole tree, not just
+# the shell, so orphaned descendants cannot outlive the task.
+_POPEN_GROUP_KWARGS: dict = {}
+if os.name == "nt":
+    _POPEN_GROUP_KWARGS["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+else:
+    _POPEN_GROUP_KWARGS["start_new_session"] = True
+
+
+def _kill_task_tree(proc: subprocess.Popen) -> None:
+    """Kill a background task's whole process tree; best effort."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
+    try:
+        import signal as _signal
+        os.killpg(proc.pid, _signal.SIGTERM)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, getattr(_signal, "SIGKILL", _signal.SIGTERM))
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _register_full_log(path: str) -> None:
     """Track a full-output log file and prune expired/surplus ones."""
-    import time as _t
-
+    now = time.monotonic()
     with _FULL_LOG_LOCK:
-        now = _t.monotonic()
         for old_path, created in list(_FULL_LOG_FILES.items()):
             if now - created > _FULL_LOG_TTL_SECONDS:
                 _FULL_LOG_FILES.pop(old_path, None)
@@ -75,8 +113,7 @@ def _register_full_log(path: str) -> None:
 
 def _prune_tasks_locked() -> None:
     """Prune old completed tasks when registry grows too large."""
-    import time as _t
-    now = _t.monotonic()
+    now = time.monotonic()
     # First, remove expired completed tasks
     expired = [
         tid for tid, info in _TASKS.items()
@@ -85,12 +122,12 @@ def _prune_tasks_locked() -> None:
     for tid in expired:
         info = _TASKS.pop(tid, None)
         # Clean up log file for pruned task
-        try:
-            lp = info.get("log_path") if info else None
-            if lp and os.path.exists(lp):
+        lp = (info or {}).get("log_path")
+        if lp and os.path.exists(lp):
+            try:
                 os.remove(lp)
-        except Exception:
-            pass
+            except OSError:
+                pass
     # If still over capacity, remove oldest completed first. A registry
     # full of running tasks is left over capacity: evicting a live entry
     # would orphan its process — unfindable by kill_shell, unreadable by
@@ -109,12 +146,13 @@ def _prune_tasks_locked() -> None:
         if victim is None:
             break
         info = _TASKS.pop(victim, None)
-        try:
-            lp = info.get("log_path") if info else None
-            if lp and os.path.exists(lp):
+        lp = (info or {}).get("log_path")
+        if lp and os.path.exists(lp):
+            try:
                 os.remove(lp)
-        except Exception:
-            pass
+            except OSError:
+                pass
+
 
 def _next_task_id() -> str:
     global _TASK_COUNTER
@@ -309,6 +347,10 @@ class RunCommandTool(Tool):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    # Same isolation as the foreground path: the task runs
+                    # in its own process group so a timeout or abort can
+                    # kill the whole tree instead of orphaning descendants.
+                    **_POPEN_GROUP_KWARGS,
                 )
             except Exception as exc:
                 _finish_task(task_id, log_path, -1, note=str(exc), duration=0.0)
@@ -360,16 +402,10 @@ class RunCommandTool(Tool):
             timed_out = False
             while True:
                 if abort is not None and abort.is_set():
-                    # Operator abort: terminate the child, then force-kill,
-                    # join the pumper, and finalize the task as interrupted.
-                    try:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                    except OSError:
-                        pass
+                    # Operator abort: kill the whole tree (the task leads
+                    # its own process group), join the pumper, and finalize
+                    # the task as interrupted.
+                    _kill_task_tree(proc)
                     try:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
@@ -390,14 +426,9 @@ class RunCommandTool(Tool):
                     if time.monotonic() < deadline:
                         continue
                     timed_out = True
-                    try:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=0.5)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                    except OSError:
-                        pass
+                    # Timeout: kill the whole tree, not just the shell, so
+                    # descendants cannot keep running past the deadline.
+                    _kill_task_tree(proc)
                     try:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:

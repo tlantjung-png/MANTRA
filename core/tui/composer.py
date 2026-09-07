@@ -354,8 +354,15 @@ class Composer:
             col = self.cursor - start
         else:
             col = self.cursor
+        # The caret lives on the rendered line, so it moves in display
+        # columns: a wide character before it pushes the caret two cells,
+        # not one. Counting string indexes put the caret inside the wide
+        # character it sits after.
+        line = lines[cl] if self.is_multiline else self.buffer
+        col_in_line = min(col, len(line))
+        display = visible_len(line[:col_in_line])
         if visible_len(self.buffer) <= avail:
-            return label_vis + col
-        # Windowed: compute the visible offset the same way _window does.
-        keep = max(0, col - avail // 2)
-        return label_vis + max(0, col - keep)
+            return label_vis + display
+        # Windowed: mirror _window's keep calculation in display columns.
+        keep = max(0, display - avail // 2)
+        return label_vis + max(0, display - keep)

@@ -75,6 +75,17 @@ _SPECIALS = {
     "F": "end",
     "Z": "shift+tab",
 }
+# CSI "1;<n>" modifier parameter -> key modifier set (xterm encoding).
+_MODIFIERS = {
+    2: frozenset({"shift"}),
+    3: frozenset({"alt"}),
+    4: frozenset({"shift", "alt"}),
+    5: frozenset({"ctrl"}),
+    6: frozenset({"ctrl", "shift"}),
+    7: frozenset({"ctrl", "alt"}),
+    8: frozenset({"ctrl", "shift", "alt"}),
+}
+
 _TILDES = {
     "1": "home",
     "2": "insert",
@@ -172,8 +183,8 @@ class Backend:
             import atexit
 
             atexit.unregister(self.stop)
-        except Exception:
-            pass
+        except (ValueError, TypeError):
+            pass  # already unregistered or interpreter shutting down
 
     @property
     def size(self) -> tuple[int, int]:
@@ -213,6 +224,9 @@ class Backend:
             if not mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
                 kernel32.SetConsoleMode(handle, mode.value | 0x0004)
         except Exception:
+            # ctypes/Win32 surface: a missing kernel32 or non-console
+            # handle simply means there is nothing to restore; frames
+            # still write (the UnicodeEncodeError fallback covers output).
             pass
 
     def current_size(self) -> tuple[int, int]:
@@ -300,8 +314,8 @@ class Backend:
         if getattr(self, "_saved_attr", None) is not None:
             try:
                 termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attr)
-            except Exception:
-                pass
+            except termios.error:
+                pass  # fd closed or not a tty anymore; nothing to restore
         try:
             signal.signal(signal.SIGWINCH, signal.SIG_DFL)
         except (OSError, ValueError):
@@ -400,13 +414,25 @@ class Backend:
 
         def flush_pending() -> None:
             nonlocal pending
-            if pending:
+            if not pending:
+                return
+            if pending.startswith(_PASTE_START):
+                # A paste that grew past the cap is delivered as one Paste
+                # event so its newlines stay intact and no marker text
+                # leaks into the composer as literal input.
+                body = pending[len(_PASTE_START):]
+                for k in range(min(len(_PASTE_END) - 1, len(body)), 0, -1):
+                    if _PASTE_END.startswith(body[-k:]):
+                        body = body[:-k]
+                        break
+                self.events.put(Paste(body))
+            else:
                 for ch in pending:
                     if ch == "\x1b":
                         self.events.put(Key("esc"))
-                    elif ch >= " ":
+                    elif ch >= " " and not (0x7F <= ord(ch) <= 0x9F):
                         self.events.put(Key(ch))
-                pending = ""
+            pending = ""
 
         while not self._stop.is_set():
             # Resizes are not reliably delivered as records through a
@@ -465,7 +491,7 @@ class Backend:
                                 body = pending[len(_PASTE_START):end]
                                 self.events.put(Paste(body))
                                 pending = ""
-                            elif len(pending) > _PASTE_CAP:
+                            elif len(pending) - len(_PASTE_START) > _PASTE_CAP:
                                 flush_pending()
                             pending_at = time.monotonic()
                             continue
@@ -593,6 +619,12 @@ class Backend:
         fd = getattr(self, "_fd", -1)
         if fd < 0:
             return
+        import codecs
+
+        # Incremental UTF-8 decoder: a multi-byte character split across
+        # two reads is buffered inside the decoder instead of becoming
+        # replacement characters.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
         last_buttons = 0
         while not self._stop.is_set():
@@ -624,7 +656,7 @@ class Backend:
                 continue
             if not data:
                 continue
-            pending += data.decode("utf-8", errors="replace")
+            pending += decoder.decode(data)
             pending, last_buttons = self._parse_stream(pending, last_buttons)
             if pending:
                 self._pending_at = time.monotonic()
@@ -645,13 +677,21 @@ class Backend:
                     self.events.put(event)
                 i += consumed
                 continue
-            name = _CTRL_NAMES.get(ord(ch)) if ord(ch) < 32 else None
-            if name is not None:
-                self.events.put(Key(name))
+            o = ord(ch)
+            if o < 32:
+                name = _CTRL_NAMES.get(o)
+                if name is not None:
+                    self.events.put(Key(name))
                 i += 1
                 continue
-            if ord(ch) >= 32 or ch == " ":
-                self.events.put(Key(ch))
+            if o == 127:
+                self.events.put(Key("backspace"))
+                i += 1
+                continue
+            if 128 <= o <= 159:
+                i += 1  # C1 control byte: never printable input
+                continue
+            self.events.put(Key(ch))
             i += 1
         return buf[i:], last_buttons
 
@@ -669,11 +709,16 @@ class Backend:
                 return 0, None, last_buttons
             # Bracketed paste start: 200~ ... 201~
             if body.startswith("200"):
-                idx = seq.find("\x1b[201~")
+                idx = seq.find(_PASTE_END)
                 if idx < 0:
+                    # Bound memory: a paste whose end marker never shows
+                    # is cut off at the cap and delivered as-is.
+                    if len(seq) > _PASTE_CAP + len(_PASTE_START):
+                        cut = _PASTE_CAP + len(_PASTE_START)
+                        return len(seq), Paste(seq[len(_PASTE_START):cut]), last_buttons
                     return 0, None, last_buttons
-                text = seq[5:idx]
-                return idx + 6, Paste(text), last_buttons
+                text = seq[len(_PASTE_START):idx]
+                return idx + len(_PASTE_END), Paste(text), last_buttons
             # SGR mouse: < button ; col ; row M|m
             if body.startswith("<"):
                 m = _SGR_MOUSE.match(body)
@@ -700,12 +745,16 @@ class Backend:
             if final == "~":
                 name = _TILDES.get(params or final)
                 return consumed, (Key(name) if name else None), last_buttons
-            if params in ("1;5", "1;2"):
-                if final in ("C", "D"):
-                    name = ("ctrl+" if params == "1;5" else "alt+") + ("right" if final == "C" else "left")
-                    return consumed, Key(name), last_buttons
-                if final in ("A", "B"):
-                    return consumed, None, last_buttons
+            mod_match = re.match(r"^1;([2-8])$", params)
+            if mod_match and final in ("A", "B", "C", "D"):
+                mods = _MODIFIERS.get(int(mod_match.group(1)), frozenset())
+                base = {"A": "up", "B": "down", "C": "right", "D": "left"}[final]
+                # Ctrl+left/right keep the composed name the Windows path
+                # and the composer already understand; every other combo
+                # carries its modifiers in ``mods``.
+                if "ctrl" in mods and final in ("C", "D"):
+                    return consumed, Key("ctrl+" + base, mods), last_buttons
+                return consumed, Key(base, mods), last_buttons
             if final in ("u",) and params in ("13;2", "13"):
                 return consumed, Key("newline" if params == "13;2" else "enter"), last_buttons
             name = _SPECIALS.get(final)
@@ -717,11 +766,25 @@ class Backend:
                 return 0, None, last_buttons
             name = _SPECIALS.get(seq[2])
             return 3, (Key(name) if name else None), last_buttons
-        # Alt+key or bare escape.
+        # Alt+chord (ESC followed by a printable byte), ESC ESC, or a
+        # bare escape followed by a control byte (the escape acts alone).
+        if seq[1] == "\x1b":
+            return 1, Key("esc"), last_buttons
         if seq[1] >= " ":
-            return 2, None, last_buttons
+            return 2, Key(seq[1], frozenset({"alt"})), last_buttons
         return 1, Key("esc"), last_buttons
 
     def _feed_char(self, ch: str) -> None:
-        name = _CTRL_NAMES.get(ord(ch)) if ord(ch) < 32 else None
+        if ch == "\x1b":
+            # A lone escape replayed after a sequence timeout is the escape
+            # action, never a printable character.
+            self.events.put(Key("esc"))
+            return
+        o = ord(ch)
+        if o == 127:
+            self.events.put(Key("backspace"))
+            return
+        if 128 <= o <= 159:
+            return
+        name = _CTRL_NAMES.get(o) if o < 32 else None
         self.events.put(Key(name or ch))

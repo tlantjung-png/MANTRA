@@ -35,6 +35,32 @@ def tool_call_response(name: str, arguments: dict) -> LLMResponse:
     )
 
 
+def load_script_file(path: str) -> list[LLMResponse]:
+    """Load a scripted-conversation JSON file into LLMResponses.
+
+    Format: a JSON list of response objects, each with an optional
+    ``content`` string and/or a ``tool_calls`` list of
+    ``{"name": ..., "arguments": {...}}`` objects. Used by the E2E
+    harness (``MANTRA_SCRIPT`` env) so a live console turn stays
+    hermetic and never touches the network.
+    """
+    import json as _json
+
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = _json.load(fh)
+    out: list[LLMResponse] = []
+    for item in raw:
+        tool_calls = []
+        for idx, tc in enumerate(item.get("tool_calls", [])):
+            tool_calls.append(ToolCall(
+                id=tc.get("id") or f"call_script_{len(out)}_{idx}",
+                name=tc["name"],
+                arguments=tc.get("arguments", {}),
+            ))
+        out.append(LLMResponse(content=item.get("content"), tool_calls=tool_calls))
+    return out
+
+
 def streaming_client(content: str) -> ScriptedLLMClient:
     """A client that emits ``content`` word-by-word through ``on_delta``.
 

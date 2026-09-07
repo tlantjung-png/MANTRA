@@ -28,3 +28,9 @@ Format:
 - symptom: nine failed search_replace calls in one session: eight rejected as "found multiple times" and one "not found" when a prior edit to the same file shifted a neighbouring anchor. All followed batch comment/docstring edits where the same short line (a repeated assignment, an identical comment block, a duplicated fixture line) appears more than once in a file.
 - rule: before editing with search_replace, treat short or duplicated anchor text as non-unique. Either include enough surrounding context to make the anchor unique, or deliberately pass replace_all when every occurrence should change. After any edit to a file, re-read the region before the next edit in that file when anchors are similar; a stale anchor fails with "not found".
 - date: 2026-09-05
+
+
+## KF-5 | run_terminal_command rejected on Windows quoting / JSON discipline
+- symptom: tool-call JSON rejected with "Failed to parse arguments for tool" when a command or a probe string carries an unquoted bare Windows path, an unquoted glob, or Bash-style quoting; inline python -c probes with nested quotes also die on the shell (KF-3). The cluster recurs across sessions (16+ rejections in the unified log on one day).
+- rule: quote EVERY string value in tool-call JSON; use the exact parameter names of the tool's schema; prefer a temp .ps1/.py file for any probe needing variables, regexes, or nested quotes; never use Bash-only separators (&&, ;, |) inside Windows PowerShell command strings.
+- date: 2026-09-06

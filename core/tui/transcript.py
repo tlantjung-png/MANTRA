@@ -19,17 +19,11 @@ from core.term import _char_width
 # (CJK) characters count double.
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 
-# Bare C0/C1 controls that survive the ANSI filter (ESC c, BEL, BS, C1
-# CSI bytes, ...) can reset or corrupt the terminal frame. Layout
-# controls the transcript actually renders (\n \r \t) are not matched.
-# NOTE: \x1b (ESC) is deliberately inside the class: it must be removed
-# when it is NOT part of a kept SGR sequence. sanitize_ingest shields
-# the ESC byte of kept sequences before this strip runs.
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
-
-# Printable stand-in for the ESC byte of a kept SGR sequence while the
-# control-char strip runs; restored afterwards.
-_SGR_SHIELD = "_SGRESC_"
+# Bare C0/C1 controls (ESC c, BEL, BS, C1 CSI bytes, ...) can reset or
+# corrupt the terminal frame. Layout controls the transcript actually
+# renders (\n \t) are preserved: sanitize_ingest handles them itself, so
+# this class never needs an exception for them.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]")
 
 
 def sanitize_ingest(text: str) -> str:
@@ -38,21 +32,34 @@ def sanitize_ingest(text: str) -> str:
     Transcript lines are data, never cursor control: if a positioning or
     mouse sequence ever leaks into a print path, it must not be able to
     relocate the frame or replay itself on screen.
+
+    Single pass, no sentinel: SGR sequences are copied verbatim (their
+    control bytes are exempt from the strip), everything else — other
+    escapes, bare C0/C1 controls, and CR — is dropped. Because kept
+    sequences never pass through a printable stand-in, model output
+    cannot forge one.
     """
-
-    def _keep(m: "re.Match[str]") -> str:
-        # Keep SGR sequences whole, every other escape is dropped. The
-        # ESC byte is shielded so the strip below cannot eat it and
-        # leave literal "[2m" codes behind (which would render as text
-        # and never colour the line).
-        return _SGR_SHIELD + m.group(0)[1:] if m.group(0).endswith("m") else ""
-
-    # Strip every escape except SGR, drop bare C0/C1 controls (including
-    # the ESC byte of dropped sequences), then restore the shielded ESC
-    # bytes so the stored line carries real, parseable SGR.
-    shielded = _ANSI_RE.sub(_keep, text)
-    stripped = _CTRL_RE.sub("", shielded)
-    return stripped.replace(_SGR_SHIELD + "[", "\x1b[")
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\x1b":
+            m = _ANSI_RE.match(text, i)
+            if m and m.group(0).endswith("m"):
+                out.append(m.group(0))  # SGR: kept whole
+                i = m.end()
+            else:
+                # Any other escape is dropped; skip its full body when
+                # parseable so trailing parameter bytes cannot leak.
+                i = m.end() if m else i + 1
+            continue
+        if ch == "\r" or _CTRL_RE.match(ch):
+            i += 1  # carriage returns and bare C0/C1 controls are never layout
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def wrap_ansi(text: str, width: int) -> list[str]:
@@ -194,6 +201,22 @@ class Transcript:
                 if self._width:
                     self.display.extend(wrap_ansi(clean, self._width))
             self.version += 1
+
+    def _wrap_one_locked(self, line: str) -> None:
+        """Replace one logical line's display rows incrementally.
+
+        A full rewrap is O(total content); this is O(one line), which is
+        what an append-heavy streaming feed needs once the transcript
+        holds thousands of lines.
+        """
+        if self.raw:
+            self.raw[-1] = line
+        if not self._width:
+            return
+        if self.display:
+            self.display.pop()
+        self.display.extend(wrap_ansi(line, self._width))
+        self.version += 1
 
     def append_partial(self, styled_text: str) -> None:
         """Feed a live fragment: complete lines commit, the tail is held."""

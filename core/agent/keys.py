@@ -132,7 +132,9 @@ def _restrict_dir(directory: Path) -> None:
                 ["icacls", str(directory), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
                 capture_output=True, timeout=5
             )
-        except Exception:
+        except (OSError, ImportError, subprocess.SubprocessError):
+            # icacls is missing, the user name is undeterminable, or the
+            # call failed; the chmod fallback above already ran.
             pass
 
 
@@ -152,7 +154,8 @@ def _restrict_file(path: Path) -> None:
                 ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                 capture_output=True, timeout=5
             )
-        except Exception:
+        except (OSError, ImportError, subprocess.SubprocessError):
+            # Same as _restrict_dir: best effort, chmod already ran.
             pass
 
 
@@ -212,7 +215,9 @@ def _store_locked():
             else:
                 import fcntl
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
+        except (OSError, ImportError):  # noqa: BLE001 - degrade to unlocked
+            # The advisory lock is an optimization; the atomic replace
+            # already keeps the store intact without it.
             if handle is not None:
                 try:
                     handle.close()

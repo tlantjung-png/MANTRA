@@ -156,8 +156,8 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
                 parsed = json.loads(arguments)
                 if isinstance(parsed, dict):
                     return parsed, ["parsed stringified JSON arguments"]
-            except Exception:
-                pass
+            except (json.JSONDecodeError, ValueError):
+                pass  # not JSON after all; handled as a plain string below
         return arguments if isinstance(arguments, dict) else {}, ["repaired: arguments not a dict"]
 
     repaired = dict(arguments)
@@ -247,8 +247,8 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
                             repaired[param] = parsed
                             notes.append(f"parsed JSON string {param}")
                             continue
-                    except Exception:
-                        pass
+                    except (json.JSONDecodeError, ValueError):
+                        pass  # fall through to bare-string wrapping
             # Bare-string-wrap: string where array expected
             if isinstance(val, str) and ptype == "array":
                 repaired[param] = [val]
