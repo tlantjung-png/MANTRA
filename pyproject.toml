@@ -9,6 +9,7 @@ version = "0.1.0"
 description = "Modular harness for coding agents"
 readme = "README.MD"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 dependencies = []
 
 [project.scripts]
