@@ -5,6 +5,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .hypothesis/
+.coverage
+coverage.xml
+htmlcov/
 
 # Runtime state
 logs/
@@ -12,6 +15,8 @@ workspace/
 
 # Build metadata
 *.egg-info/
+dist/
+build/
 
 # Virtual environments
 .venv/
@@ -31,3 +36,10 @@ Thumbs.db
 # Harness state (any level)
 .mantra/
 .grok/
+
+# Patch / merge leftovers
+*.orig
+*.rej
+
+# Tests (untracked by choice; see note below)
+tests/
