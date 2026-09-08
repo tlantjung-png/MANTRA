@@ -12,6 +12,7 @@
 | `compress-output` | Use the console's bounded tools (read_file with caps, list_dir, search_code, the paged diff renderer) instead of raw file dumps, ls, grep, or git diff when the result would be large. Compression at the source keeps the context window small and the model focused on the relevant signal. |
 | `context-handoff` | Manage the context budget across compaction - watch capacity signals, offload volatile state to durable files (workspace memory, the standing goal), write a continuation brief before compacting, and rebuild intent afterwards. |
 | `copy` | Write specific, persuasive marketing or branded content in a truthful voice without invented claims, guarantees, or generic filler. |
+| `copywriting` | Create persuasive copy that sounds natural, audience-aware, specific, and credible while preserving factual accuracy and avoiding formulaic marketing language. |
 | `create-skill` | Create and register a new workflow skill with valid metadata, a focused procedure, catalog and routing entries, and verification coverage. |
 | `create-workflow` | Create, register, and launch a MANTRA workflow (an ordered prompt sequence in ~/.mantra/workflows.json) using the /workflow commands. |
 | `debug` | Reproduce a bug or failure, identify its root cause from the actual path, make the smallest safe correction, and prove the regression is gone. |
@@ -26,7 +27,7 @@
 | `excel` | Build auditable spreadsheets, financial models, trackers, or data workbooks with explicit inputs, formulas, tie-outs, and usage guidance. |
 | `exec-mode` | Recommend whether a task should run in a regular session, as a MANTRA workflow, or as a goal, using a deterministic signal table, and log the decision to the workspace memory. |
 | `help` | Explain current MANTRA setup, configuration, authentication, skills, commands, and troubleshooting from the actual repository and ~/.mantra state. |
-| `humanize` | Rewrite stiff, generic, or AI-sounding prose into natural, specific, truthful writing while preserving every factual proposition and removing reasoning-transcript leakage. |
+| `humanize` | Rewrite stiff, robotic, repetitive, or overly polished prose into natural human-sounding writing while preserving meaning, facts, terminology, and the writer's intended voice. |
 | `imagine` | Plan image generation, image editing, short video workflows, and UI demonstration GIFs with accurate prompts, references, consistency checks, and safe handling of likenesses. |
 | `improve-coverage` | Add meaningful tests for existing behavior by prioritizing high-risk boundaries, regressions, failures, and untested contracts rather than chasing a percentage. |
 | `instruction-audit` | Audit always-loaded instruction assets - the base system prompt, workspace memory, AGENTS.md instructions, the known-failure registry, and command rules - for token weight, staleness, contradiction, and attention dilution. |

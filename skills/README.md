@@ -30,6 +30,15 @@ user-invocable: true
 the attached procedure is injected into the agent's system prompt so it is
 followed rather than improvised.
 
+## Humanize and Copywriting
+
+Two writing skills are intentionally kept separate:
+
+- `humanize` rewrites existing prose. Its priority is meaning preservation, factual fidelity, voice consistency, and natural flow. It should not inject a generic persona, artificial mistakes, statistical irregularities, or detector-evasion tactics.
+- `copywriting` creates new persuasive copy. It adapts the message to audience, awareness, channel, offer, objection, and desired action while avoiding unsupported claims and formulaic marketing language.
+
+Neither skill guarantees a particular AI-detector score or claims that text is "100% human." Naturalness is treated as a writing-quality goal rather than a numerical detector target.
+
 ## Origin
 
 This library was adopted from a pre-existing skill collection and adapted to
