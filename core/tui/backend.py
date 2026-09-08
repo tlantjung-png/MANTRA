@@ -459,6 +459,15 @@ class Backend:
             if not kernel32.ReadConsoleInputW(handle, records, len(records), ctypes.byref(read)):
                 time.sleep(_POLL)
                 continue
+            # A burst of key-downs in one read is a paste, not typing:
+            # newlines inside it must land in the composer as newlines
+            # instead of submitting the prompt mid-paste.
+            batch_downs = sum(
+                1
+                for j in range(read.value)
+                if records[j].EventType == KEY_EVENT and records[j].Event.KeyEvent.bKeyDown
+            )
+            pasted = batch_downs > 1
             for i in range(read.value):
                 rec = records[i]
                 etype = rec.EventType
@@ -522,7 +531,7 @@ class Backend:
                         pending = ch
                         pending_at = time.monotonic()
                         continue
-                    for ev in self._win_key_to_event(key, mods):
+                    for ev in self._win_key_events(key, mods, pasted):
                         self.events.put(ev)
                     continue
                 if etype == MOUSE_EVENT:
@@ -559,6 +568,25 @@ class Backend:
                     if changed & 0x0002 and buttons & 0x0002:
                         self.events.put(Mouse("press", 2, x, y, mods_of(m.dwControlKeyState)))
                     continue
+
+    def _win_key_events(self, key: Any, mods: frozenset, pasted: bool) -> list[Event]:
+        """Decode one Windows key record, keeping pastes out of submit.
+
+        A lone Enter submits the prompt, but an Enter inside a burst of
+        key-downs is a pasted newline and must insert instead — otherwise
+        the first line of a paste submits before the rest arrives.
+        """
+        out: list[Event] = []
+        for ev in self._win_key_to_event(key, mods):
+            if (
+                pasted
+                and isinstance(ev, Key)
+                and ev.key == "enter"
+                and "shift" not in ev.mods
+            ):
+                ev = Key("newline", ev.mods)
+            out.append(ev)
+        return out
 
     @staticmethod
     def _primary_button(current: int, previous: int) -> int:

@@ -45,6 +45,10 @@ class Composer:
         self.completer = None
         # Submitted text (Enter with no popup). Consumed by the app.
         self.submitted: str | None = None
+        # Mouse selection as buffer offsets. Typing or paste replaces the
+        # selected range; caret moves clear it.
+        self.sel_anchor: int | None = None
+        self.sel_head: int | None = None
 
     # ── state ─────────────────────────────────────────────────
 
@@ -57,6 +61,44 @@ class Composer:
         self._last_token = None
         self._dismissed = False
         self.submitted = None
+        self.sel_anchor = None
+        self.sel_head = None
+
+    # ── selection ─────────────────────────────────────────────
+
+    def has_selection(self) -> bool:
+        return (
+            self.sel_anchor is not None
+            and self.sel_head is not None
+            and self.sel_anchor != self.sel_head
+        )
+
+    def selected_range(self) -> tuple[int, int] | None:
+        if not self.has_selection():
+            return None
+        assert self.sel_anchor is not None and self.sel_head is not None
+        return (self.sel_anchor, self.sel_head) if self.sel_anchor < self.sel_head else (self.sel_head, self.sel_anchor)
+
+    def selected_text(self) -> str:
+        span = self.selected_range()
+        return "" if span is None else self.buffer[span[0] : span[1]]
+
+    def clear_selection(self) -> None:
+        self.sel_anchor = None
+        self.sel_head = None
+
+    def _drop_selection(self) -> bool:
+        """Delete the selected range, parking the caret at its start."""
+        span = self.selected_range()
+        if span is None:
+            return False
+        self.buffer = self.buffer[: span[0]] + self.buffer[span[1] :]
+        self.cursor = span[0]
+        self.clear_selection()
+        self._last_token = None
+        self._dismissed = False
+        self._recompute()
+        return True
 
     @property
     def is_multiline(self) -> bool:
@@ -93,6 +135,7 @@ class Composer:
             if self.popup_open:
                 self._accept_popup()
                 return
+            self.clear_selection()
             if self.buffer.strip():
                 text = self.buffer
                 self.clear()
@@ -122,26 +165,33 @@ class Composer:
                 step = -1 if key == "up" else 1
                 self.selected = max(0, min(len(self.completion.items) - 1, self.selected + step))
                 return
+            self.clear_selection()
             if self.is_multiline:
                 self.cursor = self._vertical_caret(-1 if key == "up" else 1)
             return
         if key == "left":
+            self.clear_selection()
             self.cursor = max(0, self.cursor - 1)
             self._recompute_soft()
             return
         if key == "right":
+            self.clear_selection()
             self.cursor = min(len(self.buffer), self.cursor + 1)
             self._recompute_soft()
             return
         if key == "home" or key == "ctrl+a":
+            self.clear_selection()
             self.cursor = 0
             self._recompute_soft()
             return
         if key == "end" or key == "ctrl+e":
+            self.clear_selection()
             self.cursor = len(self.buffer)
             self._recompute_soft()
             return
         if key == "backspace":
+            if self._drop_selection():
+                return
             if self.cursor > 0:
                 self.buffer = self.buffer[: self.cursor - 1] + self.buffer[self.cursor :]
                 self.cursor -= 1
@@ -150,15 +200,19 @@ class Composer:
                 self._recompute()
             return
         if key == "delete":
+            if self._drop_selection():
+                return
             self.buffer = self.buffer[: self.cursor] + self.buffer[self.cursor + 1 :]
             self._dismissed = False
             self._recompute()
             return
         if key == "ctrl+left":
+            self.clear_selection()
             self.cursor = self._prev_word()
             self._recompute_soft()
             return
         if key == "ctrl+right":
+            self.clear_selection()
             self.cursor = self._next_word()
             self._recompute_soft()
             return
@@ -196,6 +250,8 @@ class Composer:
         self._insert(text)
 
     def _insert(self, text: str) -> None:
+        if self.has_selection():
+            self._drop_selection()
         self.buffer = self.buffer[: self.cursor] + text + self.buffer[self.cursor :]
         self.cursor += len(text)
         self._last_token = None
@@ -242,6 +298,107 @@ class Composer:
         while i < n and self.buffer[i].isspace():
             i += 1
         return i
+
+    # ── mouse geometry ────────────────────────────────────────
+    # Maps screen cells back onto buffer offsets with the same layout
+    # math as rendering, so a press/drag in the prompt box positions
+    # the caret and selects text for editing.
+
+    def _label_vis(self) -> int:
+        return visible_len(f"│ {self.label} ")
+
+    @staticmethod
+    def _window_keep(text: str, caret_col: int, width: int) -> int:
+        """Horizontal scroll offset mirroring ``_window``."""
+        if visible_len(text) <= width:
+            return 0
+        return max(0, caret_col - width // 2)
+
+    def row_map(self, cols: int, rows_total: int, box_height: int) -> list[tuple[int, int, str, int]]:
+        """One (screen_y, line_no, line_text, window_keep) per visible row."""
+        label_vis = self._label_vis()
+        avail = max(0, cols - label_vis - 1)
+        height = box_height - 1
+        if not self.is_multiline:
+            keep = self._window_keep(self.buffer, self.cursor, avail)
+            return [(rows_total - 2, 0, self.buffer, keep)]
+        lines = self.buffer.split("\n")
+        caret_line = min(len(lines) - 1, self.buffer[: self.cursor].count("\n"))
+        max_lines = max(1, height - 1)
+        first = max(0, caret_line + 1 - max_lines)
+        y = rows_total - box_height
+        top = y + height - (1 + (caret_line + 1 - first))
+        caret_col = self.cursor - sum(len(lines[i]) + 1 for i in range(caret_line))
+        keep = self._window_keep(lines[caret_line], caret_col, avail)
+        return [
+            (top + 1 + i, idx, lines[idx], keep)
+            for i, idx in enumerate(range(first, caret_line + 1))
+        ]
+
+    @staticmethod
+    def _col_to_offset(text: str, keep: int, col: int) -> int:
+        """Char offset whose display cell contains column ``keep + col``."""
+        target = keep + col
+        display = 0
+        scanner = _WidthScanner()
+        for i, ch in enumerate(text):
+            w = max(1, scanner.feed(ch))
+            if display < keep:
+                display += w
+                continue
+            if display + w > target:
+                return i
+            display += w
+        return len(text)
+
+    @staticmethod
+    def _display_col(text: str, keep: int, offset: int) -> int:
+        """Display column of char ``offset`` relative to the window start."""
+        total = 0
+        scanner = _WidthScanner()
+        for ch in text[:offset]:
+            total += max(1, scanner.feed(ch))
+        return max(0, total - keep)
+
+    def _line_start(self, line_no: int) -> int:
+        return sum(len(line) + 1 for line in self.buffer.split("\n")[:line_no])
+
+    def offset_at(self, screen_y: int, x: int, cols: int, rows_total: int, box_height: int) -> int | None:
+        """Buffer offset under screen cell (``screen_y``, ``x``), if any."""
+        label_vis = self._label_vis()
+        for sy, line_no, text, keep in self.row_map(cols, rows_total, box_height):
+            if sy != screen_y:
+                continue
+            col = x - label_vis
+            if col <= 0:
+                return self._line_start(line_no)
+            off = self._col_to_offset(text, keep, col)
+            return self._line_start(line_no) + min(off, len(text))
+        return None
+
+    def selection_spans(self, cols: int, rows_total: int, box_height: int) -> list[tuple[int, int, int]]:
+        """(screen_y, start_col, end_col) highlight spans for the selection."""
+        span = self.selected_range()
+        if span is None:
+            return []
+        start, end = span
+        label_vis = self._label_vis()
+        avail = max(0, cols - label_vis - 1)
+        out: list[tuple[int, int, int]] = []
+        for sy, line_no, text, keep in self.row_map(cols, rows_total, box_height):
+            line_start = self._line_start(line_no)
+            line_end = line_start + len(text)
+            s = max(start, line_start)
+            e = min(end, line_end)
+            if s < e:
+                c0 = self._display_col(text, keep, s - line_start)
+                c1 = self._display_col(text, keep, e - line_start)
+                out.append((sy, label_vis + c0, label_vis + c1))
+            elif s == e == line_end and end > line_end:
+                # The selection covers this row's newline: extend the
+                # highlight to the row edge so the wrap is visible.
+                out.append((sy, label_vis + self._display_col(text, keep, len(text)), label_vis + avail))
+        return out
 
     def _vertical_caret(self, direction: int) -> int:
         if not self.buffer:

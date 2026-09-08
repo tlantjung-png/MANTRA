@@ -328,6 +328,7 @@ class TuiApp:
         self.overlay: Any = None          # menu / question / line prompt
         self._overlay_reply: queue.Queue | None = None
         self._overlay_lock = threading.Lock()  # serialize concurrent prompts
+        self._composer_press = False  # a press started inside the prompt box
         self.queued = ""                  # prompt submitted mid-turn
         self._last_ctrl_c = 0.0
         self._drag_autoscroll = 0
@@ -833,10 +834,14 @@ class TuiApp:
                 comp._popup_off = max(0, comp._popup_off - comp.max_popup)
                 self.mark_dirty()
                 return
+            if self._press_composer(ev.x, ev.y):
+                return
             if self._content_top <= ev.y < self._content_top + self._content_height:
                 self.selection.begin_press(ev.x, ev.y)
             return
         if ev.kind == "drag" and ev.button == 0:
+            if self._drag_composer(ev.x, ev.y):
+                return
             if self.selection._press_cell is not None:
                 self.selection.begin_drag(ev.x, ev.y, self.row_at)
                 self._drag_autoscroll = 0
@@ -849,6 +854,13 @@ class TuiApp:
             return
         if ev.kind == "release":
             self._drag_autoscroll = 0
+            if self._composer_press:
+                self._composer_press = False
+                comp = self.composer
+                if not comp.has_selection():
+                    comp.clear_selection()
+                self.mark_dirty()
+                return
             if ev.button == 0 and self.selection._press_cell is not None:
                 result = self.selection.end_press(
                     ev.x, ev.y, self.row_at, self._text_at
@@ -858,6 +870,53 @@ class TuiApp:
                     n = len(result[0].splitlines())
                     self.toast_message(f"copied {n} line{'s' if n != 1 else ''}")
                 self.mark_dirty()
+
+    # ── composer mouse editing ────────────────────────────────
+
+    def _composer_box(self) -> tuple[int, int, int] | None:
+        """(cols, rows, box_height) for hit-testing the prompt box."""
+        cols, rows = self.cols, self.rows
+        if cols <= 0 or rows <= 0 or self.overlay is not None:
+            return None
+        return (cols, rows, self._composer_height(rows))
+
+    def _press_composer(self, x: int, y: int) -> bool:
+        """Press inside the prompt box: place the caret, start a selection."""
+        box = self._composer_box()
+        if box is None:
+            return False
+        cols, rows, box_height = box
+        if not (rows - box_height <= y <= rows - 2):
+            return False
+        comp = self.composer
+        off = comp.offset_at(y, x, cols, rows, box_height)
+        if off is None:
+            return True  # inside the box chrome: swallow, don't touch transcript
+        self.selection.clear()
+        comp.cursor = off
+        comp.sel_anchor = off
+        comp.sel_head = off
+        self._composer_press = True
+        self._history_idx = len(self._history)
+        self.mark_dirty()
+        return True
+
+    def _drag_composer(self, x: int, y: int) -> bool:
+        """Drag after a prompt-box press: extend the selection."""
+        if not self._composer_press:
+            return False
+        box = self._composer_box()
+        if box is None:
+            return True
+        cols, rows, box_height = box
+        comp = self.composer
+        off = comp.offset_at(y, x, cols, rows, box_height)
+        if off is None:
+            return True
+        comp.sel_head = off
+        comp.cursor = off
+        self.mark_dirty()
+        return True
 
     # ── geometry helpers ──────────────────────────────────────
 
@@ -966,6 +1025,9 @@ class TuiApp:
         # the whole prompt reads as one closed rectangle with the status
         # row as its top edge.
         caret = self.composer.render(buf, rows - composer_height, composer_height - 1, cols, wall="│")
+        for sy, c0, c1 in self.composer.selection_spans(cols, rows, composer_height):
+            if c1 > c0:
+                buf.set_style(c0, sy, min(c1, cols) - c0, select_style)
         buf.set_str(0, rows - 1, "╰" + "─" * max(0, cols - 2) + "╯", hair_style)
         renderer.set_cursor(caret, rows - 2)
 

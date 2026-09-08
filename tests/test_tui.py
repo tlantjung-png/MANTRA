@@ -240,6 +240,71 @@ class ComposerTest(unittest.TestCase):
         c.consume_paste("a\r\nb\rc")
         self.assertEqual(c.buffer, "a\nb\nc")
 
+    def test_typing_replaces_the_selection(self):
+        c = Composer()
+        c.consume_paste("hello world")
+        c.sel_anchor, c.sel_head, c.cursor = 6, 11, 11
+        c.consume_key("x")
+        self.assertEqual(c.buffer, "hello x")
+        self.assertFalse(c.has_selection())
+
+    def test_backspace_deletes_the_selection(self):
+        c = Composer()
+        c.consume_paste("hello world")
+        c.sel_anchor, c.sel_head, c.cursor = 0, 6, 6
+        c.consume_key("backspace")
+        self.assertEqual(c.buffer, "world")
+        self.assertEqual(c.cursor, 0)
+
+    def test_caret_move_clears_the_selection(self):
+        c = Composer()
+        c.consume_paste("hello")
+        c.sel_anchor, c.sel_head = 0, 5
+        c.consume_key("left")
+        self.assertFalse(c.has_selection())
+
+    def test_mouse_offset_and_highlight_span(self):
+        # Single-line box of height 2: content sits on rows_total - 2,
+        # after the "│ MANTRA > " label (11 cells).
+        c = Composer()
+        c.consume_paste("hello")
+        self.assertEqual(c.offset_at(22, 11, 40, 24, 2), 0)
+        self.assertEqual(c.offset_at(22, 16, 40, 24, 2), 5)
+        self.assertIsNone(c.offset_at(10, 11, 40, 24, 2))
+        c.sel_anchor, c.sel_head = 1, 4
+        spans = c.selection_spans(40, 24, 2)
+        self.assertEqual(spans, [(22, 12, 15)])
+
+    def test_mouse_offset_multiline(self):
+        c = Composer()
+        c.consume_paste("ab\ncde")
+        rows = c.row_map(40, 24, 4)
+        self.assertEqual([sy for sy, _, _, _ in rows], [21, 22])
+        self.assertEqual(c.offset_at(21, 11, 40, 24, 4), 0)
+        self.assertEqual(c.offset_at(22, 12, 40, 24, 4), 4)
+
+    def test_pasted_enter_inserts_instead_of_submitting(self):
+        # A burst of key-downs is a paste: its newlines insert, and the
+        # prompt only submits on a lone, typed Enter.
+        from types import SimpleNamespace
+
+        def decode(uchar, vk, pasted, mods=frozenset()):
+            key = SimpleNamespace(wVirtualKeyCode=vk, uChar=uchar, dwControlKeyState=0)
+            return Backend()._win_key_events(key, mods, pasted)
+
+        self.assertEqual(decode("\r", 0x0D, False), [Key("enter")])
+        self.assertEqual(decode("\r", 0x0D, True), [Key("newline")])
+        self.assertEqual(
+            decode("\r", 0x0D, True, frozenset({"shift"})), [Key("newline", frozenset({"shift"}))]
+        )
+        self.assertEqual(decode("a", 0x41, True), [Key("a")])
+        # End to end: the pasted newline lands in the buffer, nothing submits.
+        c = Composer()
+        for ev in decode("a", 0x41, True) + decode("\r", 0x0D, True) + decode("b", 0x42, True):
+            c.consume_key(ev.key, ev.mods)
+        self.assertEqual(c.buffer, "a\nb")
+        self.assertIsNone(c.submitted)
+
 
 class SelectionTest(unittest.TestCase):
     def _rows(self, y=None):

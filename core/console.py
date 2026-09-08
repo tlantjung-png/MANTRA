@@ -95,11 +95,9 @@ def _resolve_data_path(*parts: str) -> str:
 KNOWN_FAILURES_PATH = _resolve_data_path("knowledge", "known-failures.md")
 
 HELP_TEXT = """Commands:
-  /model                provider & model — add endpoint, pick a model
-  /model key [name]     replace stored key
+  /model                provider & model — add endpoint, pick a model, replace key
   /fix                  send the last failure to the agent for a fix
   /sessions             saved conversations — browse and resume
-  /sessions <name>      resume that session directly
   /help                 show help
   /workspace            show workspace path + files
   /memory               show memory file
@@ -3332,8 +3330,7 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
 
 
 SLASH_COMMANDS = [
-    ("/model", "provider & model — add endpoint, pick a model"),
-    ("/model key", "replace stored key"),
+    ("/model", "provider & model — add endpoint, pick a model, replace key"),
     ("/fix", "send the last failure to the agent for a fix"),
     ("/sessions", "saved conversations — browse and resume"),
     ("/help", "show help"),
