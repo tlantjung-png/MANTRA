@@ -42,6 +42,7 @@ Works across domains while remaining brand-agnostic unless the user supplies bra
 8. Do not force slang, contractions, fragments, jokes, or rhetorical questions.
 9. Avoid generic hype that could apply to any product.
 10. Do not claim that copy is guaranteed to evade AI detectors. Aim for genuinely natural writing instead.
+11. Avoid hyperbole and exaggerated claims.
 
 ## Procedure
 

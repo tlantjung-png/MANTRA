@@ -35,6 +35,7 @@ Do not use this skill to change the author's actual position, invent personal ex
 8. Do not force contractions, slang, fragments, jokes, rhetorical questions, or self-corrections when they do not fit the writer or context.
 9. Do not optimize for a numerical detector score. Detector outputs are inconsistent and are not a reliable definition of human writing.
 10. Never claim that a rewrite is guaranteed to be "100% human" or guaranteed to bypass a detector.
+11. Avoid hyperbole and exaggerated claims.
 
 ## Procedure
 
