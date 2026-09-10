@@ -1,8 +1,6 @@
-"""Tool call repairs — validate-then-repair for LLM tool inputs.
+"""Tool call repairs — validate-then-repair for model tool inputs.
 
-Adapted from Command Code harness engineering /tool-call-repairs.
-
-Four shape repairs cover ~90% of open-model failures:
+Four shape repairs cover most open-model failures:
   1. null-for-optional: {"timeoutMs": null} → {}
   2. json-array-parse: '"[\"a\",\"b\"]"' → ["a","b"]
   3. empty-placeholder: {} where array expected → handle
@@ -192,6 +190,8 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
             "run_command": {"command", "timeout"},
             "search_code": {"query"},
             "find_file": {"pattern"},
+            "extract_document": {"path", "max_chars"},
+            "query_tree": {"pattern", "root"},
             "web_fetch": {"url", "max_chars"},
             "git_diff": set(),
             "git_reset": set(),

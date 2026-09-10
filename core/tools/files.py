@@ -1,6 +1,5 @@
-"""File tools: read, write, edit, list with caps, ledger, and harness repairs.
+"""File tools: read, write, edit, list with caps, ledger, and argument repairs.
 
-Adapted from Command Code read-tool harness engineering:
 - 3 ceilings: 2000 lines / 128KB / 2000ch per line
 - Recovery notes instead of silent empty
 - Dedup self-expiring cache
@@ -26,17 +25,16 @@ _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 _MAX_READ_CHARS = 20000  # legacy cap for non-windowed callers
 _MAX_WRITE_CHARS = 1_000_000
 
-# Command Code ceilings
 _LINE_WINDOW = 2000
 _BYTE_BUDGET = 128 * 1024  # 128KB
 _PER_LINE_CLAMP = 2000
 
 # Cached read results are kept only below this size so the dedup cache
-# stays bounded (~100 entries x 100KB worst case).
+# stays bounded (about 100 entries x 100KB worst case).
 _DEDUP_CACHE_MAX_CHARS = 100_000
 
 def _is_strict_positive_int(s: str, allow_zero: bool = False) -> bool:
-    """harness Convert-StrictPositiveInt: regex ^(0|[1-9][0-9]*)$, no 2abc, no 1.5"""
+    """Strict non-negative integer string: ^(0|[1-9][0-9]*)$, no 2abc, no 1.5."""
     if not isinstance(s, str):
         s = str(s)
     if not re.match(r"^(0|[1-9][0-9]*)$", s):
@@ -51,7 +49,8 @@ def _is_strict_positive_int(s: str, allow_zero: bool = False) -> bool:
     return True
 
 def _is_blocked_path_harness(path: str) -> str | None:
-    """harness Test-BlockedPath: device namespace, trailing dot/space, ADS, CON/PRN etc."""
+    """Return a reason string for blocked path shapes: device namespace,
+    trailing dot/space, alternate data streams, device names."""
     if not path or not path.strip():
         return "path is empty"
     if path.startswith("\\\\?\\") or path.startswith("\\\\.\\"):

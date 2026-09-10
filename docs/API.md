@@ -6,11 +6,23 @@ Two entry points are exposed.
 
 The interactive console accepts optional flags to select the configuration document, override the workspace location, handle a single message non-interactively before exiting, override the configured model, set the reasoning effort, override the endpoint address, and select the approval mode, plus a flag to disable styling. It restores the operator's saved active endpoint and model selections at startup when no explicit overrides are given, and it guides a first-time operator through endpoint configuration before opening the prompt.
 
-The headless runner requires paths to a configuration document and a task document. It returns a process exit status: zero when the evaluator passed, one when it failed, and two for configuration or task-file errors. Input paths are resolved against the working directory and then the project root, while relative log paths inside the configuration are anchored to the project root so the same configuration works from any working directory. The resolved paths are the effective locations used for the run.
+The headless runner requires paths to a configuration document and a task document. It returns a process exit status: zero when the evaluator passed, one when it failed, and two for configuration or task-file errors. Input paths are resolved against the working directory and then the project root, while relative log paths inside the configuration are anchored to the project root so the same configuration works from any working directory.
 
 ## Interactive Commands
 
 Commands are invoked with a leading slash. The full set is: /exit and /quit to leave the console (with an autosave first), /help or a bare / to show the command help, /workspace to show the workspace path and files, /memory to show the memory file, /diff to show uncommitted changes, /fix to send the most recent failure back to the agent for a diagnosis and a suggested fix, /undo to discard changes after confirmation, /model to manage providers and models (add an endpoint, pick a model, replace a stored key), /reasoning and /effort to set the thinking effort, /approve to select the approval mode, /cost to show token usage and cache metrics, /compact to summarize the conversation, /clear and /reset to clear the conversation while keeping files, /sessions to browse, list, or resume saved conversations, /goal to set, show, or clear a standing objective, /todo to manage a session checklist, /workflow to create, show, launch, or remove workflow sequences, /skills and /skill to discover and attach skills, and /verbose to toggle per-tool detail. Any other line starting with a slash that looks like a path is handed to the agent rather than rejected.
+
+## Tools Exposed to the Model
+
+The default tool list covers file reading, writing, editing, and directory listing; command execution with shell output reading and background-task termination; code search and file finding; document extraction and tree querying; version-control diff and reset; and web fetching. Tool names are normalized (case and dashes) before lookup, and an alias maps the legacy extraction name to its canonical form.
+
+- **read_file / write_file / edit_file / list_dir** — file operations confined to the workspace, with byte and line caps, binary detection, and atomic writes.
+- **run_command / shell_output / kill_shell** — shell execution with timeout and abort, cursor-based output reads, and process-tree termination for background tasks.
+- **search_code / find_file** — literal text search and filename search across the workspace, bounded by result, scan, size, and line-length ceilings.
+- **extract_document** — bounded plain-text extraction from a single structured file (markup, JSON, XML, CSV, markdown, ini/toml-ish). Unrenderable formats are reported as a note; malformed structured files fall back to a short raw snippet.
+- **query_tree** — file-tree pattern query: literal paths, globs, and a small brace-shaped syntax for structural presence checks. Targets are re-validated against the workspace on every descent step.
+- **git_diff / git_reset** — version-control change display and discard with confirmation.
+- **web_fetch** — bounded retrieval of a URL with text extraction and private-network blocking.
 
 ## File References
 
@@ -47,15 +59,13 @@ The following environment variables are honored.
 
 ## Abstract Interfaces
 
-The language model interface accepts a list of messages, optional tool schemas, and an optional streaming callback. It returns a normalized response that is either a final answer or a collection of tool invocations, each with an identifier, name, and arguments, plus usage metadata including prompt and completion token counts and cached token counts. The streaming callback, when supplied, receives content fragments as they arrive. Implementations cap total streamed content, bound single-line buffers, and enforce limits on both consecutive and total malformed fragments.
+The language model interface accepts a list of messages, optional tool schemas, and an optional streaming callback. It returns a normalized response that is either a final answer or a collection of tool invocations, each with an identifier, name, and arguments, plus usage metadata including prompt and completion token counts and cached token counts. The streaming callback, when supplied, receives content fragments as they arrive.
 
-The sandbox interface provisions the environment for a task, executes shell commands with timeout and abort support, and reads and writes files relative to the workspace. Provisioning optionally fetches a repository, validates the repository address and commit identifier, and runs a setup command. Execution results include exit status, standard output, standard error, and a timeout flag. File operations reject escapes via resolved path checks at read, write, and directory-creation time, check each component of newly created parent chains for symbolic links, and cap read and execution output. Writes stage through a uniquely named temporary file before the atomic replace. Cleanup is idempotent and distinguishes between sandboxes that own their directory and those that were given an existing workspace.
+The sandbox interface provisions the environment for a task, executes shell commands with timeout and abort support, and reads and writes files relative to the workspace. Execution results include exit status, standard output, standard error, and a timeout flag. A command-screening hook lets a sandbox reject commands before execution so foreground and background paths share one implementation. Cleanup is idempotent.
 
-The tool interface exposes a name, description, and parameter schema. Execution is performed against a sandbox and returns an observation string that is appended to the conversation. Tool schemas are passed to the language model as part of the function-calling specification. File tools share a single edit ledger that enforces read-before-edit within a session and tracks whether the last view was partial.
+The tool interface exposes a name, description, and parameter schema. Execution is performed against a sandbox and returns an observation string that is appended to the conversation. Schemas are deep-copied per call so callers cannot mutate a tool's declared parameters. File tools share a single edit ledger that enforces read-before-edit within a session and tracks whether the last view was partial.
 
-The evaluator interface examines the sandbox after the orchestrator finishes and never raises. It returns a verdict indicating pass or fail, a descriptive detail string, and optional metrics. One implementation runs a shell command and interprets a zero exit status without timeout as pass, with per-task override support, tail truncation, and execution errors surfaced as failed verdicts rather than exceptions. The other always reports a neutral result for interactive sessions without automated grading.
-
-The logger interface receives structured events and never propagates input or output errors. Implementations append one record per line with a timestamp and use both in-process and inter-process locks with verified stale handling. The event bus interface allows subscription of handlers and fans out events synchronously while suppressing handler exceptions to isolate observers.
+The evaluator interface examines the sandbox after the orchestrator finishes and never raises. It returns a verdict indicating pass or fail, a descriptive detail string, and optional metrics. The logger interface receives structured events and never propagates input or output errors. The event bus interface allows subscription of handlers and fans out events synchronously while suppressing handler exceptions to isolate observers.
 
 ## Registry
 

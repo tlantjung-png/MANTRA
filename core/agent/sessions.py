@@ -30,8 +30,7 @@ def sessions_dir() -> Path:
 
 
 def _slug(text: str) -> str:
-    # Slug: lowercase alphanumeric runs joined by hyphens, shared by all
-    # name-derivation paths.
+    # Lowercase alphanumeric runs joined by hyphens; shared by all name paths.
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
 
 

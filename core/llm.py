@@ -31,10 +31,9 @@ DeltaCallback = Callable[[str], None]
 # Mid-stream drop surfaces as IncompleteRead, not OSError; handle explicitly.
 IncompleteRead = http.client.IncompleteRead
 
-# Hosts that accept requests with no credential at all. The chat client
-# must agree with the console's keyless-endpoint guidance: asking an
-# operator to invent a key for a local inference server, after the setup
-# flow told them none is needed, is a contradiction.
+# Hosts that accept requests with no credential at all. Kept in sync
+# with the console's keyless-endpoint guidance so the setup flow and the
+# client never contradict each other.
 KEYLESS_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1")
 
 

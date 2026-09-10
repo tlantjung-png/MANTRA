@@ -13,12 +13,13 @@ task end to end and exits with a pass/fail status.
 - **Git.** Used for workspace setup and for inspecting changes (`/diff`, `/undo`).
 - **Network access to a language-model endpoint** plus an API key for it
   (any OpenAI-compatible endpoint works).
-- **A container runtime** (e.g. Docker) is optional. It is only needed for
-  the container sandbox, which confines untrusted work. Trusted daily work
-  uses the host sandbox and needs nothing extra.
+- **A container runtime** is optional. It is only needed for the container
+  sandbox, which confines untrusted work. Trusted daily work uses the host
+  sandbox and needs nothing extra.
 
 There are no mandatory Python dependencies: core operation relies on the
-standard library only.
+standard library only. An optional parsing library is required only when
+configuration documents are written in YAML instead of JSON.
 
 ## Installation
 
@@ -46,8 +47,10 @@ Launch the console straight from the repository folder:
 mantra.cmd
 ```
 
-The launcher detects whether the package is installed and falls back to the
-source tree automatically, so both options behave identically.
+The launcher probes whether the package resolves from this repository and
+prepends the source tree to the module search path when it does not, so
+both options behave identically. The probe also rejects a foreign `core`
+package from site-packages, so a different package cannot hijack the console.
 
 ## First Run
 
@@ -66,11 +69,8 @@ time with the `/model` command:
 /model key [name]               replace a stored key
 ```
 
-Example — add a provider and pick a model in one go:
-
-```text
-/model https://api.openai.com/v1 sk-... gpt-4o
-```
+Local inference servers on the loopback interface need no key at all; the
+setup flow tells you when none is required.
 
 Keys are never written to the run configuration. They resolve from the
 environment first (e.g. `OPENAI_API_KEY`) and then from a restricted
@@ -97,10 +97,12 @@ Useful commands (see `/help` inside the console for the full list):
 | `/sessions` | Browse, save, and resume conversations                    |
 | `/goal`     | Set, show, or clear a standing objective for the session  |
 | `/todo`     | Manage a session checklist                                |
+| `/workflow` | Create and launch ordered prompt sequences                |
+| `/skills`   | Discover and attach skill procedures                      |
 | `/approve`  | Set approval mode: `default`, `auto`, `yolo`, or `plan`   |
 | `/compact`  | Summarise a long conversation to free context             |
 | `/memory`   | Show the workspace memory file                            |
-| `/cost`     | Show token usage                                          |
+| `/cost`     | Show token usage and cache metrics                        |
 | `/verbose`  | Toggle per-tool detail output                             |
 | `/clear`    | Clear the conversation (files are kept)                   |
 | `/exit`     | Leave the console (autosaves first)                       |
@@ -131,6 +133,11 @@ result with the configured test command, writes a structured event log to
 configuration/task-file errors. Relative log paths are anchored to the
 project root so the same configuration works from any directory.
 
+In headless mode nobody can answer an approval prompt, so the configured
+mode maps to its closest non-interactive form: `plan` refuses every
+mutation, `default` and `auto` allow ordinary mutations but refuse
+destructive ones, and `yolo` allows everything.
+
 ## Configuration
 
 - **Per-run config** (`--config`): model connection, sandbox provider,
@@ -141,7 +148,8 @@ project root so the same configuration works from any directory.
   files are quarantined to a backup instead of being overwritten.
 - **Credentials** (`~/.mantra/credentials.json`): stored keys, readable
   only by your user account. Prefer environment variables on shared
-  machines.
+  machines; stored credentials are plaintext protected only by file
+  permissions.
 - **Sessions** (`~/.mantra/sessions/`): saved conversations.
 - **Workspace memory** (`<workspace>/.mantra/memory.md`): durable notes
   the system appends automatically after each turn.
@@ -149,20 +157,24 @@ project root so the same configuration works from any directory.
 ## Safety Notes
 
 - **Two sandboxes.** The host sandbox runs commands directly in the
-  workspace folder — fast, but not a containment boundary. The container
-  sandbox runs everything inside a disposable container with memory/CPU
-  limits and reduced privileges. Use the container sandbox for untrusted
-  input or repositories you do not control.
+  workspace folder — fast, but not a containment boundary: its traversal
+  screen is a heuristic, and unrecognized command shapes run with the full
+  authority of your user account. The container sandbox runs everything
+  inside a disposable container with memory/CPU limits, reduced privileges,
+  and an unprivileged user. Use the container sandbox for untrusted input
+  or repositories you do not control.
 - **Approvals.** The default mode asks before destructive actions. Every
   decision is written to a redacted audit log.
 - **Path confinement.** All file and command tools are confined to the
-  workspace; escapes via `..` or symlinks are rejected, and writes are
-  atomic (staged to a temporary file, then moved into place).
+  workspace; escapes via `..` or symlinks are rejected at every operation,
+  parent chains are checked for symbolic links, and writes are atomic
+  (staged to a uniquely named temporary file, then moved into place).
 - **Secrets.** Command text and tool output are redacted for known secret
-  patterns before being persisted to logs, but treat log files as
-  sensitive anyway.
+  patterns before being persisted to logs, and the host sandbox strips
+  credential-shaped variables from the child environment, but treat log
+  files as sensitive anyway.
 
-See `docs/ARCHITECTURE.md` and `docs/DEPLOYMENT.md` for the full details.
+See `docs/` for the full documentation set.
 
 ## Tests
 
@@ -174,21 +186,43 @@ python -m pytest tests/ -q
 
 It covers the agent loop, context budgeting, configuration validation,
 file-tool safety, approval classification, session persistence, the
-streaming parser, model discovery, and the terminal input layer. Live
-probes for end-to-end verification with real credentials are available
-under `tests/` when needed.
+streaming parser, model discovery, the terminal input layer, and the
+search, document-extraction, and tree-query tools. Live probes for
+end-to-end verification with real credentials are available under
+`tests/` when needed.
+
+## Workspace Reading Tools
+
+Beyond the file and command tools, the agent has three bounded helpers for
+reading the workspace without streaming raw bytes into the conversation:
+
+- **search_code / find_file** — literal substring search across workspace
+  text files, and filename substring search. The walk honors ignore files,
+  never descends into ignored or symlinked-out directories, skips files
+  above 500 kilobytes and non-text extensions, and notes when result or
+  scan ceilings are reached.
+- **extract_document** — read a single structured file and return a
+  bounded plain-text representation for common formats (HTML, JSON, XML,
+  CSV, markdown, ini/toml-ish). Formats it cannot render are reported as
+  a note instead of being silently parsed; malformed structured files fall
+  back to a short raw snippet.
+- **query_tree** — a small tree-pattern query for file-tree structure:
+  literal paths, simple globs, and a tiny brace-style shape syntax
+  (`{dir}`, `{dir/*}`, `{dir/*.ext}`, `{dir/**/pattern}`, one-level
+  descent into nested directories). A navigation aid, not a code-query
+  engine.
 
 ## Documentation Map
 
-- `docs/ARCHITECTURE.md` — layers, module interactions, trade-offs.
-- `docs/SETUP.md` — prerequisites, installation, local development.
+- `docs/Architecture.md` — layers, module interactions, trade-offs.
+- `docs/Setup.md` — prerequisites, installation, local development.
 - `docs/API.md` — entry points, commands, configuration, environment variables.
-- `docs/DEPLOYMENT.md` — build, testing, sandbox levels, runbooks.
-- `docs/CONFIGURATION.md` — loader behaviour and user-wide settings.
-- `docs/CONSOLE.md` — terminal interface and session management.
-- `docs/CORE.md` — orchestration, context, knowledge, approvals, events.
-- `docs/IMPLEMENTATIONS.md` — concrete clients, sandboxes, tools, loggers.
-- `docs/INTERFACES.md` — abstract contracts.
+- `docs/Deployment.md` — build, testing, sandbox levels, runbooks.
+- `docs/configuration.md` — loader behaviour and user-wide settings.
+- `docs/console.md` — terminal interface and session management.
+- `docs/core.md` — orchestration, context, knowledge, approvals, events.
+- `docs/implementations.md` — concrete clients, sandboxes, tools, loggers.
+- `docs/interfaces.md` — abstract contracts.
 - `docs/ADOPTION.md` — what was kept and what was left out.
 
 ## License

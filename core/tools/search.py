@@ -62,11 +62,24 @@ def _load_ignore_matcher(root: str):
     return _ignored
 
 
+def _normalize_grep_lines(lines: list[str]) -> list[str]:
+    """Normalize shell-grep output into the tool's canonical path:line: text shape."""
+    out: list[str] = []
+    for raw in lines:
+        if not raw:
+            continue
+        # Keep only lines that look like path:lineno: content markers.
+        if ":" in raw:
+            out.append(raw.rstrip())
+    return out
+
+
 class SearchCodeTool(Tool):
     name = "search_code"
     description = (
-        "Search for a literal substring across text files in the workspace. "
-        "Returns matching lines prefixed with 'path:line'."
+        "Search text files in the workspace for a literal substring and return "
+        "matching lines with file path and line number. Use it for code search, "
+        "symbol lookups, and quick text presence checks across the workspace."
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -94,7 +107,7 @@ class SearchCodeTool(Tool):
             result = sandbox.exec(f"grep -Frn {skip_flags} -- {quoted} .")
             if result.exit_code != 0:
                 return "(no matches)"
-            return result.stdout[:20000] if result.stdout.strip() else "(no matches)"
+            return "\n".join(_normalize_grep_lines(result.stdout.strip().splitlines()))[:20000] if result.stdout.strip() else "(no matches)"
 
         hits: list[str] = []
         real_root = os.path.realpath(root)
@@ -212,7 +225,7 @@ class FindFileTool(Tool):
             result = sandbox.exec(
                 f"find . -name {quoted} -not -path './.git/*'"
             )
-            return result.stdout[:20000] if result.exit_code == 0 else "(no matches)"
+            return "\n".join(_normalize_grep_lines(result.stdout.strip().splitlines()))[:20000] if result.exit_code == 0 and result.stdout.strip() else "(no matches)"
 
         matches = []
         real_root = os.path.realpath(root)

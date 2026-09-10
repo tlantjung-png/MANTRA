@@ -24,10 +24,8 @@ _LOCK_HARD_CEILING_SECONDS = 60.0
 if os.name == "nt":  # pragma: no cover - Windows-only
     import ctypes
 
-    # use_last_error captures the Win32 last-error per call; without it
-    # ctypes.get_last_error() would read a stale value and the not-found
-    # probe could misreport a dead process as alive, wedging the stale
-    # lock forever.
+    # use_last_error is required: without it the not-found probe can read
+    # a stale error and misreport a dead process as alive.
     _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 

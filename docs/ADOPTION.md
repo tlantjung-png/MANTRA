@@ -26,7 +26,15 @@ A daily-driver agent needs a gate between a requested tool and an executed actio
 
 ### Turn-Aware Context Management
 
-Conversation history is bounded and turn-aware, preserving the initial system prompt and task while removing the oldest complete turn first to avoid orphaned tool results, with repeated truncation and turn removal until within budget and with single-message reservation.
+Conversation history is bounded and turn-aware, preserving the initial system prompt and task while removing the oldest complete turn first to avoid orphaned tool results, with repeated truncation and turn removal until within budget and with single-message reservation applied at seeding as well as appending.
+
+### Tool-Call Argument Repair
+
+Validate-then-repair handling of model tool inputs was adopted in a compact form: alias resolution, null stripping, JSON-string parsing, numeric coercion, path aliasing, and markdown-link unwrapping, always validating first and re-validating after repair.
+
+### Bounded Workspace Reading
+
+Literal text search, filename search, single-file structured extraction, and tree-pattern querying were adopted as bounded reading primitives: every tool has result, scan, size, and output ceilings, honors ignore files and symlink confinement, and reports when a ceiling is reached instead of silently truncating.
 
 ## Adopted Later
 
@@ -38,4 +46,4 @@ Host-level orchestration and permission plumbing, multi-agent fan-out, integrity
 
 ## Current State After Remediation
 
-The adopted features now include hardened path confinement at every file and command boundary including encoded forms, owner-only permissions for staged container files and background logs, bounded streaming and memory handling with both consecutive and total limits, validated configuration limits with unknown-key rejection, and validated container inputs. A later hardening pass added process-group isolation for background tasks with shared tree-kill semantics, uniquely named staging files for atomic writes, a byte-explicit terminal input decoder with bounded bracketed pastes and modifier-aware arrow keys, a locked handoff between prompt submission and turn teardown, single-pass transcript sanitization without forgeable internal markers, and display-column caret arithmetic in the prompt box. The suite of adopted ideas remains small, test-locked, and free of host-specific dependencies, preserving the original goal of a personal daily driver that is easy to move and easy to reason about.
+The adopted features now include hardened path confinement at every file and command boundary including encoded forms, owner-only permissions for staged container files and background logs, bounded streaming and memory handling with both consecutive and total limits, validated configuration limits with unknown-key rejection, and validated container inputs. A later hardening pass added process-group isolation for background tasks with shared tree-kill semantics, uniquely named staging files for atomic writes, a byte-explicit terminal input decoder with bounded bracketed pastes and modifier-aware arrow keys, a locked handoff between prompt submission and turn teardown, single-pass transcript sanitization without forgeable internal markers, display-column caret arithmetic in the prompt box, and credential-shaped variable stripping in the host sandbox child environment. The suite of adopted ideas remains small, test-locked, and free of host-specific dependencies, preserving the original goal of a personal daily driver that is easy to move and easy to reason about.

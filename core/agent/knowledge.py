@@ -13,9 +13,8 @@ from typing import Any
 
 _memory_lock = threading.Lock()
 
-# Lock wait and stale thresholds for memory writes. The wait is a little
-# longer than the other stores because append_memory runs on the
-# interactive turn path, where brief contention is worth absorbing.
+# Memory-write lock thresholds. The wait is slightly longer than other
+# stores because append_memory runs on the interactive turn path.
 _LOCK_WAIT_SECONDS = 1.5
 _LOCK_STALE_SECONDS = 10.0
 

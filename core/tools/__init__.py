@@ -1,1 +1,1 @@
-"""Tool implementations: command, file, ledger, search, and web tools."""
+"""Tool implementations: command, file, ledger, search, extract, tree query, and web tools."""

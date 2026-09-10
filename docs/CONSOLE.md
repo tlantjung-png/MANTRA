@@ -20,9 +20,9 @@ While a task streams, a turn-scoped reader keeps native mouse selection working 
 
 The line editor reads single keys and provides completion for commands and workspace paths, with handling for navigation keys, deletion, and history, and a popup that can be dismissed or re-invoked via a dedicated key. The popup supports filtering as the operator types, selection via arrow keys, a hint area, and a count hint when the terminal is too small to render. Multi-line input renders as an upward-growing paste box with a size chip. Bracketed paste is assembled with an idle timeout, and mouse drag or click on a transcript line copies the selected text to the clipboard with a status flash. When standard input or output is not a terminal, the editor falls back to plain line input.
 
-## File References
-
 The completion popup for slash commands and at-mentions is a window that follows the selection; the overflow row pages the list by whole windows, by mouse click, or by running the selection past the edge. The mouse is captured only while the popup is open, so the terminal's native text selection keeps working the rest of the time. Dismissing the popup with the escape key lasts until the text changes, so a stray escape can never silence suggestions for the rest of the prompt, and the popup also works inside the multi-line paste box. While a turn is running, the escape key interrupts it exactly like a single control-c.
+
+## File References
 
 At-sign mentions are expanded by resolving tokens relative to the workspace, rejecting escapes via resolved path checks, and expanding globs with caps on hits and entries. Each file is capped, the total attached content is capped, and unknown references are reported. Directory listings for globs are limited, and content is truncated with a marker when caps are exceeded.
 
@@ -40,4 +40,4 @@ Auto-compaction summarizes the conversation via the language model client when t
 
 ## Persistence
 
-The session autosaves after each turn once the conversation is substantial, so a closing window can be resumed from the transcript list. Session save and load enforce size caps on file and payload, and path validation checks the resolved absolute form against allowed directories for both absolute and relative inputs.
+The session autosaves after each turn once the conversation is substantial, so a closing window can be resumed from the transcript list. Session save and load enforce size caps on file and payload, and path validation checks the resolved absolute form against allowed directories for both absolute and relative inputs, compared case-insensitively on platforms where path case does not distinguish files.

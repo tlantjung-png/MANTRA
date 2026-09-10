@@ -21,10 +21,9 @@ DEFAULT_FILE = {
     "endpoints": {},
     "active": {"endpoint": "", "model": "", "reasoning_effort": None},
     "skills": {
-        # Whether the router may attach a skill/bundle to a plain prompt. Kept
-        # here rather than in the config because it is a preference the
-        # operator switches once, and config.json is an input, not a
-        # scratchpad - nothing in MANTRA writes back to it.
+        # Skill auto-attach lives here, not in the run config: it is a
+        # one-time operator preference, and the run config is never written
+        # back to by the system.
         "auto": True,
         "auto_bundle": True,
     },

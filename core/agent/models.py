@@ -27,14 +27,10 @@ _REASONING_HINTS = (
 )
 _REASONING_RE = re.compile("|".join(re.escape(h) for h in _REASONING_HINTS), re.IGNORECASE)
 
-# Entries a gateway advertises that chat completions cannot use. They
-# are dropped rather than shown: an embedding or a text-to-speech model
-# in a chat picker is not a neutral extra row, it is a wrong answer the
-# operator has to recognise and skip, and on a large account they are
-# most of the list.
-# "instruct" used to be filtered outright, which silently hid perfectly
-# ordinary chat models whose names happen to contain it. Only the legacy
-# completion families are noise; everything else stays in the catalogue.
+# Entries chat completions cannot use are dropped, not shown: an
+# embedding or speech model in a chat picker is a wrong answer the
+# operator would have to skip. Only legacy completion families are
+# filtered; ordinary chat models stay in the catalogue.
 _NOISE_RE = re.compile(
     r"("
     r"embedding|whisper|transcri\w*|speech|audio|realtime|"

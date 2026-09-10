@@ -27,9 +27,8 @@ class EventBus:
             try:
                 handler(event, payload)
             except Exception as exc:  # noqa: BLE001 - observer isolation
-                # One broken observer must not kill the fan-out, but a
-                # silently swallowed failure hides real bugs: report the
-                # handler name and a bounded error snippet to stderr.
+                # One broken observer must not kill the fan-out; report it
+                # to stderr so the failure is never silent.
                 name = getattr(handler, "__name__", repr(handler))
                 print(
                     f"[events] handler {name} failed on {event!r}: {str(exc)[:200]}",

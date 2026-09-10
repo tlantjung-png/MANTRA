@@ -21,8 +21,10 @@ console's bounded tools return only what matters.
   so an edit after a capped read is safe.
 - `list_dir` returns one line per directory entry, capped and sorted, instead of a
   raw `ls`.
-- `search_code` returns the top matches with line numbers, capped, instead of raw
-  `grep`.
+- `search_code` searches text files for a literal substring and returns matching lines
+  with file path and line number, capped, instead of raw `grep`.
+  Use it for code search, symbol lookups, and quick text presence checks across the
+  workspace.
 - The console renders `git diff` output and edit diffs as paged old/new panes
   (capped, with "N more diff lines" notes) instead of dumping a full patch.
 

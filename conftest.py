@@ -1,11 +1,7 @@
-"""Test isolation for the whole suite.
+"""Test isolation: redirect session and audit stores to a temp directory.
 
-Console turns call ``session.autosave()``, which writes into the real
-sessions store (``~/.mantra/sessions`` by default), and
-``ApprovalPolicy.check`` appends to the real pre-tool-use audit log.
-Point ``MANTRA_SESSIONS`` and ``MANTRA_PRE_TOOL_USE_LOG`` at fresh temp
-paths for the duration of the run so no test leaks a stray file into the
-developer's store or logs.
+Console autosave and the approval audit log otherwise write to the real
+user stores; both are pointed at fresh temp paths for the run.
 """
 
 from __future__ import annotations

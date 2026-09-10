@@ -27,6 +27,7 @@ from core.tools.files import (
     WriteFileTool,
 )
 from core.tools.search import FindFileTool, SearchCodeTool
+from core.tools.extract import ExtractDocumentTool, QueryTreeTool
 from core.tools.web import WebFetchTool
 from core.types import Evaluator
 from core.types import LLMClient
@@ -65,6 +66,8 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         KillShellTool,
         SearchCodeTool,
         FindFileTool,
+        ExtractDocumentTool,
+        QueryTreeTool,
         GitDiffTool,
         GitResetTool,
         WebFetchTool,
@@ -82,6 +85,9 @@ def _normalize_tool_name(name: str) -> str:
 
 
 TOOL_REGISTRY["webfetch"] = WebFetchTool
+# Backwards-compat alias: the extraction tool was briefly registered as
+# "extract"; its canonical name is ExtractDocumentTool.name = "extract_document".
+TOOL_REGISTRY["extract"] = ExtractDocumentTool
 
 
 def build_llm(config: dict) -> LLMClient:

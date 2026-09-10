@@ -15,10 +15,9 @@ BONE_BOLD = "1;38;5;255"  # strongest emphasis (H1, bold inline, keywords)
 ASH_ITAL  = "3;38;5;250"  # italics when the terminal honours SGR 3
 
 # --- accent (identity) ------------------------------------------------
-# Bright crimson, used where identity or intent matters: the wordmark,
-# the agent signature, selection, the spinner. One accent across the
-# whole UI so the top bar and the transcript share a single colour.
-# 204 (light red) keeps the identity readable on dark backgrounds.
+# One accent across the whole UI (wordmark, selection, spinner) so the
+# top bar and transcript share a single colour. 204 stays readable on
+# dark backgrounds.
 BLOOD      = "38;5;204"
 BLOOD_BOLD = "1;38;5;204"
 

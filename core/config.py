@@ -35,6 +35,8 @@ DEFAULTS = {
         "kill_shell",
         "search_code",
         "find_file",
+        "extract_document",
+        "query_tree",
         "git_diff",
         "git_reset",
         "web_fetch",

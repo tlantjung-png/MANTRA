@@ -3,6 +3,7 @@
 | Skill | Function |
 |---|---|
 | `adopt-workspace` | Adopt a new project into MANTRA - seed its workspace .mantra state directory with a memory file and known-failure registry so every session has somewhere to read and write from day one. |
+| `search-workflow` | Use this repo's search, extraction, and web tools like a unified grep/markitdown-style workflow: literal-first search, bounded document extraction, tree navigation, and web fetch as reading primitives. |
 | `analytics` | Debug console and agent-loop issues by reducing the repo's JSONL event logs and per-session signals into one correlated, prioritized report of bugs, failures, anomalies, per-tool metrics, and token usage. Use to find where a feature is failing or to audit health. |
 | `api-endpoint` | Add or review an API endpoint or webhook using the existing contract, validation, authentication, error, and test patterns. |
 | `changelog` | Write user-facing release notes from verified repository history, clearly separating current, planned, changed, fixed, and removed behavior. |
