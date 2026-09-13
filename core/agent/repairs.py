@@ -140,7 +140,7 @@ def canonical_command(arguments: dict[str, Any]) -> str:
     """The run_command payload under its canonical ``command`` key.
 
     Alias spellings (cmd, shellCommand, ...) resolve to the canonical
-    value so dedup and session keys agree with the repair pass (D4).
+    value so dedup and session keys agree with the repair pass.
     """
     command = str(arguments.get("command") or "").strip()
     if command:
@@ -151,8 +151,8 @@ def canonical_command(arguments: dict[str, Any]) -> str:
     return ""
 
 def _is_json_array_string(s: str) -> bool:
-    # Matches arrays, objects, and quoted strings despite the name; also
-    # gates the object-string parse path below.
+    # The name is historical: the pattern also matches arrays, objects,
+    # and quoted strings, and gates the object-string parse path below.
     s = s.strip()
     return (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")) or (s.startswith('"') and s.endswith('"'))
 

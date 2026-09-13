@@ -84,11 +84,24 @@ from core.tui.overlays import (
 )
 from core.tui.selection import Selection, col_to_offset
 from core.tui.transcript import Transcript
+from core.tui.suggest import Suggestion, suggestions_for
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
 DRAW_INTERVAL = 0.033
 RESIZE_DEBOUNCE = 0.016
+
+# "↓ bottom" chip timings: accent pulse on turn-end and on output
+# arriving while detached; fade-out linger after returning to the tail.
+CHIP_FLASH_SECONDS = 2.0
+CHIP_FADE_SECONDS = 0.6
+# Chip pulse throttle: streaming output re-arms the accent pulse at most
+# once per this interval, so a fast token stream pulses instead of
+# burning the accent solid-on for the whole turn.
+CHIP_PULSE_THROTTLE = 1.0
+# Auto-suggestions after a finished task ("next steps" chips).
+SUGGESTION_MAX = 3
+SUGGESTION_LINGER = 45.0  # seconds the row stays before self-dismissing
 
 _WHEEL_UP = 64
 _WHEEL_DOWN = 65
@@ -97,6 +110,8 @@ STYLE_HAIR = ("38;5;238",)
 STYLE_ACCENT = (theme.BLOOD,)
 STYLE_SELECT = ("7",)
 STYLE_WARN = (theme.WARN,)
+STYLE_BONE = (theme.BONE,)
+STYLE_FAINT = ("2",)
 
 
 class LayoutBridge:
@@ -294,6 +309,26 @@ class TuiApp:
         self.composer = Composer()
         self.selection = Selection()
         self.lock = threading.RLock()
+        # Chip flash/fade timers (transcript exists at this point).
+        self._chip_flash_until = 0.0
+        self._chip_fade_until = 0.0
+        self._chip_fade_missed = 0  # missed count frozen for the fade echo
+        self._chip_last_pulse = 0.0  # pulse throttle anchor
+        # Turn-scoped context the suggestion engine reads at turn end.
+        self._turn_user_prompt = ""
+        self._turn_tool_text: list[str] = []
+        self._turn_had_error = False
+        # Auto-suggestions after a finished task: an ordered list of
+        # suggestion strings, the hit rects painted for them, and the
+        # selected index while the row has keyboard focus. Gated by the
+        # persisted UI preference (settings file, via session config
+        # override) so /suggestions off survives a restart.
+        self.suggestions_enabled = self._resolve_suggestions_enabled(session)
+        self.suggestions: list[str] = []
+        self._suggestion_commands: list[str] = []
+        self._suggestion_rects: list[tuple[int, int, int]] = []
+        self._suggestion_selected: int | None = None
+        self._suggestions_until = 0.0
 
         self.cols = 0
         self.rows = 0
@@ -324,6 +359,13 @@ class TuiApp:
         self._popup_hits: dict[int, int] = {}
         self._popup_more_row: int | None = None
         self._popup_less_row: int | None = None
+        # Transcript scrollbar: (track_x, top, height, thumb_top, thumb_span)
+        # from the last painted frame, and whether a thumb drag is live.
+        self._scrollbar: tuple[int, int, int, int, int] | None = None
+        self._scrollbar_drag = False
+        self._scrollbar_anchor = 0
+        # "↓ bottom" chip rect (x, y, width) while detached from the tail.
+        self._scroll_to_bottom: tuple[int, int, int] | None = None
 
         self.overlay: Any = None          # menu / question / line prompt
         self._overlay_reply: queue.Queue | None = None
@@ -401,6 +443,15 @@ class TuiApp:
             self.transcript.append_partial(text)
         # First real content replaces the centered welcome card.
         self._welcome_card = False
+        # Output arriving while scrolled away: pulse the chip so the
+        # operator sees the transcript growing underneath them, not
+        # just when the turn ends. Throttled: a fast token stream
+        # re-arms at most once per CHIP_PULSE_THROTTLE seconds, so the
+        # accent blinks rather than burning solid-on all turn.
+        now = time.monotonic()
+        if self.transcript.scrolled > 0 and now - self._chip_last_pulse >= CHIP_PULSE_THROTTLE:
+            self._chip_last_pulse = now
+            self._chip_flash_until = now + CHIP_FLASH_SECONDS
         self.mark_dirty()
 
     def set_status(self, text: str) -> None:
@@ -417,7 +468,85 @@ class TuiApp:
         if not on:
             self.status_text = ""
             self.counter_text = ""  # the live counter chip is stale once the turn ends
+            # Finishing a turn while the operator is scrolled away is
+            # worth announcing: the chip (already showing the missed
+            # count) flashes in the accent colour for a moment.
+            if self.transcript.scrolled > 0:
+                self._chip_flash_until = time.monotonic() + CHIP_FLASH_SECONDS
+            self._maybe_show_suggestions()
         self.mark_dirty()
+
+    @staticmethod
+    def _resolve_suggestions_enabled(session) -> bool:
+        """Suggestion toggle resolution: session config beats settings file.
+
+        The session config is authoritative within the process (the
+        /suggestions command keeps it in step); the settings file's
+        "ui.suggestions" is the default for a fresh start.
+        """
+        cfg = getattr(session, "config", None) or {}
+        if "suggestions" in cfg:
+            return bool(cfg["suggestions"])
+        try:
+            from core.agent.settings import ui_prefs
+
+            return bool(ui_prefs().get("suggestions", True))
+        except Exception:
+            return True  # settings unreadable: default on, never crash startup
+
+    def _maybe_show_suggestions(self) -> None:
+        """After a finished turn, derive and show next-step chips."""
+        if not self.suggestions_enabled:
+            return
+        if not self._turn_user_prompt:
+            return  # nothing captured (e.g. non-turn path) - skip
+        prompt = self._turn_user_prompt
+        # The assistant's final reply is the richest signal: it states
+        # what was done ("edited the files", "all tests pass") and what
+        # it would do next. The session stashes it turn-scoped.
+        reply = str(getattr(self.session, "last_reply", "") or "")
+        # Collect the last turn's tool lines: the transcript stores raw
+        # styled lines, so filter recent lines that look like tool calls.
+        with self.lock:
+            recent = list(self.transcript.raw[-80:])
+        tool_lines = [
+            ln for ln in recent
+            if "→" in ln or ln.lstrip().startswith(("run_command", "edit_file", "write_file", "read_file"))
+        ]
+        tool_text = "\n".join(tool_lines)
+        suggestions = suggestions_for(
+            prompt, reply, tool_text, self._turn_had_error, max_items=SUGGESTION_MAX
+        )
+        if suggestions:
+            self.suggestions = [s.label for s in suggestions]
+            self._suggestion_commands = [s.command for s in suggestions]
+            self._suggestion_selected = None
+            self._suggestions_until = time.monotonic() + SUGGESTION_LINGER
+        self._turn_user_prompt = ""  # consumed
+
+    def _dismiss_suggestions(self) -> None:
+        """Clear the suggestion row (expiry, submit, or Esc)."""
+        self.suggestions = []
+        self._suggestion_commands = []
+        self._suggestion_rects = []
+        self._suggestion_selected = None
+        self._suggestions_until = 0.0
+
+    def _accept_suggestion(self, index: int) -> None:
+        """Run a suggestion chip as if the operator had typed it."""
+        if 0 <= index < len(self._suggestion_commands):
+            command = self._suggestion_commands[index]
+            self._dismiss_suggestions()
+            self.submit(command)
+
+    def _arm_chip_fade(self, missed: int) -> None:
+        """Linger the chip as a fading echo after returning to the tail."""
+        self._chip_fade_missed = missed
+        self._chip_fade_until = time.monotonic() + CHIP_FADE_SECONDS
+        # The jump supersedes any pending flash: without this the chip
+        # would blink out until the flash expired, then fade — instead
+        # of handing straight over to the echo.
+        self._chip_flash_until = 0.0
 
     def toast_message(self, text: str, seconds: float = 1.6) -> None:
         self.toast = text
@@ -463,9 +592,18 @@ class TuiApp:
             self.busy_label = "Chanting"
             self._turn_started = time.monotonic()
             self._spinner_i = 0
+            # Turn-scoped context for the post-task suggestion engine.
+            self._turn_user_prompt = text
+            self._turn_tool_text = []
+            self._turn_had_error = False
+        # A detached scroll intentionally survives a new submission
+        # (pinned by test_turn_end_does_not_yank_a_detached_scroll), so
+        # submit never jumps — and never fades the chip either.
         stamp = time.strftime("%H:%M")
         self.feed_output(f"\033[2m{stamp}\033[0m  {display_text}\n")
         self.transcript.flush_partial()
+        # Typing a prompt supersedes the suggestion row.
+        self._dismiss_suggestions()
         self.mark_dirty()
         self.run_detached(lambda: self._run_turn(text))
 
@@ -482,6 +620,7 @@ class TuiApp:
         except AbortError:
             pass
         except HarnessError as exc:
+            self._turn_had_error = True
             self.feed_output(f"\033[38;5;167m  !! {exc}\033[0m\n")
         finally:
             # Clear busy and take the queued prompt inside the same lock
@@ -571,6 +710,14 @@ class TuiApp:
             return True
         if self.toast and time.monotonic() < self._toast_until:
             return True
+        now = time.monotonic()
+        # Chip flash and fade are timed states: the loop must keep
+        # ticking (and repaint once at each boundary) while they run.
+        if now < self._chip_flash_until or now < self._chip_fade_until:
+            return True
+        # The suggestion row self-dismisses after its linger window.
+        if self.suggestions and now >= self._suggestions_until:
+            return True
         return False
 
     def animation_interval(self) -> float:
@@ -583,6 +730,18 @@ class TuiApp:
             self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
         if self.toast and time.monotonic() >= self._toast_until:
             self.toast = ""
+        # At flash expiry repaint once to drop the accent styling.
+        if self._chip_flash_until and time.monotonic() >= self._chip_flash_until:
+            self._chip_flash_until = 0.0
+            self.mark_dirty()
+        # At fade expiry repaint once to clear the lingering chip.
+        if self._chip_fade_until and time.monotonic() >= self._chip_fade_until:
+            self._chip_fade_until = 0.0
+            self.mark_dirty()
+        # Suggestion row self-dismisses after its linger window.
+        if self.suggestions and time.monotonic() >= self._suggestions_until:
+            self._dismiss_suggestions()
+            self.mark_dirty()
         if self.selection.active and self._drag_autoscroll:
             with self.lock:
                 if self._drag_autoscroll < 0:
@@ -634,7 +793,7 @@ class TuiApp:
                 self.mark_dirty()
                 return
             # A modal (menu / question card) is open: drop the paste rather
-            # than routing it to the hidden composer buffer (D5).
+            # than routing it to the hidden composer buffer.
             if self.overlay is not None and not isinstance(self.overlay, LinePrompt):
                 return
             self.composer.consume_paste(event.text)
@@ -695,7 +854,25 @@ class TuiApp:
                 self.selection.clear()
                 self.mark_dirty()
                 return
+            if self.suggestions:
+                self._dismiss_suggestions()
+                self.mark_dirty()
+                return
             return
+        # While the suggestion row is up it owns Tab and the number
+        # keys: Tab moves between chips, 1-9 accept directly.
+        if self.suggestions and self.transcript.follow and not self.busy:
+            if key == "tab":
+                n = len(self.suggestions)
+                cur = self._suggestion_selected
+                self._suggestion_selected = 0 if cur is None else (cur + 1) % n
+                self.mark_dirty()
+                return
+            if key in "123456789" and len(key) == 1:
+                idx = int(key) - 1
+                if idx < len(self.suggestions):
+                    self._accept_suggestion(idx)
+                    return
         if key in ("pageup", "pagedown"):
             with self.lock:
                 if key == "pageup":
@@ -751,13 +928,21 @@ class TuiApp:
             return
         if key == "ctrl+end":
             with self.lock:
+                was_follow = self.transcript.follow
+                missed = self.transcript.missed
                 self.transcript.jump_bottom()
+            if not was_follow:
+                self._arm_chip_fade(missed)
             self.mark_dirty()
             return
         if key == "end" and not self.composer.buffer:
             # No text to move within: end jumps the transcript to the tail.
             with self.lock:
+                was_follow = self.transcript.follow
+                missed = self.transcript.missed
                 self.transcript.jump_bottom()
+            if not was_follow:
+                self._arm_chip_fade(missed)
             self.mark_dirty()
             return
         if key == "enter" and not self.composer.buffer and not self.composer.popup_open:
@@ -803,11 +988,36 @@ class TuiApp:
                     comp.selected = max(0, min(len(comp.completion.items) - 1, comp.selected + step))
                     self.mark_dirty()
                 return
+            # Route by where the cursor sits: over the prompt box the
+            # wheel scrolls the composer's own multi-line view; over the
+            # conversation it scrolls the transcript.
+            composer_height = self._composer_height(self.rows)
+            composer_top = self.rows - composer_height
+            if ev.y >= composer_top and not (
+                self._popup_rect
+                and self._popup_rect[0] <= ev.x < self._popup_rect[0] + self._popup_rect[2]
+                and self._popup_rect[1] <= ev.y <= self._popup_rect[1] + self._popup_rect[3]
+            ):
+                delta = -1 if ev.button == _WHEEL_UP else 1
+                with self.lock:
+                    self.composer.scroll_by(delta, composer_height - 1)
+                self.mark_dirty()
+                return
             with self.lock:
+                # ~10 rows per notch: a full page overshot past the
+                # context around the target, three rows took forever.
+                # Small viewports still scroll by most of their height.
+                step = min(10, max(3, self._content_height - 2))
+                was_follow = self.transcript.follow
+                missed = self.transcript.missed
                 if ev.button == _WHEEL_UP:
-                    self.transcript.scroll_up(3)
+                    self.transcript.scroll_up(step)
                 else:
-                    self.transcript.scroll_down(3)
+                    self.transcript.scroll_down(step)
+                # Wheeling back down to the tail re-follows; the chip
+                # echoes the jump as a fading remnant.
+                if not was_follow and self.transcript.follow:
+                    self._arm_chip_fade(missed)
             self.mark_dirty()
             return
         if ev.kind == "press" and ev.button == 0:
@@ -836,10 +1046,19 @@ class TuiApp:
                 return
             if self._press_composer(ev.x, ev.y):
                 return
+            if self._press_scroll_to_bottom(ev.x, ev.y):
+                return
+            if self._press_scrollbar(ev.x, ev.y):
+                return
+            if self._press_suggestion(ev.x, ev.y):
+                return
             if self._content_top <= ev.y < self._content_top + self._content_height:
                 self.selection.begin_press(ev.x, ev.y)
             return
         if ev.kind == "drag" and ev.button == 0:
+            if self._scrollbar_drag:
+                self._drag_scrollbar(ev.y)
+                return
             if self._drag_composer(ev.x, ev.y):
                 return
             if self.selection._press_cell is not None:
@@ -854,6 +1073,10 @@ class TuiApp:
             return
         if ev.kind == "release":
             self._drag_autoscroll = 0
+            if self._scrollbar_drag:
+                self._scrollbar_drag = False
+                self.mark_dirty()
+                return
             if self._composer_press:
                 self._composer_press = False
                 comp = self.composer
@@ -872,6 +1095,87 @@ class TuiApp:
                 self.mark_dirty()
 
     # ── composer mouse editing ────────────────────────────────
+
+    def _press_suggestion(self, x: int, y: int) -> bool:
+        """Click on a suggestion chip: accept it (submit its command)."""
+        for i, (sx, sy, sw) in enumerate(self._suggestion_rects):
+            if sy == y and sx <= x < sx + sw:
+                self._accept_suggestion(i)
+                return True
+        return False
+
+    def _press_scroll_to_bottom(self, x: int, y: int) -> bool:
+        """Click on the \"↓ bottom\" chip: jump back to the live tail."""
+        chip = self._scroll_to_bottom
+        if chip is None:
+            return False
+        chip_x, chip_y, chip_w = chip
+        if y != chip_y or not chip_x <= x < chip_x + chip_w:
+            return False
+        with self.lock:
+            missed = self.transcript.missed
+            self.transcript.jump_bottom()
+        # The jump is echoed: the chip lingers in fading style for a
+        # second instead of popping out of existence.
+        self._arm_chip_fade(missed)
+        self.mark_dirty()
+        return True
+
+    def _press_scrollbar(self, x: int, y: int) -> bool:
+        """Begin a scrollbar interaction at screen cell ``(x, y)``.
+
+        Only the bar's own column consumes the press: a click on
+        ordinary transcript text must still start a selection even when
+        it shares a row with the track. A press on the thumb starts a
+        drag anchored at the grab point so the thumb never jumps under
+        the cursor; a press on the bare track pages the transcript
+        toward that end. Returns True when the press was consumed.
+        """
+        bar = self._scrollbar
+        if bar is None:
+            return False
+        track_x, top, height, thumb_top, thumb_span = bar
+        if x != track_x or y < top or y >= top + height:
+            return False
+        self._scrollbar_drag = True
+        self._scrollbar_anchor = y - (top + thumb_top)  # grab offset within the thumb
+        if not (top + thumb_top) <= y < top + thumb_top + thumb_span:
+            # Track press (not the thumb): page one viewport toward the
+            # press, clamped so the thumb parks at the pressed end.
+            total = self.transcript.total_rows()
+            height_v = self.transcript.viewport_height
+            max_offset = max(1, total - height_v)
+            toward_tail = y < top + thumb_top  # press above thumb: page up
+            with self.lock:
+                step = max(3, height_v - 2)
+                if toward_tail:
+                    self.transcript.scroll_down(step)
+                else:
+                    self.transcript.scroll_up(step)
+            # Anchor mid-thumb after the page so the subsequent drag is
+            # relative to wherever the thumb now sits.
+            self._scrollbar_anchor = thumb_span // 2
+        self.mark_dirty()
+        return True
+
+    def _drag_scrollbar(self, y: int) -> None:
+        """Move the thumb so the grab point stays under the cursor."""
+        bar = self._scrollbar
+        if bar is None:
+            return
+        track_x, top, height, _thumb_top, thumb_span = bar
+        anchor = max(0, min(thumb_span - 1, getattr(self, "_scrollbar_anchor", 0)))
+        thumb_top = max(0, min(height - thumb_span, y - anchor - top))
+        total = self.transcript.total_rows()
+        height_v = self.transcript.viewport_height
+        max_offset = max(1, total - height_v)
+        # Exact inverse of the render mapping (thumb top runs 0 at the
+        # oldest content down to the track bottom near the tail), so the
+        # grab point stays put instead of the thumb sliding inverted.
+        offset = max_offset - thumb_top * max_offset // max(1, height - thumb_span)
+        with self.lock:
+            self.transcript.scroll_to_offset(offset)
+        self.mark_dirty()
 
     def _composer_box(self) -> tuple[int, int, int] | None:
         """(cols, rows, box_height) for hit-testing the prompt box."""
@@ -987,12 +1291,130 @@ class TuiApp:
         with self.lock:
             self.transcript.viewport_height = height
             visible = self.transcript.row_source(height)
+            # Scrollbar geometry, computed under the same lock: the
+            # thumb mirrors the viewport's position in the whole pool
+            # (display rows plus the live partial tail).
+            scrolled = self.transcript.offset
+            total_rows = self.transcript.total_rows()
+        now = time.monotonic()  # shared by the thumb pulse and the chip
         self._visible_rows = visible
         self._content_top = content_top
         self._content_height = height
         first_display = visible[0][0] if visible else 0
         for i, (_idx, text) in enumerate(visible):
             buf.set_styled_line(0, content_top + i, text, styles, cols)
+        # Scrollbar on the right edge while the view is detached from
+        # the tail: hairline track with a bone-coloured thumb sized to
+        # the viewport's share of the pool (never smaller than one row).
+        # Thumb position follows convention: at the oldest content it
+        # rides the top of the track, toward the tail it slides down.
+        if scrolled > 0 and total_rows > height and height >= 4:
+            track_x = cols - 1
+            thumb_span = min(height, max(1, height * height // total_rows))
+            max_offset = total_rows - height
+            thumb_top = (height - thumb_span) * (max_offset - scrolled) // max_offset
+            buf.set_str(track_x, content_top, "│" * height, hair_style)
+            # Accent pulse: while new output streams in detached, the
+            # thumb matches the chip's accent state so "the conversation
+            # is growing" reads on the edge as well.
+            if now < self._chip_flash_until:
+                for cy in range(content_top + thumb_top, content_top + thumb_top + thumb_span):
+                    buf.set_str(track_x, cy, "█", styles.id_for(STYLE_ACCENT))
+            else:
+                bone = styles.id_for(STYLE_BONE)
+                for cy in range(content_top + thumb_top, content_top + thumb_top + thumb_span):
+                    buf.set_str(track_x, cy, "█", bone)
+            # Contrast band: the single text column hugging the thumb
+            # renders faint so the thumb reads as an overlay, not as
+            # content, without smearing a wide gutter into the text.
+            faint = styles.id_for(STYLE_FAINT)
+            if track_x > 0:
+                for cy in range(content_top + thumb_top, content_top + thumb_top + thumb_span):
+                    buf.set_style(track_x - 1, cy, 1, faint)
+            self._scrollbar = (track_x, content_top, height, thumb_top, thumb_span)
+        else:
+            self._scrollbar = None
+
+        # "↓ bottom" jump chip while the view is detached from the tail:
+        # one click re-follows the live output without wheeling down. A
+        # counter rides along ("+14") when output streamed in while
+        # detached, so the operator can see how far behind they are.
+        #
+        # Two timed states layered on top of the live chip:
+        #  - flash: output streamed in or a turn just finished while
+        #    detached — chip and count render in the accent colour for
+        #    CHIP_FLASH_SECONDS.
+        #  - fade: just returned to the tail — the chip (with the missed
+        #    count it had at jump time) lingers in faint style for
+        #    CHIP_FADE_SECONDS instead of vanishing instantly.
+        now = time.monotonic()
+        chip_flashing = now < self._chip_flash_until
+        chip_fading = not chip_flashing and now < self._chip_fade_until
+        if scrolled > 0 and height >= 1:
+            missed = getattr(self.transcript, "missed", 0)
+            label_style = theme.BLOOD_BOLD if chip_flashing else theme.INFO
+            count_style = theme.BLOOD if chip_flashing else theme.FAINT
+            chip = f"\033[{label_style}m↓ bottom\033[0m"
+            if missed:
+                chip += f" \033[{count_style}m+{missed}\033[0m"
+            chip_w = visible_len(chip)
+            chip_x = max(0, cols - 2 - chip_w)  # one cell clear of the track
+            chip_y = content_top + height - 1
+            buf.set_styled_line(chip_x, chip_y, chip, styles, cols)
+            self._scroll_to_bottom = (chip_x, chip_y, chip_w)
+        elif chip_fading:
+            # Echo of the jump: frozen count, faint styling, no hit rect
+            # (it must not swallow clicks meant for the text below).
+            chip = f"\033[{theme.FAINT}m↓ bottom\033[0m"
+            if self._chip_fade_missed:
+                chip += f" \033[{theme.FAINT}m+{self._chip_fade_missed}\033[0m"
+            chip_w = visible_len(chip)
+            chip_x = max(0, cols - 2 - chip_w)
+            chip_y = content_top + height - 1
+            buf.set_styled_line(chip_x, chip_y, chip, styles, cols)
+            self._scroll_to_bottom = None
+        else:
+            self._scroll_to_bottom = None
+
+        # Post-task suggestion row: one line of clickable chips directly
+        # under the finished turn's output, at the tail of the content
+        # area. Visible while suggestions are pending; self-dismisses
+        # after SUGGESTION_LINGER, on submit, or on Esc.
+        self._suggestion_rects = []
+        if self.suggestions and self.transcript.follow:
+            if now < self._suggestions_until:
+                chips = [
+                    f"\033[7m\033[{theme.INFO}m {i + 1} {label} \033[0m"
+                    if i == self._suggestion_selected
+                    else f"\033[{theme.HAIR}m {i + 1} {label} \033[0m"
+                    for i, label in enumerate(self.suggestions)
+                ]
+                sep = "  "
+                x = 1
+                y = content_top + height - 1
+                for i, chip in enumerate(chips):
+                    w = visible_len(chip)
+                    if x + w > cols - 1:
+                        break  # no room for more chips this frame
+                    buf.set_styled_line(x, y, chip, styles, cols)
+                    self._suggestion_rects.append((x, y, w))
+                    x += w + len(sep)
+            else:
+                self._dismiss_suggestions()
+        elif self.suggestions and not self.transcript.follow:
+            # Detached from the tail: hold the row (no expiry countdown
+            # while hidden) so returning re-reveals it.
+            self._suggestions_until = max(self._suggestions_until, time.monotonic() + 5.0)
+
+        # Transient toast (state flips, copies, quit warnings): centered
+        # on the top hairline row, riding over the rule for its
+        # lifetime; the next frame after expiry restores the line.
+        if self.toast and now < self._toast_until:
+            toast_line = f" {self.toast} "
+            tw = visible_len(toast_line)
+            if tw < cols - 2:
+                tx = max(0, (cols - tw) // 2)
+                buf.set_styled_line(tx, 1, f"\033[{theme.WARN}m{toast_line}\033[0m", styles, cols)
         # Selection highlight.
         for offset, start, end in self.selection.overlay_rows(first_display, height):
             buf.set_style(start, content_top + offset, min(end, cols) - start, select_style)
@@ -1013,6 +1435,12 @@ class TuiApp:
         border_row = rows - 1 - composer_height
         status = self._border_text()
         marker = f" ^{self.transcript.scrolled}" if self.transcript.scrolled else ""
+        # While detached, the missed count rides beside the offset marker
+        # (" ^12 +3") so the growth stays visible while typing — even
+        # when the chip itself is scrolled out of view.
+        missed_now = getattr(self.transcript, "missed", 0)
+        if self.transcript.scrolled and missed_now:
+            marker += f" +{missed_now}"
         if self.transcript.scrolled:
             status = (status + marker) if status else marker.lstrip()
         line = "╭─" + status + " "

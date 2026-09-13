@@ -45,6 +45,8 @@ def _is_strict_positive_int(s: str, allow_zero: bool = False) -> bool:
         if int(s) > 2147483647:
             return False
     except Exception:
+        # int() can only fail here for digit strings beyond machine
+        # precision: already out of range either way.
         return False
     return True
 
@@ -93,17 +95,17 @@ def _candidate_spellings(path: str) -> list[str]:
     cands = []
     # narrow <-> regular, NFD/NFC, curly quotes
     variants = [path]
-    # narrow space
+    # narrow no-break space maps to a regular space
     if "\u202f" in path or " " in path:
         variants.append(_normalize_narrow_space(path))
         variants.append(path.replace(" ", "\u202f"))
-    # quotes
+    # curly quotes map to straight quotes
     for v in list(variants):
         if "'" in v:
             variants.append(v.replace("'", "’"))
         if "’" in v:
             variants.append(v.replace("’", "'"))
-    # NFD/NFC
+    # decomposed (NFD) forms are composed to NFC before comparison
     for v in list(variants):
         try:
             variants.append(unicodedata.normalize("NFD", v))
@@ -174,7 +176,7 @@ class ReadFileTool(Tool):
             offset = int(offset)
         elif isinstance(offset, float):
             # A float would silently truncate via int(); reject it like
-            # the string form (D18).
+            # the string form.
             return f"ERROR: offset must be an integer, got {offset!r}"
         elif not isinstance(offset, int):
             try:

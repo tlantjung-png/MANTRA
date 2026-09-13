@@ -123,7 +123,7 @@ def _trim_messages(messages: list[Any]) -> list[Any]:
         content = message.get("content")
         if isinstance(content, list):
             # Multimodal content: cap each text block so a huge block
-            # list cannot survive into the transcript (D23).
+            # list cannot survive into the transcript.
             blocks = list(content)
             changed = False
             for i, block in enumerate(blocks):
@@ -170,7 +170,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
     # must not interleave. If the lock cannot be taken in time, skip the
     # save rather than write a half-written transcript over a good one.
     # The lock is held across the whole build-and-write so no other
-    # writer can slip a save in between read and replace (D8).
+    # writer can slip a save in between read and replace.
     lock_path = target.with_suffix(target.suffix + ".lock")
     if lock_path.exists():
         _break_stale_lock(lock_path)
@@ -320,7 +320,7 @@ def _summarise(messages: list[Any]) -> str:
 # files get a new stat key and are re-read; the cache is size-capped.
 _LISTING_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _LISTING_CACHE_MAX = 512
-# Guards cache mutations: the TUI and console may list concurrently (D22).
+# Guards cache mutations: the TUI and console may list concurrently.
 _LISTING_CACHE_LOCK = threading.Lock()
 
 

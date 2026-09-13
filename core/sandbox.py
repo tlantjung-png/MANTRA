@@ -108,10 +108,10 @@ def _read_pipe_into(stream, buf: bytearray, cap: int, done: threading.Event) -> 
 
 def _strip_quoted(s: str) -> str:
     """Remove content inside single/double quotes to avoid false positives."""
-    # Replace quoted segments with spaces so positions preserved
+    # Blank out quoted spans, preserving length, so match positions hold.
     def _repl(m: re.Match[str]) -> str:
         return " " * len(m.group(0))
-    # \" or \' handling is imperfect but sufficient for heuristic
+    # Escaped-quote handling is imperfect but sufficient for a heuristic screen.
     s = re.sub(r'"[^"]*"', _repl, s)
     s = re.sub(r"'[^']*'", _repl, s)
     return s
@@ -545,6 +545,13 @@ class LocalSandbox(Sandbox):
                 with open(full, "w", encoding="utf-8", newline="\n") as handle:
                     handle.write(content)
             except OSError as exc:
+                # Remove the staged temp before surfacing: a failed direct
+                # write must not leave litter in the workspace.
+                try:
+                    if tmp and os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
                 raise SandboxError(str(exc)) from exc
             try:
                 if tmp and os.path.exists(tmp):

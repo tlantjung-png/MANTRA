@@ -404,13 +404,13 @@ class Backend:
         last_buttons = 0
         # ConPTY sometimes decomposes terminal control sequences (most
         # importantly SGR mouse reports) into individual KEY_EVENTs. A
-        # sequence started by escape is accumulated here and either parsed
-        # back into a proper event or, when it turns out to be a plain
-        # escape press, handed through as one.
+        # sequence started by escape is accumulated here and parsed by
+        # the same escape decoder the POSIX byte stream uses; when it
+        # turns out to be a plain escape press, that is handed through
+        # as one.
         pending = ""
         pending_at = 0.0
         last_size_poll = 0.0
-        mouse_re = re.compile(r"\x1b\[<(-?\d+);(\d+);(\d+)([Mm])")
 
         def flush_pending() -> None:
             nonlocal pending
@@ -427,12 +427,36 @@ class Backend:
                         break
                 self.events.put(Paste(body))
             else:
-                for ch in pending:
-                    if ch == "\x1b":
-                        self.events.put(Key("esc"))
-                    elif ch >= " " and not (0x7F <= ord(ch) <= 0x9F):
-                        self.events.put(Key(ch))
+                # Decode every complete escape sequence in the buffer
+                # through the shared parser: a decomposed SGR wheel
+                # report, arrow, or PageUp becomes its real event here,
+                # not a shower of "[<64;55;15M" keystrokes. Whatever the
+                # parser cannot consume is dropped, never typed: the
+                # fragments of a truncated report would otherwise land
+                # in the prompt box as literal text (exactly the bug
+                # where wheel motion "typed" into the composer while
+                # the transcript never scrolled).
+                for event in self._decode_win_sequence_buffer(pending):
+                    self.events.put(event)
             pending = ""
+
+        def pending_is_incomplete() -> bool:
+            """True while ``pending`` may still grow into a real event.
+
+            Asks the shared escape parser: an escape-prefix read means
+            the sequence can complete with future records, so more
+            time is granted instead of flushing mid-sequence. A lone
+            escape byte counts as complete: after the grace window it
+            is the escape action, never the start of a sequence.
+            """
+            if not pending or pending.startswith(_PASTE_START):
+                return False
+            if not pending.startswith("\x1b"):
+                return False
+            if len(pending) == 1:
+                return False
+            consumed, _, _ = self._parse_escape(pending, 0)
+            return consumed == 0
 
         while not self._stop.is_set():
             # Resizes are not reliably delivered as records through a
@@ -442,7 +466,13 @@ class Backend:
             if now - last_size_poll >= 0.2:
                 last_size_poll = now
                 self.emit_resize_if_changed()
-            if pending and now - pending_at > 0.1:
+            # A decomposed sequence whose records arrive gappily gets a
+            # generous grace window: flushing early would spray the
+            # report's parameter bytes into the composer as typing. A
+            # real key press never needs this long, and a still-growing
+            # sequence resets the timer on every new record, so the
+            # worst case is one delayed event, not a lost one.
+            if pending and now - pending_at > 0.3 and not pending_is_incomplete():
                 flush_pending()
             count = wintypes.DWORD()
             if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
@@ -481,10 +511,10 @@ class Backend:
                     mods = mods_of(key.dwControlKeyState)
                     ch = key.uChar
                     # Sequence reassembly: an escape character opens a
-                    # possible control sequence; when the accumulated
-                    # text starts with an SGR mouse report it becomes a
-                    # Mouse event (prefix-matched so a burst of reports
-                    # in one buffer is consumed one report at a time).
+                    # possible control sequence; a completed one is
+                    # decoded below into its real event (prefix-matched
+                    # so a burst of reports in one buffer is consumed
+                    # one report at a time).
                     if pending:
                         # Repeats arrive as one record with wRepeatCount
                         # (held key or paste of identical chars); expand
@@ -504,24 +534,25 @@ class Backend:
                                 flush_pending()
                             pending_at = time.monotonic()
                             continue
-                        m = mouse_re.match(pending)
-                        if m:
-                            button, col, row = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                            if button in (_WHEEL_UP, _WHEEL_DOWN):
-                                kind = "wheel"
-                            elif button & 32:  # SGR drag bit: motion with a button held
-                                kind = "drag"
-                                button = 0
-                            else:
-                                kind = "press" if m.group(4) == "M" else "release"
-                            self.events.put(
-                                Mouse(kind, button, max(0, col - 1), max(0, row - 1), mods)
-                            )
-                            # Consume only the matched report: a drag burst
-                            # can pack several reports into one buffer and
-                            # the ones before the tail must not be lost.
-                            pending = pending[len(m.group(0)):]
-                        elif len(pending) > 32:
+                        # Decode complete sequences immediately through
+                        # the shared parser (SGR wheel reports, arrows,
+                        # PageUp...): a decomposed report fires its real
+                        # event the moment its final record lands, and a
+                        # burst of reports in one buffer is consumed one
+                        # at a time.
+                        while pending.startswith("\x1b"):
+                            consumed, event, _ = self._parse_escape(pending, 0)
+                            if consumed == 0:
+                                break  # still incomplete; keep collecting
+                            if event is not None:
+                                self.events.put(event)
+                            pending = pending[consumed:]
+                        if pending and not pending.startswith("\x1b") and not pending.startswith(_PASTE_START):
+                            # Printable debris between sequences (a
+                            # mangled report's tail) is dropped, never
+                            # typed into the composer.
+                            pending = ""
+                        elif len(pending) > 64:
                             flush_pending()
                         pending_at = time.monotonic()
                         continue
@@ -722,6 +753,38 @@ class Backend:
             self.events.put(Key(ch))
             i += 1
         return buf[i:], last_buttons
+
+    def _decode_win_sequence_buffer(self, buf: str) -> list[Event]:
+        """Decode a flushed Windows reassembly buffer into real events.
+
+        ConPTY decomposes control sequences into individual key records;
+        when they arrive too gappily to reassemble, this decodes every
+        complete sequence the buffer holds instead of spraying its
+        parameter bytes as typing. Printable debris is dropped, never
+        typed: the fragments of a truncated SGR report would otherwise
+        land in the prompt box as literal text (exactly the bug where
+        wheel motion "typed" into the composer while the transcript
+        never scrolled).
+        """
+        out: list[Event] = []
+        while buf:
+            if buf[0] != "\x1b":
+                ch, buf = buf[0], buf[1:]
+                if ch >= " " and not (0x7F <= ord(ch) <= 0x9F):
+                    out.append(Key(ch))
+                continue
+            consumed, event, _ = self._parse_escape(buf, 0)
+            if consumed == 0:
+                # Unterminated sequence: a bare "\x1b" left after a
+                # timeout replays as the escape action; anything longer
+                # is a mangled report and is discarded.
+                if len(buf) == 1:
+                    out.append(Key("esc"))
+                break
+            if event is not None:
+                out.append(event)
+            buf = buf[consumed:]
+        return out
 
     def _parse_escape(self, seq: str, last_buttons: int) -> tuple[int, Event | None, int]:
         """Parse one escape sequence at the start of ``seq``.

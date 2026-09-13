@@ -129,7 +129,8 @@ def selection_in_progress() -> bool:
 
         info = _SelectionInfo()
         ok = ctypes.windll.kernel32.GetConsoleSelectionInfo(ctypes.byref(info))
-        # CONSOLE_SELECTION_IN_PROGRESS = 0x0001
+        # Quick-edit selection in progress (0x0001) stays off: the
+        # application draws its own selection.
         return bool(ok and (info.dwFlags & 0x0001))
     except Exception:
         return False

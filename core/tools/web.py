@@ -76,7 +76,7 @@ class _TextExtractor(HTMLParser):
         self.parts: list[str] = []
         # Stack of open skip-tag names, not a bare depth counter: a
         # mismatched </style> after <script> must not expose the script's
-        # content early (D11).
+        # content early.
         self._skip_stack: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
@@ -288,7 +288,7 @@ def _parse_alternative_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
     return None
 
 
-# Shared, bounded DNS resolver pool (D8): stalled lookups occupy a worker
+# Shared, bounded DNS resolver pool: stalled lookups occupy a worker
 # instead of abandoning a daemon thread per fetch.
 # Non-daemon workers are intentional: daemon threads would be killed
 # mid-lookup at interpreter exit. Use atexit to join idle workers cleanly.
@@ -599,7 +599,7 @@ class _PinningHandler(HTTPRedirectHandler, HTTPHandler, HTTPSHandler):
 
         The stdlib redirect handler follows any Location scheme, which
         would let a public server bounce the fetch to file://, ftp:// or
-        data:// with no private-host checks on that hop (D1).
+        data:// with no private-host checks on that hop.
         """
         scheme = urllib.parse.urlsplit(newurl).scheme.lower()
         if scheme not in ("http", "https"):
@@ -639,13 +639,11 @@ try:
     # Routed through the validating opener so each hop is checked, not
     # just the URL the chain happens to end on. Tests rebind this name.
     urlopen = _make_opener().open
-    _OPENER_FAILED = False
 except Exception:  # pragma: no cover - fail closed, never fetch unvalidated
     # Fail closed: retain redirect and DNS pinning guarantees rather than
     # fetching through an unvalidated opener.
     def urlopen(request, timeout=None):  # type: ignore[no-redef]
         raise URLError("fetch unavailable: secure opener failed to initialise")
-    _OPENER_FAILED = True
 
 
 class WebFetchTool(Tool):

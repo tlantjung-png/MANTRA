@@ -94,7 +94,7 @@ class ContextManager:
                         args = fn.get("arguments") or ""
                         s_args = str(args)
                         # Include the per-call overhead so a single
-                        # oversized call is clamped too (D7).
+                        # oversized call is clamped too.
                         if len(s_args) + 32 > per_call:
                             fn["arguments"] = s_args[:cap_a] + " ... [truncated]"
                         nc["function"] = fn
@@ -187,7 +187,7 @@ class ContextManager:
         """Remove oldest assistant turn and its tool results."""
         # The newest assistant turn is exempt while it is still the last
         # message: its tool results are appended in a later call, and
-        # evicting it now would orphan them (D5).
+        # evicting it now would orphan them.
         newest_unanswered = bool(self.messages) and self.messages[-1].get("role") == "assistant"
         for index in range(2, len(self.messages)):
             msg = self.messages[index]

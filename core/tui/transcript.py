@@ -22,7 +22,7 @@ _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 # Bare C0/C1 controls (ESC c, BEL, BS, C1 CSI bytes, ...) can reset or
 # corrupt the terminal frame. \n is handled by line-splitting at ingest;
 # \t is expanded to spaces here so a tab stop can never reach the
-# terminal (see D1).
+# terminal.
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]")
 
 
@@ -183,7 +183,7 @@ def wrap_ansi(text: str, width: int) -> list[str]:
     return out if out else [""]
 
 _MAX_LINES = 8000
-_PARTIAL_CAP = 4096  # longest live tail held for an unterminated line (D23)
+_PARTIAL_CAP = 4096  # longest live tail held for an unterminated line
 
 
 class Transcript:
@@ -196,6 +196,7 @@ class Transcript:
         self._width = 0
         self.offset = 0                   # display rows from the bottom
         self.follow = True
+        self.missed = 0                   # display rows appended while detached
         self.viewport_height = 30         # kept current by the app each frame
         self.version = 0                  # bumped on every content change
 
@@ -210,7 +211,10 @@ class Transcript:
                 self._rewrap_locked()
             else:
                 if self._width:
-                    self.display.extend(wrap_ansi(clean, self._width))
+                    added = wrap_ansi(clean, self._width)
+                    self.display.extend(added)
+                    if not self.follow:
+                        self.missed += len(added)
             self.version += 1
 
     def append_partial(self, styled_text: str) -> None:
@@ -239,6 +243,7 @@ class Transcript:
             self._partial_rows = []
             self.offset = 0
             self.follow = True
+            self.missed = 0
             self.version += 1
 
     def set_width(self, cols: int) -> None:
@@ -249,13 +254,13 @@ class Transcript:
             self._rewrap_locked()
 
     def _cache_partial_locked(self) -> None:
-        """Recompute the wrapped tail rows (cached per width, see D23)."""
+        """Recompute the wrapped tail rows (cached per width)."""
         self._partial_rows = (
             wrap_ansi(self.partial, self._width) if (self.partial and self._width) else []
         )
 
     def _clamp_offset_locked(self) -> None:
-        """Pin offset to the display pool after rewrap/truncation (D4)."""
+        """Pin offset to the display pool after rewrap/truncation."""
         total = len(self.display) + len(self._partial_rows)
         max_offset = max(0, total - self.viewport_height)
         if self.offset > max_offset:
@@ -303,17 +308,37 @@ class Transcript:
                 self.offset = new
                 if self.offset == 0:
                     self.follow = True
+                    self.missed = 0
                 self.version += 1
 
     def jump_bottom(self) -> None:
         with self._lock:
             self.offset = 0
             self.follow = True
+            self.missed = 0
+            self.version += 1
+
+    def scroll_to_offset(self, new_offset: int) -> None:
+        """Jump the viewport to an absolute offset (scrollbar drags).
+
+        Clamps to the real pool and keeps the follow flag in step: only
+        offset 0 (the live tail) reattaches.
+        """
+        with self._lock:
+            total = len(self.display) + len(self._partial_rows)
+            max_offset = max(0, total - self.viewport_height)
+            self.offset = max(0, min(max_offset, new_offset))
+            self.follow = self.offset == 0
             self.version += 1
 
     @property
     def scrolled(self) -> int:
         return self.offset
+
+    def total_rows(self) -> int:
+        """Display rows including the live partial tail (under lock)."""
+        with self._lock:
+            return len(self.display) + len(self._partial_rows)
 
     # ── selection support ─────────────────────────────────────
 
@@ -333,7 +358,7 @@ class Transcript:
             if 0 <= display_index < len(self.display):
                 return self.display[display_index]
             # The wrapped partial tail is visible while following; resolve
-            # it too so a drag ending there still copies (see D9/D11).
+            # it too so a drag ending there still copies.
             rel = display_index - len(self.display)
             if 0 <= rel < len(self._partial_rows):
                 return self._partial_rows[rel]

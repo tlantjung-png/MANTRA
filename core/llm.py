@@ -31,9 +31,9 @@ DeltaCallback = Callable[[str], None]
 # Mid-stream drop surfaces as IncompleteRead, not OSError; handle explicitly.
 IncompleteRead = http.client.IncompleteRead
 
-# Hosts that accept requests with no credential at all. Kept in sync
-# with the console's keyless-endpoint guidance so the setup flow and the
-# client never contradict each other.
+# Hosts that accept requests with no credential at all. Single source
+# of truth: core.console_common re-exports this tuple for the setup
+# flow, so the two can never contradict each other.
 KEYLESS_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1")
 
 
@@ -304,7 +304,8 @@ class OpenAICompatClient(LLMClient):
         self.reasoning_effort = reasoning_effort
         # Not every server understands stream_options; downgrade on a 400.
         self._usage_supported = include_usage
-        # Nor reasoning_effort - local servers tend to reject it outright.
+        # Same for reasoning_effort: only sent when configured, and shed
+        # on a server rejection.
         self._reasoning_supported = reasoning_effort is not None
         # Nor temperature: reasoning-model endpoints commonly refuse a
         # fixed sampling temperature, so it sheds like the other optional
@@ -418,7 +419,7 @@ class OpenAICompatClient(LLMClient):
                     del payload["reasoning_effort"]
                     last_error = detail or "reasoning_effort rejected"
                     continue
-                if exc.code == 400 and "temperature" in payload                         and self._blamed(detail, "temperature"):
+                if exc.code == 400 and "temperature" in payload and self._blamed(detail, "temperature"):
                     # Reasoning models refuse a fixed sampling temperature;
                     # shed the field the same way as the other optional
                     # parameters and remember the choice for later turns.

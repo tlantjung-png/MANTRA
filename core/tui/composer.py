@@ -49,6 +49,11 @@ class Composer:
         # selected range; caret moves clear it.
         self.sel_anchor: int | None = None
         self.sel_head: int | None = None
+        # Wheel-driven view offset (first visible line) for a multi-line
+        # buffer: independent of the caret so the operator can read the
+        # top of a long prompt while the caret stays deep below. Typing
+        # or any caret move re-anchors the view to the caret line.
+        self._view_first: int | None = None  # None = follow the caret
 
     # ── state ─────────────────────────────────────────────────
 
@@ -61,6 +66,7 @@ class Composer:
         self._last_token = None
         self._dismissed = False
         self.submitted = None
+        self._view_first = None
         self.sel_anchor = None
         self.sel_head = None
 
@@ -104,6 +110,49 @@ class Composer:
     def is_multiline(self) -> bool:
         return "\n" in self.buffer
 
+    # ── wheel scrolling (multi-line prompt) ───────────────────
+
+    def _caret_line_index(self) -> int:
+        return min(
+            self.buffer.count("\n"),
+            self.buffer[: self.cursor].count("\n"),
+        )
+
+    def total_lines(self) -> int:
+        return self.buffer.count("\n") + 1
+
+    def scroll_by(self, delta: int, visible_rows: int) -> None:
+        """Wheel the prompt box: move the free view by ``delta`` lines.
+
+        Clamped so the last line can rise to the bottom of the box (but
+        no further) and the first line stays at the top. Typing re-
+        anchors the view to the caret afterwards.
+        """
+        if not self.is_multiline or delta == 0:
+            return
+        lines = self.total_lines()
+        window = max(1, visible_rows)
+        first = self._view_first
+        if first is None:
+            # Leaving caret-follow mode: the current caret-anchored view
+            # becomes the starting offset.
+            caret_line = self._caret_line_index()
+            first = max(0, caret_line + 1 - window)
+        self._view_first = max(0, min(first + delta, max(0, lines - window)))
+
+    def _reanchor_to_caret(self) -> None:
+        self._view_first = None
+
+    def _view_start(self, height: int) -> int:
+        """First visible line index for a box of ``height`` rows."""
+        if not self.is_multiline:
+            return 0
+        if self._view_first is not None:
+            window = max(1, height - 1)
+            return max(0, min(self._view_first, max(0, self.total_lines() - window)))
+        caret_line = self._caret_line_index()
+        return max(0, caret_line + 1 - max(1, height - 1))
+
     @property
     def popup_open(self) -> bool:
         return bool(self.completion and self.completion.items and not self._dismissed)
@@ -131,6 +180,9 @@ class Composer:
 
     def consume_key(self, key: str, mods: frozenset = frozenset()) -> None:
         """Apply one key event. Submit text lands in ``self.submitted``."""
+        # Any keyboard activity re-anchors the view to the caret: the
+        # wheel's free-view offset is a mouse-only reading aid.
+        self._view_first = None
         if key == "enter":
             if self.popup_open:
                 self._accept_popup()
@@ -323,16 +375,20 @@ class Composer:
             keep = self._window_keep(self.buffer, self.cursor, avail)
             return [(rows_total - 2, 0, self.buffer, keep)]
         lines = self.buffer.split("\n")
-        caret_line = min(len(lines) - 1, self.buffer[: self.cursor].count("\n"))
         max_lines = max(1, height - 1)
-        first = max(0, caret_line + 1 - max_lines)
+        first = self._view_start(box_height)
         y = rows_total - box_height
-        top = y + height - (1 + (caret_line + 1 - first))
+        # Free view: the shown window is [first, first + max_lines); the
+        # caret line keeps its horizontal window, other rows are clipped
+        # from column 0 — the caret must stay where the caret column math
+        # says it is.
+        last = min(len(lines) - 1, first + max_lines - 1)
+        caret_line = min(self._caret_line_index(), len(lines) - 1)
         caret_col = self.cursor - sum(len(lines[i]) + 1 for i in range(caret_line))
         keep = self._window_keep(lines[caret_line], caret_col, avail)
         return [
-            (top + 1 + i, idx, lines[idx], keep)
-            for i, idx in enumerate(range(first, caret_line + 1))
+            (y + height - max_lines + i, idx, lines[idx], keep if idx == caret_line else 0)
+            for i, idx in enumerate(range(first, last + 1))
         ]
 
     @staticmethod
@@ -439,8 +495,8 @@ class Composer:
             lines = self.buffer.split("\n")
             caret_line = min(len(lines) - 1, self.buffer[: self.cursor].count("\n"))
             max_lines = max(1, height - 1)
-            first = max(0, caret_line + 1 - max_lines)
-            vis = lines[first : caret_line + 1]
+            first = self._view_start(height)
+            vis = lines[first : first + max_lines]
             chip = f"· {len(lines)} lines · {len(self.buffer):,} chars"
             if first > 0:
                 chip = f"… {first} more above · " + chip

@@ -78,7 +78,7 @@ _SAFE_RE = re.compile("|".join(_SAFE_COMMANDS), re.IGNORECASE)
 # Mid-session AGENTS.md / MEMORY.md cache-invalidation fence. Both files
 # get the same fence on the run_command path: redirection and the
 # PowerShell content-setting commands are refused, and tool-level writes
-# (write_file/edit_file) to either file classify as confirm (D10).
+# (write_file/edit_file) to either file classify as confirm.
 _FORBIDRE = [
     re.compile(r"(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md", re.IGNORECASE),
     re.compile(r"(>|>>)\s*[^|\r\n]*MEMORY\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md", re.IGNORECASE),
@@ -234,7 +234,7 @@ def _wrapper_oneliner(tokens: list[str]) -> bool:
     ``bash -c``, ``cmd /c`` and ``powershell -c``/``-Command`` execute
     their remaining text as code, exactly like the interpreters in
     ``_is_interpreter_oneliner``; ``_get_tokens`` strips them before
-    that check runs, so the wrapper head is detected here instead (D1).
+    that check runs, so the wrapper head is detected here instead.
     """
     if len(tokens) < 3:
         return False
@@ -255,7 +255,7 @@ def _get_tokens(segment: str) -> list[str]:
     # Wrapper expansion: classify the inner command only, so the wrapper
     # does not double-count the risk. The interpreter one-liner gate is
     # preserved separately by _wrapper_oneliner, so bash/powershell/cmd
-    # -c one-liners still classify as confirm (D1).
+    # -c one-liners still classify as confirm.
     if len(tokens) >= 3:
         wrapper = tokens[0].lower().replace("\\", "/").split("/")[-1]
         switch = tokens[1].lower()
@@ -345,7 +345,7 @@ def _has_redirect(segment: str) -> bool:
 # Interpreters with inline code can execute arbitrary payloads the pattern
 # screen cannot see, so they are gated behind explicit confirmation in every
 # interactive mode. Wrapper interpreters (bash -c, cmd /c, powershell -c)
-# are caught by _wrapper_oneliner before expansion strips them (D1).
+# are caught by _wrapper_oneliner before expansion strips them.
 _INTERPRETER_TOKENS = frozenset(
     {
         "python", "python3", "pypy", "pypy3",
@@ -398,7 +398,7 @@ def _classify_segment(segment: str) -> str:
     # Wrapper interpreters (bash -c, cmd /c, powershell -c, pwsh -Command)
     # are expanded to their inner command by _get_tokens, so the one-liner
     # check below would never see the interpreter: detect the wrapper from
-    # the pre-expansion token head and gate it like any inline code (D1).
+    # the pre-expansion token head and gate it like any inline code.
     if _wrapper_oneliner(_tokenize(segment)):
         return "confirm"
     # Interpreter one-liners: the payload is invisible to every pattern
@@ -509,7 +509,7 @@ def classify_command(command: str) -> str:
             # A bare shell interpreter fed by a preceding segment (a pipe
             # or chain) executes the incoming text as commands: escalate
             # to confirm. Wrapper one-liners (bash -c ...) already classify
-            # as confirm via _wrapper_oneliner before expansion (D1).
+            # as confirm via _wrapper_oneliner before expansion.
             if idx > 0:
                 head = _get_tokens(seg)
                 if len(head) == 1:
@@ -541,7 +541,7 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
         verb = "overwrite" if tool == "write_file" else "edit"
         # The shell-layer fence must also cover tool-level writes: a
         # direct write_file to AGENTS.md/MEMORY.md bypasses the run_command
-        # forbid rules, so route it to explicit confirmation (D10).
+        # forbid rules, so route it to explicit confirmation.
         import os as _os
 
         base = _os.path.basename(path.replace("\\", "/")).lower()
@@ -572,7 +572,7 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
 _LOG_ACL_DONE = False
 
 # One-time stderr warning when the audit log cannot be written: a silent
-# fail-open would leave tool use unlogged (D3).
+# fail-open would leave tool use unlogged.
 _LOG_WRITE_WARNED = False
 
 
@@ -595,7 +595,7 @@ def _rotate_audit_log(log_path: str) -> None:
     Two processes rotating concurrently would both read-modify-write the
     file and drop each other's recent lines; the exclusive-create lock
     makes rotation single-writer. Fails open (no rotation) on lock
-    contention or OSError, matching the best-effort logging contract (D3).
+    contention or OSError, matching the best-effort logging contract.
     """
     import os
     import time as _time
@@ -634,9 +634,9 @@ _LOG_CHECK_LOCK = threading.Lock()
 def _restrict_audit_log(log_path: str) -> None:
     """Best-effort owner-only access for the audit log, once per process.
 
-    os.chmod(0o600) is a no-op on Windows, so the same icacls tightening
-    keys._restrict_file applies is repeated here, without its credentials
-    warning. Runs only once the file exists; the ACL then persists.
+    os.chmod(0o600) is a no-op on Windows, so the icacls tightening from
+    keys._restrict_file is repeated here, minus its credentials warning.
+    Runs only once the file exists; the ACL then persists.
     """
     import os
 
@@ -763,7 +763,7 @@ class ApprovalPolicy:
     def _key(tool: str, arguments: dict[str, Any]) -> str:
         if tool == "run_command":
             # Alias spellings share the canonical key, matching classify
-            # and the loop's repair pass (D4).
+            # and the loop's repair pass.
             command = canonical_command(arguments)
             # Lowercase verb for matching; preserve path case.
             parts = command.split()

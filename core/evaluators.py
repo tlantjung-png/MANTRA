@@ -11,7 +11,7 @@ class CommandEvaluator(Evaluator):
     def __init__(self, test_cmd: str, timeout: float = 600.0) -> None:
         # A config timeout outside (0,600] would make every sandbox.exec
         # return exit -1 ("timeout out of range"); surface it here as a
-        # config error instead of a silent wall of failures (D22).
+        # config error instead of a silent wall of failures.
         try:
             timeout_f = float(timeout)
         except (TypeError, ValueError):
@@ -37,11 +37,9 @@ class CommandEvaluator(Evaluator):
             result = sandbox.exec(command, timeout=self.timeout)
         except Exception as exc:
             # Contract: evaluate() must never raise; surface as failure.
-            from core.agent.approvals import _redact_sensitive as _redact
-
             return EvaluationResult(
                 passed=False,
-                detail=f"evaluator error: {_redact(str(exc))[:2000]}",
+                detail=f"evaluator error: {_redact_sensitive(str(exc))[:2000]}",
             )
         passed = result.exit_code == 0 and not result.timed_out
         # The last 4KB of tool output can carry credentials the agent

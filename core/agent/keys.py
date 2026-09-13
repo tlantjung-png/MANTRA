@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -36,9 +37,6 @@ def _quarantine_once(path: Path) -> None:
         return
     _QUARANTINED.add(str(path))
     try:
-        import shutil
-        import time
-
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = path.with_suffix(path.suffix + f".corrupt-{stamp}")
         shutil.copy2(path, backup)
@@ -54,7 +52,7 @@ def _load() -> dict[str, Any]:
         raw = path.read_text(encoding="utf-8")
     except OSError:
         # An unreadable file is as unusable as a corrupt one: quarantine
-        # it once so a later write never destroys the only copy (D14).
+        # it once so a later write never destroys the only copy.
         _quarantine_once(path)
         return {}
     try:
@@ -64,7 +62,13 @@ def _load() -> dict[str, Any]:
         # (like settings); later reads skip straight to the empty store.
         _quarantine_once(path)
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        # A valid document of the wrong shape is as unusable as a corrupt
+        # one: quarantine it too, so a later key write cannot destroy the
+        # only copy without a backup.
+        _quarantine_once(path)
+        return {}
+    return data
 
 
 def _save(data: dict[str, Any]) -> None:
@@ -188,9 +192,14 @@ def warn_insecure_transport(base_url: str, has_key: bool) -> None:
     )
 
 
-# Cached store read, keyed by (mtime_ns, size). Redaction and resolution
-# hot paths otherwise re-read and re-parse the file on every call (D9).
-_STORED_KEYS_CACHE: tuple[tuple[int, int] | None, dict[str, str]] | None = None
+# Cached store read, keyed by (mtime_ns, size) plus a process-local
+# generation counter. Redaction and resolution hot paths otherwise re-read
+# and re-parse the file on every call. The generation guards against
+# two blind spots of the stat key: a same-size write within one timestamp
+# tick on a coarse-timestamp filesystem, and concurrent in-process writers
+# racing the cache update.
+_STORED_KEYS_CACHE: tuple[tuple[tuple[int, int] | None, int], dict[str, str]] | None = None
+_STORED_KEYS_GENERATION = 0
 
 
 def stored_keys() -> dict[str, str]:
@@ -202,13 +211,21 @@ def stored_keys() -> dict[str, str]:
     except OSError:
         stat_key = None
     global _STORED_KEYS_CACHE
-    if _STORED_KEYS_CACHE is not None and _STORED_KEYS_CACHE[0] == stat_key:
+    key = (stat_key, _STORED_KEYS_GENERATION)
+    if _STORED_KEYS_CACHE is not None and _STORED_KEYS_CACHE[0] == key:
         return dict(_STORED_KEYS_CACHE[1])
     data = _load()
     keys = data.get("keys")
     result = dict(keys) if isinstance(keys, dict) else {}
-    _STORED_KEYS_CACHE = (stat_key, result)
+    _STORED_KEYS_CACHE = (key, result)
     return result
+
+
+def _bump_keys_generation() -> None:
+    """Invalidate the stored-key cache after a write under the store lock."""
+    global _STORED_KEYS_GENERATION, _STORED_KEYS_CACHE
+    _STORED_KEYS_GENERATION += 1
+    _STORED_KEYS_CACHE = None
 
 
 _CRED_LOCK = threading.Lock()
@@ -286,6 +303,7 @@ def store(name: str, key: str) -> None:
         data["keys"] = keys
         data["version"] = _CREDENTIALS_VERSION  # schema version marker; not read back
         _save(data)
+        _bump_keys_generation()
 
 
 def remove(name: str) -> bool:
@@ -298,6 +316,7 @@ def remove(name: str) -> bool:
         del keys[name]
         data["keys"] = keys
         _save(data)
+        _bump_keys_generation()
         return True
 
 

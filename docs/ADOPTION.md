@@ -10,7 +10,7 @@ The source harness requires a recorded fresh read before any file edit and rejec
 
 ### Known-Failure Registry
 
-Every recurring incident class is recorded as an entry with symptom, rule, and date. The registry is appended to the system prompt on every session so fixed classes stay fixed. The injected registry file is knowledge/known-failures.md at the project root. New entries are added when a class is fixed and are accompanied by regression tests that lock the fix.
+Every recurring incident class is recorded as an entry with symptom, rule, and date. The registry is appended to the system prompt on every session so fixed classes stay fixed. The injected registry file is the known-failures document at the project root. New entries are added when a class is fixed and are accompanied by regression tests that lock the fix.
 
 ### Durable Workspace Memory with Cap
 
@@ -18,7 +18,7 @@ Project state is kept per workspace in a hidden directory and appended after eac
 
 ### Session Persistence and Resumption
 
-Automatically saved transcripts allow a session to be resumed after closing the window. Each transcript records version, name, timestamp, workspace, model, summary, totals, goals, and the full message list with per-message size caps. Transcripts are written atomically with restricted permissions, listed newest first, corrupted files are skipped, and unsafe names include a hash suffix with legacy fallback for older transcripts.
+Automatically saved transcripts allow a session to be resumed after closing the window. Each transcript records version, name, timestamp, workspace, model, summary, totals, goals, and the full message list with per-message size caps. Transcripts are written atomically with restricted permissions, listed newest first, with corrupted files skipped, and unsafe names include a hash suffix with legacy fallback for older transcripts.
 
 ### Approval Policy
 

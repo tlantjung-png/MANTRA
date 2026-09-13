@@ -2,15 +2,15 @@
 
 ## Build
 
-Build is declared via the standard packaging manifest with a setuptools backend and a minimum interpreter version of 3.10. Package discovery is limited to the source directory. No runtime dependencies are declared for core operation. An optional parsing library is required only for the alternative configuration format.
+Build is declared via the standard packaging manifest with a minimum interpreter version of 3.10. Package discovery is limited to the source directory. No runtime dependencies are declared for core operation. An optional parsing library is required only for the alternative configuration format.
 
 Build artifacts include distribution metadata and entry-point declarations for the interactive console and the headless runner. The manifest also ships example configuration and task documents, the knowledge file, command rules, and skill markdown as package data, and declares test discovery and module-search-path adjustments for the test suite.
 
 ## Testing
 
-The test-runner configuration points to a dedicated test directory and adjusts the module search path to include the source directory. The suite is run with pytest.
+The test-runner configuration points to a dedicated test directory and adjusts the module search path to include the source directory. The suite is run with the standard test runner.
 
-The offline suite exercises the orchestration loop including final-answer handling, step-limit termination, unknown-tool resilience, empty-final and truncated-call retry budgets, and error paths. It covers context truncation with pinned messages, orphan avoidance, and looping-budget enforcement; configuration validation including context limits and unknown-key rejection; the read-before-edit contract including unread and stale-content rejection and partial-view handling; memory capping including single-line truncation; instruction-file discovery and preference order; the streaming parser including content accumulation, tool-call reassembly, and consecutive and total malformed-chunk limits; model discovery filtering and ranking; approval classification including wrapper handling; session persistence with size caps and legacy-name fallback; file-tool safety checks including binary sampling and bulk limits; and the search, extraction, and tree-query tools including nested-descent and workspace-escape regression tests. The read tool's resume-offset behavior after a byte-budget cut, including the line recount when a cut lands mid-line, is covered by the suite.
+The offline suite exercises the orchestration loop including final-answer handling, step-limit termination, unknown-tool resilience, empty-final and truncated-call retry budgets, and error paths. It covers context truncation with pinned messages, orphan avoidance, and looping-budget enforcement; configuration validation including context limits and unknown-key rejection; the read-before-edit contract including unread and stale-content rejection and partial-view handling; memory capping including single-line truncation; instruction-file discovery and preference order; the streaming parser including content accumulation, tool-call reassembly, and consecutive and total malformed-chunk limits; model discovery filtering and ranking; approval classification including wrapper handling; session persistence with size caps and legacy-name fallback; file-tool safety checks including binary sampling and bulk limits; and the search, extraction, and tree-query tools including nested-descent and workspace-escape regression tests.
 
 Interactive-layer tests cover the composer, the completion popup, mouse and paste handling, workspace persistence, conversation continuity, turn-aware truncation, approval prompts, abort handling, and prompt forwarding, with explicit background opt-in. The suite is expected to pass without network access aside from the optional live probes, and the container-sandbox tests require a container runtime on the host.
 
@@ -34,9 +34,9 @@ The container sandbox runs every command inside an ephemeral container with memo
 
 ### Monitoring
 
-The system writes one structured record per event to an append-only log file, one record per line. Records include a timestamp, event name, and payload with task identifier, step, tool name, and result status including elapsed time and success flag. Caller payloads cannot overwrite timestamps or event names. The file rotates at a bounded size by renaming the current file and starting a fresh one. Monitoring consists of tailing this file and aggregating pass rates, step counts, tool error rates, token usage including cache-hit metrics, and the dropped-record counter which is the only visibility into logging pressure.
+The system writes one structured record per event to an append-only log file, one record per line. Records include a timestamp, event name, and payload with task identifier, step, tool name, and result status including elapsed time and success flag. Caller payloads cannot overwrite timestamps or event names. The file rotates at a bounded size by renaming the current file and starting a fresh one. Monitoring consists of tailing this file and aggregating pass rates, step counts, tool error rates, token usage including cache-hit metrics, and the dropped-record counter, which is the only visibility into logging pressure.
 
-The console also maintains per-turn totals and displays them in the status area, and the streaming path maintains a live token counter. An approval audit log records each tool decision with redacted arguments and rotates at a fixed size. A vault verification script is not shipped: integrity chains for persisted ledgers were deliberately left behind (see docs/ADOPTION.md).
+The console also maintains per-turn totals and displays them in the status area, and the streaming path maintains a live token counter. An approval audit log records each tool decision with redacted arguments and rotates at a fixed size. A vault verification script is not shipped: integrity chains for persisted ledgers were deliberately left behind, as recorded in the adoption report.
 
 ### Backup
 

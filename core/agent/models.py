@@ -104,7 +104,7 @@ def fetch_models(
                 # Fallback for response objects whose read() takes no size
                 # argument: pull bounded chunks so a hostile read(n) cannot
                 # defeat the cap. A truly argument-less reader is the last
-                # resort; its result is still size-checked below (D15).
+                # resort; its result is still size-checked below.
                 raw_bytes = b""
                 try:
                     while len(raw_bytes) <= _MAX_RESPONSE_BYTES:

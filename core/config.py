@@ -48,6 +48,9 @@ DEFAULTS = {
     "context": {"max_messages": 200, "max_chars": 240000},
     "auto_compact_tokens": 60000,  # compact when history exceeds; 0 disables
     "verbose": False,  # echo truncated tool output live
+    # Post-task suggestion chips ("run the tests", "commit", ...) shown
+    # after a finished turn; False removes the row entirely.
+    "suggestions": True,
     "skills": {
         # Auto-attach skill per turn; bundles auto-launch by default.
         "auto": True,
@@ -61,6 +64,9 @@ _MAX_CONFIG_BYTES = 1_000_000
 
 def load_config(path: str) -> dict:
     """Load a config file and merge it deeply over the defaults."""
+    # Accept path-like objects: os.path calls below require a string, and
+    # a raw AttributeError would bury the real "bad config" diagnosis.
+    path = os.fspath(path)
     if not os.path.isfile(path):
         raise ConfigError(f"config file not found: {path}")
     try:

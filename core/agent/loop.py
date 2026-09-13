@@ -271,15 +271,10 @@ class AgentLoop:
                                 }
                             )
                         break
-                    # Every call in the batch must end up with a tool message,
-                    # whatever happens inside the tool. An abort raised from
-                    # within a tool (the sandbox checks the abort signal
-                    # mid-execution) used to escape the loop before the
-                    # synthetic fill ran, leaving the just-appended assistant
-                    # tool_calls without answering tool messages — and the
-                    # next model request rejected by the provider until the
-                    # conversation was cleared. The fill below runs first,
-                    # then the abort propagates via the stopped_reason.
+                    # An abort raised inside a tool used to escape before this
+                    # fill ran, leaving unanswered tool calls that the next
+                    # request would reject. Fill first, then let the abort
+                    # propagate through the stopped reason.
                     try:
                         self._process_tool_call(
                             task_id, steps, call, cid, context, metrics, recent_calls, recent_failed
@@ -398,7 +393,7 @@ class AgentLoop:
             args = call.arguments if isinstance(call.arguments, dict) else {}
             if call.name == "run_command":
                 # Alias spellings share the canonical key, matching the
-                # repair pass and approvals (D4).
+                # repair pass and approvals.
                 key = f"run_command|{canonical_command(args)}"
             elif call.name in ("read_file", "list_dir"):
                 rest = {k: v for k, v in args.items() if k != "path"}
@@ -508,7 +503,7 @@ class AgentLoop:
         raised, was unknown, or got invalid arguments. A normal return is
         a success even when its text starts with "ERROR" (file content
         can legitimately begin that way), so metrics are not skewed by
-        content (D11).
+        content.
         """
         # Registry aliases (e.g. webfetch -> web_fetch) are normalised at
         # build time, so look up the canonical form here or an aliased call
@@ -695,10 +690,9 @@ class AgentLoop:
             cached = _to_int(usage["details"].get("cached_tokens"))
         if cached is not None:
             metrics["cache_hit"] = metrics.get("cache_hit", 0) + cached
-        # Fallback when provider gives no usage at all: estimate from context size
-        # so /cost and CACHE always show something useful.
+        # No usable token counts from the provider: flag the gap so the
+        # display can mark usage as estimated rather than inventing numbers.
         if prompt is None and completion is None:
-            # Mark as estimated so display can note it if desired
             metrics["usage_estimated"] = metrics.get("usage_estimated", 0) + 1
 
     def _render_task(self, task: dict[str, Any]) -> str:

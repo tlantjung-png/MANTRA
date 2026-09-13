@@ -48,7 +48,7 @@ def render_environment(workspace: str) -> str:
 
 
 # Git facts per workspace, cached briefly: each system-prompt rebuild
-# otherwise spawns up to three git subprocesses (D21).
+# otherwise spawns up to three git subprocesses.
 _GIT_FACTS_CACHE: dict[str, tuple[float, str]] = {}
 _GIT_FACTS_TTL = 30.0
 
@@ -204,7 +204,7 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
         existing = _read_file(memory_path)
         # A single appended entry longer than the cap must not wipe the
         # file: cap the entry itself first, and refuse when nothing of
-        # it survives (D2).
+        # it survives.
         if len(entry) > cap:
             body = entry.rstrip("\n")
             body = body[-cap:] if len(body) > cap else body
@@ -353,7 +353,7 @@ _META_RE = re.compile(r"\|\s*(?:status=([a-z]+)|stale=(\d{4}-\d{2}-\d{2})|source
 
 
 def _prune_to_cap(combined: str, cap: int) -> str:
-    """Drop oldest lines until the body fits cap; never returns empty (D2)."""
+    """Drop oldest lines until the body fits cap; never returns empty."""
     while len(combined) > cap:
         lines = combined.split("\n")
         if len(lines) <= 2:

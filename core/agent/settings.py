@@ -27,6 +27,10 @@ DEFAULT_FILE = {
         "auto": True,
         "auto_bundle": True,
     },
+    # Console UI preferences (runtime-toggled, persisted across restarts).
+    "ui": {
+        "suggestions": True,
+    },
 }
 
 
@@ -240,11 +244,15 @@ def load() -> dict[str, Any]:
         "endpoints": {},
         "active": dict(DEFAULT_FILE["active"]),
         "skills": dict(DEFAULT_FILE["skills"]),
+        "ui": dict(DEFAULT_FILE["ui"]),
     }
     skills = data.get("skills")
     if isinstance(skills, dict):
         # Copy only known preference keys; unknown stored keys are dropped.
         out["skills"].update({key: skills.get(key, value) for key, value in DEFAULT_FILE["skills"].items()})
+    ui = data.get("ui")
+    if isinstance(ui, dict):
+        out["ui"].update({key: ui.get(key, value) for key, value in DEFAULT_FILE["ui"].items()})
     endpoints = data.get("endpoints")
     if isinstance(endpoints, dict):
         for name, entry in endpoints.items():
@@ -418,6 +426,19 @@ def set_skills_prefs(auto: bool | None = None, auto_bundle: bool | None = None) 
         data["skills"]["auto"] = bool(auto)
     if auto_bundle is not None:
         data["skills"]["auto_bundle"] = bool(auto_bundle)
+    return _write(data)
+
+
+def ui_prefs() -> dict[str, Any]:
+    """The UI preferences the operator has actually set."""
+    return dict(load()["ui"])
+
+
+def set_ui_prefs(suggestions: bool | None = None) -> bool:
+    """Record the UI preferences. Arguments left as-is when not given."""
+    data = load()
+    if suggestions is not None:
+        data["ui"]["suggestions"] = bool(suggestions)
     return _write(data)
 
 
