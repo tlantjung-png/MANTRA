@@ -40,7 +40,3 @@ Thumbs.db
 # Patch / merge leftovers
 *.orig
 *.rej
-
-# Tests: kept untracked on purpose; the suite is reproducible from the
-# sources and the pytest cache. Remove this line to track tests/.
-tests/
