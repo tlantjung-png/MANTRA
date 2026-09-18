@@ -1052,19 +1052,12 @@ class TuiApp:
             # while a path or command is being typed. The list is walked
             # with the arrow keys, or paged by clicking an item / its
             # "… more" row.
-            composer_height = self._composer_height(self.rows)
-            composer_top = self.rows - composer_height
             if self._wheel_over_scrollbar(ev):
                 return
-            if ev.y >= composer_top and self.composer.is_multiline:
-                # Only a multi-line prompt has a view of its own to wheel:
-                # a single-line box has nothing to scroll, so its wheel
-                # events fall through to the transcript.
-                delta = -1 if ev.button == _WHEEL_UP else 1
-                with self.lock:
-                    self.composer.scroll_by(delta, composer_height - 1)
-                self.mark_dirty()
-                return
+            # The wheel always scrolls the conversation, even over the
+            # prompt box: routing notches to a multi-line composer made the
+            # box swallow the wheel, so the operator could not scroll the
+            # transcript from the lower half of the window.
             with self.lock:
                 # ~10 rows per notch: a full page overshot past the
                 # context around the target, three rows took forever.
