@@ -9,7 +9,7 @@ MANTRA is a modular harness that delegates coding and analysis tasks to an exter
 - Network access to a language-model endpoint plus an API key for it. Any endpoint that speaks the common chat-completions protocol works.
 - A container runtime is optional. It is only needed for the container sandbox, which confines untrusted work. Trusted daily work uses the host sandbox and needs nothing extra.
 
-There are no mandatory third-party dependencies: core operation relies on the standard library only. An optional parsing library is required only when configuration documents are written in the alternative markup format instead of JSON.
+There is one runtime dependency, an XML-parsing library used when extracting structured documents. All other core operation relies on the standard library; an optional alternative parsing library is needed only when configuration documents are written in the alternative markup format instead of JSON.
 
 ## Installation
 
@@ -52,6 +52,8 @@ Useful commands; the help command inside the console lists them all:
 - memory: show the workspace memory file
 - cost: show token usage and cache metrics
 - verbose: toggle per-tool detail output
+- suggestions: toggle the follow-up chip row shown after each reply
+- export: write the conversation to a Markdown or JSON file
 - clear: clear the conversation; files are kept
 - exit: leave the console; autosaves first
 

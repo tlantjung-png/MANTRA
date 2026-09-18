@@ -24,10 +24,8 @@ from urllib.parse import urlparse
 from core.agent.exceptions import HarnessError
 from core.config import REASONING_EFFORTS
 from core.agent.keys import mask, store as store_key, stored_keys
-from core.agent.models import fetch_models, is_reasoning_model
 from core.agent.settings import (
     add_endpoint,
-    endpoint_name_for_url,
     endpoints as known_endpoints,
     models_for,
     remove_endpoint,
@@ -37,6 +35,14 @@ from core.agent.settings import (
     validate_endpoint,
 )
 from core.tui.overlays import Option
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only: console.py imports this module back, so a runtime import
+    # here would be circular. ruff F821 is otherwise raised on every
+    # forward reference in signatures.
+    from core.console import ConsoleSession
 
 def _effort_options(current: str | None) -> list[Option]:
     """Thinking levels, with the one in force marked.

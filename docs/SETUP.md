@@ -6,7 +6,7 @@ A supported interpreter version is required as declared in the project manifest 
 
 ## Installation
 
-The project is installed via the standard packaging mechanism using the manifest in the repository root. Package discovery is limited to the source directory. No runtime dependencies are declared for core operation. An optional parsing library is required only when using the alternative configuration format.
+The project is installed via the standard packaging mechanism using the manifest in the repository root. Package discovery is limited to the source directory. One runtime dependency is declared: an XML-parsing library used by the document-extraction tool. An optional alternative parsing library is required only when using the alternative configuration format.
 
 After installation, two entry points are available: the interactive console and the headless runner. On Windows the console can also be invoked directly from the source tree without installation through the provided launcher script. The launcher first probes whether the core package resolves under the launcher's own directory, and when the probe fails it retries with the source directory prepended to the module search path; the probe also rejects a foreign core package from site-packages so a different package cannot hijack the console.
 

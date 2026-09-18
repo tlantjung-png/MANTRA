@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core.agent.keys import warn_insecure_transport
+from core.locking import break_stale_lock as _break_stale_lock_shared
 
 _VERSION = 1
 
@@ -119,26 +120,6 @@ def _quarantine(file: Path, reason: str) -> str | None:
         return None
 
 
-def _break_stale_lock(lock_path: Path) -> bool:
-    """Try to break a stale lock atomically. Returns True if removed."""
-    try:
-        stat = lock_path.stat()
-        age = time.time() - stat.st_mtime
-        if age < _LOCK_STALE_SECONDS:
-            return False
-        # Compare-and-remove: re-stat before unlink so a fresh lock is never deleted.
-        try:
-            stat2 = lock_path.stat()
-            if stat2.st_mtime != stat.st_mtime:
-                return False
-            lock_path.unlink(missing_ok=True)
-            return True
-        except FileNotFoundError:
-            return True
-    except OSError:
-        return False
-
-
 def _write(data: dict[str, Any]) -> bool:
     """Persist the document atomically. Returns False when the write failed."""
     file = path()
@@ -162,7 +143,7 @@ def _write(data: dict[str, Any]) -> bool:
     # Opportunistically break a stale lock before trying; if break fails,
     # the subsequent open will simply wait.
     if lock_path.exists():
-        _break_stale_lock(lock_path)
+        _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
     acquired = False
     lock_fd = None
     start = time.monotonic()
@@ -176,7 +157,7 @@ def _write(data: dict[str, Any]) -> bool:
             # Opportunistically retry stale break if lock looks old
             try:
                 if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE_SECONDS:
-                    _break_stale_lock(lock_path)
+                    _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
             except OSError:
                 pass
         except OSError:

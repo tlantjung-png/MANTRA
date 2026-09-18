@@ -581,3 +581,46 @@ class Composer:
         # Windowed: mirror _window's keep calculation in display columns.
         keep = max(0, display - avail // 2)
         return label_vis + max(0, display - keep)
+
+    def column_for(self, offset: int, cols: int) -> int:
+        """Display column of buffer ``offset`` — where the popup anchors.
+
+        Must agree with ``_caret_col`` (same layout math) so the dropdown
+        hangs exactly off the token being typed, per display column (wide
+        chars count two) and per horizontal window when the buffer slides.
+        """
+        label_vis = visible_len(f"│ {self.label} ")
+        avail = max(0, cols - label_vis - 1)
+        if self.is_multiline:
+            lines = self.buffer.split("\n")
+            cl = min(len(lines) - 1, self.buffer[:offset].count("\n"))
+            start = sum(len(lines[i]) + 1 for i in range(cl))
+            col = offset - start
+            line = lines[cl]
+        else:
+            col = offset
+            line = self.buffer
+        col_in_line = min(col, len(line))
+        display = visible_len(line[:col_in_line])
+        caret_display = self._caret_offset_display(cols)
+        if visible_len(self.buffer) <= avail:
+            return label_vis + min(display, caret_display)
+        # Windowed: the whole view shares the caret's keep offset, and no
+        # offset may anchor right of the caret (popup rows only ever use
+        # the caret's own line, but the bound must hold for any offset).
+        keep = max(0, caret_display - avail // 2)
+        return label_vis + min(max(0, display - keep), max(0, caret_display - keep))
+
+    def _caret_offset_display(self, cols: int) -> int:
+        """Display column of the caret, in the caret's own line coords."""
+        if self.is_multiline:
+            lines = self.buffer.split("\n")
+            cl = min(len(lines) - 1, self.buffer[: self.cursor].count("\n"))
+            start = sum(len(lines[i]) + 1 for i in range(cl))
+            col = self.cursor - start
+            line = lines[cl]
+        else:
+            col = self.cursor
+            line = self.buffer
+        col_in_line = min(col, len(line))
+        return visible_len(line[:col_in_line])

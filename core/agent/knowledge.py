@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Any
 
+from core.locking import break_stale_lock as _break_stale_lock_shared
+
 _memory_lock = threading.Lock()
 
 # Memory-write lock thresholds. The wait is slightly longer than other
@@ -232,7 +234,7 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
             # as the arbiter; stale removal is verified to avoid deleting a
             # freshly created lock.
             if os.path.exists(lock_path):
-                _break_stale_lock(lock_path)
+                _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
             # Brief lock wait on interactive thread.
             start = time.monotonic()
             while time.monotonic() - start < _LOCK_WAIT_SECONDS:
@@ -245,7 +247,7 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     time.sleep(0.02)
                     try:
                         if time.time() - os.stat(lock_path).st_mtime >= _LOCK_STALE_SECONDS:
-                            _break_stale_lock(lock_path)
+                            _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
                     except OSError:
                         pass
                 except OSError:
@@ -303,27 +305,6 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                 except OSError:
                     pass
     return False
-
-
-def _break_stale_lock(lock_path: str) -> bool:
-    """Remove a lock whose holder is no longer around to remove it."""
-    try:
-        stat = os.stat(lock_path)
-        age = time.time() - stat.st_mtime
-        if age < _LOCK_STALE_SECONDS:
-            return False
-        # Verify mtime hasn't changed since we checked to avoid deleting
-        # a lock that was just freshly created by another process.
-        try:
-            stat2 = os.stat(lock_path)
-            if stat2.st_mtime != stat.st_mtime:
-                return False
-            os.remove(lock_path)
-            return True
-        except FileNotFoundError:
-            return True
-    except OSError:
-        return False
 
 
 def _read_file(path: str) -> str:
@@ -538,7 +519,7 @@ def rewrite_memory(memory_path: str | None, body: str, new_entry: str | None = N
     lock_handle = None
     try:
         if os.path.exists(lock_path):
-            _break_stale_lock(lock_path)
+            _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
         start = time.monotonic()
         while time.monotonic() - start < _LOCK_WAIT_SECONDS:
             try:
@@ -550,7 +531,7 @@ def rewrite_memory(memory_path: str | None, body: str, new_entry: str | None = N
                 time.sleep(0.02)
                 try:
                     if time.time() - os.stat(lock_path).st_mtime >= _LOCK_STALE_SECONDS:
-                        _break_stale_lock(lock_path)
+                        _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
                 except OSError:
                     pass
             except OSError:

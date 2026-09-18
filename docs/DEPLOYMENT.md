@@ -2,7 +2,7 @@
 
 ## Build
 
-Build is declared via the standard packaging manifest with a minimum interpreter version of 3.10. Package discovery is limited to the source directory. No runtime dependencies are declared for core operation. An optional parsing library is required only for the alternative configuration format.
+Build is declared via the standard packaging manifest with a minimum interpreter version of 3.10. Package discovery is limited to the source directory. One runtime dependency is declared: an XML-parsing library used by the document-extraction tool. An optional parsing library is required only for the alternative configuration format.
 
 Build artifacts include distribution metadata and entry-point declarations for the interactive console and the headless runner. The manifest also ships example configuration and task documents, the knowledge file, command rules, and skill markdown as package data, and declares test discovery and module-search-path adjustments for the test suite.
 

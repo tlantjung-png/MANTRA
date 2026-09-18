@@ -10,7 +10,6 @@ live the whole time.
 
 from __future__ import annotations
 
-import os
 import queue
 import re
 import threading
@@ -18,8 +17,23 @@ import time
 from typing import Any
 
 from core import theme
-from core.term import visible_len
 from core.agent import sessions
+from core.term import ansi_strip as strip_ansi, visible_len
+from core.tui.backend import Backend, Key, Mouse, Paste, Resize
+from core.tui.buffer import Renderer
+from core.tui.clipboard import copy_text
+from core.tui.composer import Composer
+from core.tui.loop import Presenter
+from core.tui.overlays import (
+    LinePrompt,
+    MenuOverlay,
+    QuestionCard,
+    render_completion,
+)
+from core.tui.selection import Selection, col_to_offset
+from core.tui.transcript import Transcript
+from core.tui.suggest import suggestions_for, topic_of
+
 from core.diffparse import parse_diff
 from core.tui.review import ReviewState, render_review
 from core.tui.sessionpanel import SessionEntry, SessionPanelState, render_session_panel
@@ -69,22 +83,6 @@ def _redact_model_line_keys(text: str) -> str:
         tail = f" {parts[4]}" if len(parts) >= 5 else ""
         return f"{parts[0]} {parts[1]} {parts[2]} {masked}{tail}"
     return text
-from core.term import ansi_strip as strip_ansi
-
-from core.tui.backend import Backend, Key, Mouse, Paste, Resize
-from core.tui.buffer import Buffer, Renderer
-from core.tui.clipboard import copy_text
-from core.tui.composer import Composer
-from core.tui.loop import Presenter
-from core.tui.overlays import (
-    LinePrompt,
-    MenuOverlay,
-    QuestionCard,
-    render_completion,
-)
-from core.tui.selection import Selection, col_to_offset
-from core.tui.transcript import Transcript
-from core.tui.suggest import Suggestion, suggestions_for
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
@@ -105,6 +103,15 @@ SUGGESTION_LINGER = 45.0  # seconds the row stays before self-dismissing
 
 _WHEEL_UP = 64
 _WHEEL_DOWN = 65
+# Ceiling for the completion dropdown's adaptive window: a dropdown is a
+# shortcut, not a file browser, so "it fits" is not reason enough to show
+# a hundred rows on a very tall terminal.
+_POPUP_ROWS_CAP = 24
+# Smallest frame the chrome can be laid out in: below this the info bar,
+# the transcript window, the completion popup and the prompt box cannot all
+# have a row of their own, so the frame degrades to a one-line notice.
+MIN_COLS = 30
+MIN_ROWS = 8
 
 STYLE_HAIR = ("38;5;238",)
 STYLE_ACCENT = (theme.BLOOD,)
@@ -317,6 +324,15 @@ class TuiApp:
         # Turn-scoped context the suggestion engine reads at turn end.
         self._turn_user_prompt = ""
         self._turn_tool_text: list[str] = []
+        # Chips show at every turn end: _turn_pending marks a submitted
+        # turn not yet consumed, _turn_was_command suppresses the row for
+        # slash-command turns (their "reply" is chrome, not agent work).
+        self._turn_pending = False
+        self._turn_was_command = False
+        # Subjects of recent turns, newest first: lets the chip row jump
+        # back to an older thread and inherit a subject when a turn is
+        # content-free ("thanks").
+        self._recent_topics: list[str] = []
         self._turn_had_error = False
         # Auto-suggestions after a finished task: an ordered list of
         # suggestion strings, the hit rects painted for them, and the
@@ -495,11 +511,21 @@ class TuiApp:
             return True  # settings unreadable: default on, never crash startup
 
     def _maybe_show_suggestions(self) -> None:
-        """After a finished turn, derive and show next-step chips."""
-        if not self.suggestions_enabled:
+        """After a finished turn, derive and show next-step chips.
+
+        Runs at every agent-turn end: the engine always returns at least
+        one chip, falling back to conversation-derived ones. Consumed
+        exactly once per turn (set_busy(False) can fire twice), and
+        slash-command turns show nothing - their output is chrome, so
+        follow-up chips there would answer a reply nobody read.
+        """
+        if not self._turn_pending:
+            return  # already consumed, or a spurious set_busy(False)
+        self._turn_pending = False
+        was_command, self._turn_was_command = self._turn_was_command, False
+        if not self.suggestions_enabled or was_command:
+            self._turn_user_prompt = ""
             return
-        if not self._turn_user_prompt:
-            return  # nothing captured (e.g. non-turn path) - skip
         prompt = self._turn_user_prompt
         # The assistant's final reply is the richest signal: it states
         # what was done ("edited the files", "all tests pass") and what
@@ -514,14 +540,29 @@ class TuiApp:
             if "→" in ln or ln.lstrip().startswith(("run_command", "edit_file", "write_file", "read_file"))
         ]
         tool_text = "\n".join(tool_lines)
+        # The effective subject mirrors the engine's own choice (the
+        # prompt's topic, or the inherited one when the prompt was
+        # content-free); it is recorded so later turns can jump back to
+        # this thread or inherit it in turn.
+        effective_topic = topic_of(prompt) or (self._recent_topics[0] if self._recent_topics else "")
         suggestions = suggestions_for(
-            prompt, reply, tool_text, self._turn_had_error, max_items=SUGGESTION_MAX
+            prompt, reply, tool_text, self._turn_had_error, max_items=SUGGESTION_MAX,
+            recent_topics=self._recent_topics,
         )
-        if suggestions:
-            self.suggestions = [s.label for s in suggestions]
-            self._suggestion_commands = [s.command for s in suggestions]
+        # The engine guarantees at least one chip for every agent turn,
+        # so this is a shape guard, not a filter: an empty result must
+        # never reach the paint path.
+        self.suggestions = [s.label for s in suggestions][:SUGGESTION_MAX]
+        self._suggestion_commands = [s.command for s in suggestions][:SUGGESTION_MAX]
+        if self.suggestions:
             self._suggestion_selected = None
             self._suggestions_until = time.monotonic() + SUGGESTION_LINGER
+        if effective_topic:
+            # Newest first, deduped (re-raising a topic moves it to the
+            # front), and capped - a bounded memory, not a transcript.
+            self._recent_topics = [effective_topic] + [
+                t for t in self._recent_topics if t != effective_topic
+            ][:7]
         self._turn_user_prompt = ""  # consumed
 
     def _dismiss_suggestions(self) -> None:
@@ -596,11 +637,20 @@ class TuiApp:
             self._turn_user_prompt = text
             self._turn_tool_text = []
             self._turn_had_error = False
+            self._turn_pending = True
+            self._turn_was_command = False
         # A detached scroll intentionally survives a new submission
         # (pinned by test_turn_end_does_not_yank_a_detached_scroll), so
         # submit never jumps — and never fades the chip either.
         stamp = time.strftime("%H:%M")
-        self.feed_output(f"\033[2m{stamp}\033[0m  {display_text}\n")
+        # The operator's own line must be scannable in a wall of tool
+        # output: timestamp on a subtle dark chip, the text in the accent
+        # colour (the same hue as the wordmark and spinner, so "what I
+        # typed" reads as one visual family).
+        self.feed_output(
+            f"\033[2m\033[48;5;236m{stamp}\033[0m"
+            f"\033[2m you\033[0m \033[38;5;204m{display_text}\033[0m\n"
+        )
         self.transcript.flush_partial()
         # Typing a prompt supersedes the suggestion row.
         self._dismiss_suggestions()
@@ -612,6 +662,7 @@ class TuiApp:
 
         try:
             was_command = dispatch_session(self.session, text)
+            self._turn_was_command = was_command
             if not was_command:
                 self.session.handle(text)
         except SystemExit:
@@ -782,10 +833,14 @@ class TuiApp:
         if self.review is not None:
             if isinstance(event, Key):
                 self._handle_review_key(event.key, event.mods)
+            elif isinstance(event, Mouse):
+                self._handle_review_mouse(event)
             return
         if self.session_panel is not None:
             if isinstance(event, Key):
                 self._handle_session_panel_key(event.key, event.mods)
+            elif isinstance(event, Mouse):
+                self._handle_session_panel_mouse(event)
             return
         if isinstance(event, Paste):
             if isinstance(self.overlay, LinePrompt):
@@ -849,6 +904,16 @@ class TuiApp:
         if key == "esc":
             if self.busy:
                 self._abort_turn()
+                return
+            if self.composer.popup_open:
+                # The completion popup owns ESC first: dismiss it here
+                # before the generic handlers claim the key, otherwise
+                # the popup can never be closed by ESC and keeps
+                # swallowing wheel events over its rect.
+                self.composer._dismissed = True
+                self.composer.completion = None
+                self._popup_rect = None
+                self.mark_dirty()
                 return
             if self.selection.active:
                 self.selection.clear()
@@ -977,27 +1042,24 @@ class TuiApp:
 
     def _handle_mouse(self, ev: Mouse) -> None:
         if ev.kind == "wheel":
-            if (
-                self._popup_rect
-                and self._popup_rect[0] <= ev.x < self._popup_rect[0] + self._popup_rect[2]
-                and self._popup_rect[1] <= ev.y <= self._popup_rect[1] + self._popup_rect[3]
-            ):
-                comp = self.composer
-                if comp.popup_open:
-                    step = -1 if ev.button == _WHEEL_UP else 1
-                    comp.selected = max(0, min(len(comp.completion.items) - 1, comp.selected + step))
-                    self.mark_dirty()
+            if self._overlay_takes_wheel(ev):
                 return
-            # Route by where the cursor sits: over the prompt box the
-            # wheel scrolls the composer's own multi-line view; over the
-            # conversation it scrolls the transcript.
+            # The wheel always scrolls the conversation; the completion
+            # popup never claims it. That dropdown is a tall floating box
+            # over the lower half of the transcript, so letting it swallow
+            # wheel events left the conversation unscrollable whenever a
+            # "/" or "@" completion was open - which is most of the time
+            # while a path or command is being typed. The list is walked
+            # with the arrow keys, or paged by clicking an item / its
+            # "… more" row.
             composer_height = self._composer_height(self.rows)
             composer_top = self.rows - composer_height
-            if ev.y >= composer_top and not (
-                self._popup_rect
-                and self._popup_rect[0] <= ev.x < self._popup_rect[0] + self._popup_rect[2]
-                and self._popup_rect[1] <= ev.y <= self._popup_rect[1] + self._popup_rect[3]
-            ):
+            if self._wheel_over_scrollbar(ev):
+                return
+            if ev.y >= composer_top and self.composer.is_multiline:
+                # Only a multi-line prompt has a view of its own to wheel:
+                # a single-line box has nothing to scroll, so its wheel
+                # events fall through to the transcript.
                 delta = -1 if ev.button == _WHEEL_UP else 1
                 with self.lock:
                     self.composer.scroll_by(delta, composer_height - 1)
@@ -1021,6 +1083,8 @@ class TuiApp:
             self.mark_dirty()
             return
         if ev.kind == "press" and ev.button == 0:
+            if self._overlay_takes_click(ev):
+                return
             in_popup = (
                 self._popup_rect is not None
                 and self._popup_rect[0] <= ev.x < self._popup_rect[0] + self._popup_rect[2]
@@ -1141,10 +1205,9 @@ class TuiApp:
         self._scrollbar_anchor = y - (top + thumb_top)  # grab offset within the thumb
         if not (top + thumb_top) <= y < top + thumb_top + thumb_span:
             # Track press (not the thumb): page one viewport toward the
-            # press, clamped so the thumb parks at the pressed end.
-            total = self.transcript.total_rows()
+            # press. The step is a fixed viewport page - not the distance
+            # to the press - and the transcript clamps it at either end.
             height_v = self.transcript.viewport_height
-            max_offset = max(1, total - height_v)
             toward_tail = y < top + thumb_top  # press above thumb: page up
             with self.lock:
                 step = max(3, height_v - 2)
@@ -1158,12 +1221,46 @@ class TuiApp:
         self.mark_dirty()
         return True
 
+    def _wheel_over_scrollbar(self, ev: Mouse) -> bool:
+        """Wheel on the bar's own column drags the thumb one step.
+
+        The bar is a drag target, not just a readout: a notch on the track
+        walks the thumb by exactly one thumb-step (the inverse of the
+        render mapping), so the scrollbar can be operated with the wheel
+        and lands between the page-sized jumps the conversation uses.
+        While a drag is in progress the held button owns the bar, so a
+        stray notch cannot snatch the thumb out from under the cursor.
+        Returns True when the notch belonged to the bar.
+        """
+        bar = self._scrollbar
+        if bar is None:
+            return False
+        if self._scrollbar_drag:
+            # A held button owns the bar: falling through to the page step
+            # here would drag the thumb out from under the cursor.
+            return True
+        track_x, top, height, _thumb_top, thumb_span = bar
+        if ev.x != track_x or not (top <= ev.y < top + height):
+            return False
+        total = self.transcript.total_rows()
+        height_v = self.transcript.viewport_height
+        # One thumb-step: how far the view moves when the thumb is dragged
+        # a single row (the same mapping, read backwards).
+        step = max(1, max(1, total - height_v) // max(1, height - thumb_span))
+        with self.lock:
+            if ev.button == _WHEEL_UP:
+                self.transcript.scroll_up(step)
+            else:
+                self.transcript.scroll_down(step)
+        self.mark_dirty()
+        return True
+
     def _drag_scrollbar(self, y: int) -> None:
         """Move the thumb so the grab point stays under the cursor."""
         bar = self._scrollbar
         if bar is None:
             return
-        track_x, top, height, _thumb_top, thumb_span = bar
+        _track_x, top, height, _thumb_top, thumb_span = bar
         anchor = max(0, min(thumb_span - 1, getattr(self, "_scrollbar_anchor", 0)))
         thumb_top = max(0, min(height - thumb_span, y - anchor - top))
         total = self.transcript.total_rows()
@@ -1262,9 +1359,18 @@ class TuiApp:
         buf.reset()
         styles = renderer.styles
         hair_style = styles.id_for(STYLE_HAIR)
-        accent = styles.id_for(STYLE_ACCENT)
         select_style = styles.id_for(STYLE_SELECT)
-        warn_style = styles.id_for(STYLE_WARN)
+
+        # Below the minimum size the chrome cannot be laid out without
+        # overlapping itself (the info bar, the transcript, the popup and
+        # the prompt box all compete for the same few rows), so the frame
+        # degrades to a single line of guidance. An open modal is still
+        # drawn - clamped to the frame - so an approval waiting behind it
+        # is never lost.
+        if cols < MIN_COLS or rows < MIN_ROWS:
+            self._render_minimal_frame(buf, styles, cols, rows)
+            renderer.flush()
+            return
 
         # Full-screen diff review replaces the whole chrome.
         if self.review is not None:
@@ -1392,7 +1498,7 @@ class TuiApp:
                 sep = "  "
                 x = 1
                 y = content_top + height - 1
-                for i, chip in enumerate(chips):
+                for chip in chips:
                     w = visible_len(chip)
                     if x + w > cols - 1:
                         break  # no room for more chips this frame
@@ -1421,8 +1527,11 @@ class TuiApp:
 
         # Centered welcome card: shown while the transcript is still
         # empty, re-centered every frame so it follows resized windows.
-        if self._welcome_card and not self.transcript.raw:
-            card = self._welcome_lines
+        if self._welcome_card and not self.transcript.raw and height > 0:
+            # Only the lines that fit the content area are drawn: a short
+            # window clips the card instead of letting it paint over the
+            # status row and the prompt box below it.
+            card = self._welcome_lines[:height]
             card_w = max((visible_len(ln) for ln in card), default=0)
             x = max(0, (cols - card_w) // 2)
             y = content_top + max(0, (height - len(card)) // 2)
@@ -1461,8 +1570,16 @@ class TuiApp:
 
         # Completion popup above the border row.
         comp = self.composer
-        if comp.popup_open:
-            max_rows = max(3, min(comp.max_popup, border_row - 2))
+        # Adaptive window: the dropdown grows with the viewport (a tall
+        # terminal shows more of the list than the composer's own
+        # preference) but never eats the conversation, and always leaves
+        # room for the box borders plus the two overflow rows
+        # ("… n above" / "… n more") above the status line. Under two item
+        # rows there is nothing worth drawing, so the dropdown is skipped
+        # rather than colliding with the info bar.
+        space = border_row - content_top - 4
+        if comp.popup_open and space >= 2:
+            max_rows = max(1, min(max(comp.max_popup, space // 2), space, _POPUP_ROWS_CAP))
             comp._popup_off = max(0, min(comp._popup_off, max(0, len(comp.completion.items) - max_rows)))
             if comp.selected < comp._popup_off:
                 comp._popup_off = comp.selected
@@ -1477,6 +1594,7 @@ class TuiApp:
                 max_rows,
                 border_row,
                 cols,
+                comp.column_for(comp.completion.start, cols),
             )
             self._popup_rect = (x, y, w, h) if h else None
             self._popup_hits = {}
@@ -1503,6 +1621,21 @@ class TuiApp:
 
         renderer.flush()
 
+    def _render_minimal_frame(self, buf, styles, cols: int, rows: int) -> None:
+        """The whole frame when the terminal is too small to lay out.
+
+        One line of guidance instead of a chrome that paints over itself,
+        plus an open modal card (clamped to the frame) so a pending
+        approval stays visible and answerable.
+        """
+        notice = f"terminal too small ({cols}x{rows}) - resize to continue"
+        if rows >= 1 and cols >= 8:
+            line = notice[: max(0, cols - 1)]
+            x = max(0, (cols - visible_len(line)) // 2)
+            buf.set_styled_line(x, 0, f"\033[{theme.WARN}m{line}\033[0m", styles, cols)
+        if self.overlay is not None:
+            self.overlay.render(buf, cols, rows)
+
     def _composer_height(self, rows: int) -> int:
         # One extra row for the box's bottom edge: the prompt is a
         # closed rectangle, not an open U.
@@ -1528,7 +1661,9 @@ class TuiApp:
         # semantic values (model in info blue, approval by mode, cache
         # in sage), hairline separators.
         st = self.session.style
-        label = lambda t: st._wrap(theme.FAINT, t)
+
+        def label(t: str) -> str:
+            return st._wrap(theme.FAINT, t)
         appr_color = {
             "auto": theme.SAGE, "plan": theme.INFO,
             "yolo": theme.WARN, "default": theme.ASH,
@@ -1587,7 +1722,83 @@ class TuiApp:
             review.split = not review.split
         self.mark_dirty()
 
+    def _overlay_takes_click(self, ev: Mouse) -> bool:
+        """A click inside an open modal card belongs to the card.
+
+        A menu highlights the option under the pointer (clicking the
+        highlighted one accepts it); an approval card's drawn buttons
+        answer it. Any other cell inside the card is still swallowed, so a
+        modal never lights up a selection on the transcript behind it -
+        but clicks outside the card keep reaching the conversation.
+        """
+        overlay = self.overlay
+        if not isinstance(overlay, (MenuOverlay, QuestionCard, LinePrompt)):
+            return False
+        if not overlay.click(ev.x, ev.y):
+            return False
+        if overlay.finished:
+            if isinstance(overlay, MenuOverlay):
+                self._finish_overlay(None if overlay.cancelled else overlay.result)
+            else:
+                self._finish_overlay(overlay.answer)
+        self.mark_dirty()
+        return True
+
+    def _overlay_takes_wheel(self, ev: Mouse) -> bool:
+        """Route a wheel notch to an open modal card when it is over it.
+
+        A menu box takes the notch to walk its options, an approval card to
+        scroll a long body, and a key prompt to slide a value wider than
+        the card; wheeling *outside* the card keeps scrolling the
+        conversation behind it, so a modal never makes the transcript
+        unreachable.
+        """
+        overlay = self.overlay
+        if overlay is None or not isinstance(
+            overlay, (MenuOverlay, QuestionCard, LinePrompt)
+        ):
+            return False
+        rect = getattr(overlay, "rect", None)
+        if rect is None:
+            return False
+        x, y, w, h = rect
+        if not (x <= ev.x < x + w and y <= ev.y < y + h):
+            return False
+        overlay.consume_wheel(-1 if ev.button == _WHEEL_UP else 1)
+        self.mark_dirty()
+        return True
+
+    def _handle_review_mouse(self, ev: Mouse) -> None:
+        """Wheel the full-screen diff review: a quarter page per notch.
+
+        Mouse events reaching ``handle_event`` while the review owns the
+        screen used to be dropped, which left the diff view unscrollable
+        with the wheel.
+        """
+        review = self.review
+        if review is None or ev.kind != "wheel":
+            return
+        viewport = max(1, self.rows - 2)
+        total = int(getattr(review, "_total", 0) or 0)
+        step = max(3, viewport // 4)
+        review.step(-step if ev.button == _WHEEL_UP else step, total, viewport)
+        self.mark_dirty()
+
     # ── session manager panel ────────────────────────────────
+
+    def _handle_session_panel_mouse(self, ev: Mouse) -> None:
+        """Wheel the session list one entry per notch (two rows each)."""
+        panel = self.session_panel
+        if panel is None or ev.kind != "wheel":
+            return
+        total = len(panel.entries)
+        entry_viewport = max(1, max(2, self.rows - 2) // 2)
+        panel.next(-1 if ev.button == _WHEEL_UP else 1, total)
+        if panel.index < panel.offset:
+            panel.offset = panel.index
+        elif panel.index >= panel.offset + entry_viewport:
+            panel.offset = panel.index - entry_viewport + 1
+        self.mark_dirty()
 
     def _render_session_panel_frame(self, buf, styles, cols: int, rows: int) -> None:
         panel = self.session_panel
@@ -1679,8 +1890,8 @@ class TuiApp:
         self.mark_dirty()
 
 
-# The session's slash-command router is imported lazily so the session
-# module never needs to know about this one.
+# Imported lazily so the import order never matters: core.console imports
+# this module's helpers at its tail, and the tests patch both namespaces.
 def dispatch_session(session, line: str) -> bool:
     from core.console import dispatch
 

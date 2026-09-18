@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import http.client
 import ipaddress
@@ -11,7 +12,7 @@ import threading
 import urllib.parse
 import zlib
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import (
@@ -64,8 +65,8 @@ class _TextExtractor(HTMLParser):
     reconstruct a table's layout, which is why the tool says so.
     """
 
-    _SKIP = {"script", "style", "noscript", "template", "svg", "head", "iframe"}
-    _BREAK = {
+    _SKIP: ClassVar[set[str]] = {"script", "style", "noscript", "template", "svg", "head", "iframe"}
+    _BREAK: ClassVar[set[str]] = {
         "p", "div", "br", "li", "tr", "section", "article", "header",
         "footer", "nav", "table", "ul", "ol", "dl", "blockquote", "pre",
         "h1", "h2", "h3", "h4", "h5", "h6",
@@ -162,6 +163,10 @@ class _InflatedResult(bytes):
         if isinstance(other, tuple) and len(other) == 2:
             return (bytes(self), self._truncated) == other
         return super().__eq__(other)  # type: ignore[no-any-return]
+
+    def __hash__(self) -> int:
+        # Bytes semantics (the truncation flag is a compat side-channel).
+        return bytes.__hash__(self)
 
 
 def _inflate(raw: bytes, content_encoding: str, cap: int = _MAX_INFLATED) -> _InflatedResult:  # type: ignore[return]
@@ -295,9 +300,7 @@ def _parse_alternative_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
 _RESOLVER_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="mantra-dns"
 )
-import atexit as _atexit
-
-_atexit.register(_RESOLVER_POOL.shutdown, wait=False, cancel_futures=True)
+atexit.register(_RESOLVER_POOL.shutdown, wait=False, cancel_futures=True)
 
 
 def _resolve_limited(host: str, timeout: float) -> list[tuple] | None:
@@ -373,7 +376,7 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 # the per-hop redirect checks and the final-URL re-check
                 # below remain the gate for actual private targets.
                 return False
-            for family, _, _, _, sockaddr in infos:
+            for _family, _, _, _, sockaddr in infos:
                 addr = sockaddr[0]
                 try:
                     ip = ipaddress.ip_address(addr.split("%")[0])
@@ -515,7 +518,7 @@ def _resolve_and_pin(hostname: str) -> str | None:
     if not infos:
         return None
     pinned: str | None = None
-    for family, _, _, _, sockaddr in infos:
+    for _family, _, _, _, sockaddr in infos:
         addr = sockaddr[0].split("%")[0]
         try:
             ip = ipaddress.ip_address(addr)
@@ -662,7 +665,7 @@ class WebFetchTool(Tool):
         "documentation, release notes, issue threads and API references. "
         "Table and page layout is not preserved."
     )
-    parameters: dict[str, Any] = {
+    parameters: ClassVar[dict[str, Any]] = {
         "type": "object",
         "properties": {
             "url": {
@@ -711,10 +714,12 @@ class WebFetchTool(Tool):
             budget = _DEFAULT_MAX_CHARS
 
         try:
-            request = Request(url, headers={"User-Agent": _USER_AGENT})
+            request = Request(url, headers={"User-Agent": _USER_AGENT})  # noqa: S310 - validating opener, scheme checked above
             # Through the validating opener, so a redirect to an internal
             # host is refused at that hop instead of being followed and
             # only noticed once the final URL is inspected.
+            # Validating opener: scheme, private hosts and redirects are
+            # checked per hop; final URL re-checked below.
             with urlopen(request, timeout=self.timeout) as response:
                 raw = response.read(_MAX_BYTES + 1)
                 final_url = response.geturl()

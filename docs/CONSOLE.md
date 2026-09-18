@@ -28,7 +28,9 @@ At-sign mentions are expanded by resolving tokens relative to the workspace, rej
 
 ## Commands
 
-Commands are invoked with a leading slash. The full set is listed by the help command: endpoint connection and key replacement, model selection with an effort choice, workspace and memory inspection, difference display and change discard, approval-mode selection, cost and cache display, conversation summarization, clearing and resetting, session resume, goal and todo management, workflow creation and launching, skill discovery and attachment, the verbosity toggle, and exit. The console banner displays model, endpoint, workspace, version-control status, approval mode, tool count, and instruction-file information.
+Commands are invoked with a leading slash. The full set is listed by the help command: endpoint connection and key replacement, model selection with an effort choice, workspace and memory inspection, difference display and change discard, approval-mode selection, cost and cache display, conversation summarization, clearing and resetting, conversation export to a Markdown or JSON file, session resume, goal and todo management, workflow creation and launching, skill discovery and attachment, the verbosity toggle, and exit. The console banner displays model, endpoint, workspace, version-control status, approval mode, tool count, and instruction-file information.
+
+After every agent reply the console shows a row of follow-up chips. The chips are derived from the conversation itself: the subject of the prompt is echoed back as a continuation chip, rule matches (failures to diagnose, files edited, tests passing) fill the rest, and a conversational turn that matches no rule still earns a fallback row. The row also remembers the subjects of recent turns: switching to a new subject offers a jump back to the previous thread, and a content-free reply such as a bare acknowledgement keeps pointing at the thread in progress. The /suggestions command turns the row off and on.
 
 ## Goals, Todos, Skills, and Workflows
 

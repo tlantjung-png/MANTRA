@@ -5,24 +5,18 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
 import time
 
 from core.agent.exceptions import AbortError, SandboxError
+from core.procutil import POPEN_GROUP_KWARGS as _POPEN_GROUP_KWARGS
+from core.procutil import kill_process_tree as _kill_process_tree
+from core.procutil import read_pipe_into as _read_pipe_into
+from core.urlcheck import is_safe_commit as _is_safe_commit_impl
+from core.urlcheck import is_safe_repo_url as _is_safe_repo_url_impl
 from core.types import ExecResult, Sandbox
-
-# Spawn each child in its own process group/session so a timeout or abort
-# can kill the whole tree (grandchildren included), not just the direct
-# child — otherwise survivors keep the stdout/stderr pipes open and the
-# reader threads never see EOF.
-_POPEN_GROUP_KWARGS: dict = {}
-if os.name == "nt":
-    _POPEN_GROUP_KWARGS["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-else:
-    _POPEN_GROUP_KWARGS["start_new_session"] = True
 
 # Heuristic patterns for shell traversal; best effort, not a boundary.
 # The host sandbox executes with shell=True so containment cannot be
@@ -52,58 +46,6 @@ def _filtered_env(env: dict) -> dict:
         if not any(marker in name.upper() for marker in _SECRET_ENV_MARKERS)
         and name.upper() not in _MANTRA_SECRET_ENV
     }
-
-
-def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """Terminate the child and its whole tree; best effort, never raises."""
-    if os.name == "nt":
-        # taskkill /T walks the process tree, /F force-kills. The child
-        # was spawned in its own process group, so taskkill starts there.
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass  # taskkill unavailable; the direct proc.kill below still runs
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        return
-    # POSIX: the child leads its own session (start_new_session), so
-    # signalling the group reaches every descendant, not just the shell.
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-
-
-def _read_pipe_into(stream, buf: bytearray, cap: int, done: threading.Event) -> None:
-    """Append streamed bytes to ``buf`` until EOF or ``cap``; set ``done``.
-
-    Runs in a daemon thread so the main loop keeps watching the deadline
-    and the abort signal while output is read incrementally; the cap keeps
-    memory bounded for chatty commands.
-    """
-    try:
-        while len(buf) < cap:
-            chunk = stream.read(cap - len(buf) + 1)
-            if not chunk:
-                break
-            buf.extend(chunk[: cap - len(buf)])
-    except (OSError, ValueError):
-        pass
-    finally:
-        done.set()
 
 
 def _strip_quoted(s: str) -> str:
@@ -604,25 +546,7 @@ class LocalSandbox(Sandbox):
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
         return self._pump(proc, timeout_f)
 
-    @staticmethod
-    def _is_safe_repo_url(url: str) -> bool:
-        url = url.strip()
-        if not url or len(url) > 2048 or "\n" in url or "\r" in url or "\x00" in url:
-            return False
-        if url.startswith(("http://", "https://", "git@", "ssh://", "git://")):
-            return True
-        # File scheme is disabled by default because it allows reading
-        # arbitrary local paths. Enable only for tests via env.
-        if url.startswith("file://"):
-            return bool(os.environ.get("MANTRA_ALLOW_FILE_URL"))
-        return False
-
-    @staticmethod
-    def _is_safe_commit(commit: str) -> bool:
-        commit = commit.strip()
-        if not commit or len(commit) > 256 or "\n" in commit or "\r" in commit or "\x00" in commit:
-            return False
-        # block shell metacharacters
-        if any(c in commit for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", '"', "'")):
-            return False
-        return True
+    # Shared refusal rules live in core.urlcheck; re-exported as
+    # staticmethods so callers and tests keep the LocalSandbox seams.
+    _is_safe_repo_url = staticmethod(_is_safe_repo_url_impl)
+    _is_safe_commit = staticmethod(_is_safe_commit_impl)

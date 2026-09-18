@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.locking import break_stale_lock as _break_stale_lock_shared
+
 _VERSION = 1
 _OVERRIDE_ENV = "MANTRA_SESSIONS"
 
@@ -95,24 +97,6 @@ _LOCK_STALE_SECONDS = 5.0
 _LOCK_WAIT = 0.5
 
 
-def _break_stale_lock(lock_path: Path) -> bool:
-    try:
-        stat = lock_path.stat()
-        age = time.time() - stat.st_mtime
-        if age < _LOCK_STALE_SECONDS:
-            return False
-        try:
-            stat2 = lock_path.stat()
-            if stat2.st_mtime != stat.st_mtime:
-                return False
-            lock_path.unlink(missing_ok=True)
-            return True
-        except FileNotFoundError:
-            return True
-    except OSError:
-        return False
-
-
 def _trim_messages(messages: list[Any]) -> list[Any]:
     """Cap each message's content so the transcript stays bounded."""
     trimmed: list[Any] = []
@@ -173,7 +157,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
     # writer can slip a save in between read and replace.
     lock_path = target.with_suffix(target.suffix + ".lock")
     if lock_path.exists():
-        _break_stale_lock(lock_path)
+        _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
     acquired = False
     lock_fd = None
     start = time.monotonic()
@@ -186,7 +170,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             time.sleep(0.02)
             try:
                 if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE_SECONDS:
-                    _break_stale_lock(lock_path)
+                    _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
             except OSError:
                 pass
         except OSError:

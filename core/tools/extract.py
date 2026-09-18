@@ -20,7 +20,8 @@ import json
 import os
 import re
 import shlex
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as _stdlib_et  # noqa: F401 - reserved for the stdlib pretty-print path (no external entity expansion by default); defusedxml is the parser in use below
+import defusedxml.ElementTree as ET
 from csv import reader as csv_reader
 from typing import Any
 

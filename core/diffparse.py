@@ -39,11 +39,11 @@ class FileDiff:
 
     @property
     def added(self) -> int:
-        return sum(1 for h in self.hunks for l in h.lines if l.kind == "add")
+        return sum(1 for h in self.hunks for ln in h.lines if ln.kind == "add")
 
     @property
     def removed(self) -> int:
-        return sum(1 for h in self.hunks for l in h.lines if l.kind == "del")
+        return sum(1 for h in self.hunks for ln in h.lines if ln.kind == "del")
 
 
 def _strip_prefix(path: str) -> str:

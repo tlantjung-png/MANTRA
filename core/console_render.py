@@ -317,10 +317,10 @@ def _flush_table_lines(lines: list[str], style: Style) -> str:
     otherwise the plain paragraph lines they always were."""
     if len(lines) < 2 or not (
         _is_table_sep(lines[1])
-        or len({len(_table_cells(l)) for l in lines}) == 1
+        or len({len(_table_cells(ln)) for ln in lines}) == 1
     ):
-        return "\n".join(_inline_md(l, style) for l in lines)
-    return _render_table([_table_cells(l) for l in lines], style)
+        return "\n".join(_inline_md(ln, style) for ln in lines)
+    return _render_table([_table_cells(ln) for ln in lines], style)
 
 
 def _syntax_highlight(line: str, style: Style) -> str:

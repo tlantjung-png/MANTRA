@@ -10,30 +10,15 @@ import time
 import uuid
 
 from core.agent.exceptions import AbortError, SandboxError
+from core.procutil import POPEN_GROUP_KWARGS as _POPEN_GROUP_KWARGS
+from core.procutil import read_pipe_into as _read_pipe_into
+from core.urlcheck import is_safe_commit as _is_safe_commit_impl
+from core.urlcheck import is_safe_repo_url as _is_safe_repo_url_impl
 from core.types import ExecResult, Sandbox
 
 _EXEC_TIMEOUT = 600.0
 _MAX_READ_BYTES = 500_000
 _MAX_EXEC_BYTES = 1_000_000
-
-
-def _read_pipe_into(stream, buf: bytearray, cap: int, done: threading.Event) -> None:
-    """Append streamed bytes to ``buf`` until EOF or ``cap``; set ``done``.
-
-    Runs in a daemon thread so the pump keeps watching the deadline and
-    the abort signal while output is read incrementally; the cap keeps
-    memory bounded for chatty in-container commands.
-    """
-    try:
-        while len(buf) < cap:
-            chunk = stream.read(cap - len(buf) + 1)
-            if not chunk:
-                break
-            buf.extend(chunk[: cap - len(buf)])
-    except (OSError, ValueError):
-        pass
-    finally:
-        done.set()
 
 
 class DockerSandbox(Sandbox):
@@ -427,26 +412,10 @@ class DockerSandbox(Sandbox):
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
         return self._pump(proc, timeout_f)
 
-    @staticmethod
-    def _is_safe_repo_url(url: str) -> bool:
-        url = url.strip()
-        if not url or len(url) > 2048 or "\n" in url or "\r" in url or "\x00" in url:
-            return False
-        if url.startswith(("http://", "https://", "git@", "ssh://", "git://")):
-            return True
-        if url.startswith("file://"):
-            # Disabled by default: file URLs read arbitrary local paths.
-            return bool(os.environ.get("MANTRA_ALLOW_FILE_URL"))
-        return False
-
-    @staticmethod
-    def _is_safe_commit(commit: str) -> bool:
-        commit = commit.strip()
-        if not commit or len(commit) > 256 or "\n" in commit or "\r" in commit or "\x00" in commit:
-            return False
-        if any(c in commit for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", '"', "'")):
-            return False
-        return True
+    # Shared refusal rules live in core.urlcheck; re-exported as
+    # staticmethods so callers and tests keep the DockerSandbox seams.
+    _is_safe_repo_url = staticmethod(_is_safe_repo_url_impl)
+    _is_safe_commit = staticmethod(_is_safe_commit_impl)
 
     @staticmethod
     def _validate_image(image: str) -> str:

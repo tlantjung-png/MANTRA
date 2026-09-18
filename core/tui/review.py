@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from core.diffparse import FileDiff, Hunk, parse_diff
+from core.diffparse import FileDiff, Hunk
 
 _SIDEBAR_MAX = 28
 _SIDEBAR_MIN = 14
@@ -70,8 +70,8 @@ class ReviewFrame:
 
 
 def _hunk_header(h: Hunk) -> str:
-    old_n = sum(1 for l in h.lines if l.kind in ("del", "ctx"))
-    new_n = sum(1 for l in h.lines if l.kind in ("add", "ctx"))
+    old_n = sum(1 for ln in h.lines if ln.kind in ("del", "ctx"))
+    new_n = sum(1 for ln in h.lines if ln.kind in ("add", "ctx"))
     old = f"-{h.old_start},{old_n}" if old_n != 1 else f"-{h.old_start}"
     new = f"+{h.new_start},{new_n}" if new_n != 1 else f"+{h.new_start}"
     return f"@@ {old} {new} @@"
@@ -93,8 +93,8 @@ def _stacked_rows(file: FileDiff) -> list[ReviewRow]:
             new = f"{line.new_no:>{_GUTTER_W}}" if line.new_no is not None else " " * _GUTTER_W
             rows.append(ReviewRow(f"{old} {new} {line.text}", line.kind))
         if hunk.lines:
-            prev_old_end = max((l.old_no for l in hunk.lines if l.old_no is not None), default=hunk.old_start)
-            prev_new_end = max((l.new_no for l in hunk.lines if l.new_no is not None), default=hunk.new_start)
+            prev_old_end = max((ln.old_no for ln in hunk.lines if ln.old_no is not None), default=hunk.old_start)
+            prev_new_end = max((ln.new_no for ln in hunk.lines if ln.new_no is not None), default=hunk.new_start)
     return rows
 
 
@@ -137,7 +137,7 @@ def _split_rows(file: FileDiff, left_w: int, right_w: int) -> list[ReviewRow]:
     rows: list[ReviewRow] = []
     for hunk in file.hunks:
         rows.append(ReviewRow(_hunk_header(hunk), "sep"))
-        for kind, old_no, new_no, ltext, rtext in _split_pairs(hunk):
+        for _kind, old_no, new_no, ltext, rtext in _split_pairs(hunk):
             lg = f"{old_no:>{_GUTTER_W}}" if old_no is not None else " " * _GUTTER_W
             rg = f"{new_no:>{_GUTTER_W}}" if new_no is not None else " " * _GUTTER_W
             left = (f"{lg} {ltext}")[:left_w].ljust(left_w)

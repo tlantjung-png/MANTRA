@@ -22,6 +22,10 @@ import uuid
 from typing import Any
 
 from core.agent.approvals import _redact_sensitive
+# Process-group isolation for background tasks (the flags and tree-kill
+# helper below) is shared with the sandboxes via core.procutil.
+from core.procutil import POPEN_GROUP_KWARGS as _POPEN_GROUP_KWARGS
+from core.procutil import kill_process_tree as _kill_task_tree
 from core.sandbox import _filtered_env
 from core.types import ExecResult, Sandbox
 from core.types import Tool
@@ -47,47 +51,6 @@ _MAX_FULL_LOGS = 50
 # can run up to 600s and must not be able to fill the disk. The pumper
 # writes a marker and the truncated flag is surfaced by shell_output.
 _LOG_BYTE_CEILING = 10 * 1024 * 1024
-
-
-# Process-group isolation for background tasks, matching the sandbox's
-# foreground behavior: a timeout, abort, or kill_shell task_id kill hits
-# the whole tree, not just the shell, so orphaned descendants cannot
-# outlive the task.
-_POPEN_GROUP_KWARGS: dict = {}
-if os.name == "nt":
-    _POPEN_GROUP_KWARGS["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-else:
-    _POPEN_GROUP_KWARGS["start_new_session"] = True
-
-
-def _kill_task_tree(proc: subprocess.Popen) -> None:
-    """Kill a background task's whole process tree; best effort."""
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-            )
-        except Exception:
-            pass
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        return
-    try:
-        import signal as _signal
-        os.killpg(proc.pid, _signal.SIGTERM)
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, getattr(_signal, "SIGKILL", _signal.SIGTERM))
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
 
 
 def _register_full_log(path: str) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 from core.term import _WidthScanner, ansi_strip as strip_ansi
 
@@ -167,7 +168,3 @@ class Selection:
             else:
                 spans.append((offset, 0, 10**6))
         return spans
-
-
-# Kept at module level to avoid importing typing just for one alias.
-from typing import Callable  # noqa: E402

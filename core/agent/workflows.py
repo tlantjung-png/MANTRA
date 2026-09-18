@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.locking import break_stale_lock as _break_stale_shared
+
 _VERSION = 1
 _OVERRIDE_ENV = "MANTRA_WORKFLOWS"
 
@@ -82,36 +84,13 @@ def load_all() -> dict[str, Any]:
     return data
 
 
-def _break_stale(lock_path: Path) -> bool:
-    """Remove a lock whose holder is gone. True when removed.
-
-    The mtime is checked twice so a freshly created lock is never deleted.
-    """
-    try:
-        stat = lock_path.stat()
-        age = time.time() - stat.st_mtime
-        if age < _LOCK_STALE:
-            return False
-        # Verify mtime unchanged to avoid deleting a freshly created lock
-        try:
-            stat2 = lock_path.stat()
-            if stat2.st_mtime != stat.st_mtime:
-                return False
-        except OSError:
-            return False
-        lock_path.unlink(missing_ok=True)
-        return True
-    except OSError:
-        return False
-
-
 def _save_all(data: dict[str, Any]) -> bool:
     """Persist the workflows document under an inter-process lock."""
     target = workflows_path()
     # File lock for inter-process safety — atomic exclusive create is arbiter.
     lock_path = target.with_suffix(target.suffix + ".lock")
     if lock_path.exists():
-        _break_stale(lock_path)
+        _break_stale_shared(lock_path, _LOCK_STALE)
     acquired = False
     lock_fd = None
     start = time.monotonic()
@@ -124,7 +103,7 @@ def _save_all(data: dict[str, Any]) -> bool:
             time.sleep(0.02)
             try:
                 if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE:
-                    _break_stale(lock_path)
+                    _break_stale_shared(lock_path, _LOCK_STALE)
             except OSError:
                 pass
         except OSError:

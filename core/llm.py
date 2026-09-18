@@ -12,6 +12,10 @@ import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from core.agent.exceptions import AbortError, LLMError
+from core.agent.keys import resolve as resolve_key
+from core.types import LLMClient, LLMResponse, ToolCall
+
 _MAX_RESPONSE_BYTES = 5_000_000
 _MAX_CONTENT_PARTS_BYTES = 2_000_000
 # Tool-call argument fragments accumulate per slot; cap them like content
@@ -21,10 +25,6 @@ _MAX_TOOL_ARGS_BYTES = 2_000_000
 # not grow without bound: a garbage stream without blank-line terminators
 # must flush through the malformed backstop instead of buffering forever.
 _MAX_SSE_EVENT_CHARS = 1_000_000
-
-from core.agent.exceptions import AbortError, LLMError
-from core.agent.keys import resolve as resolve_key
-from core.types import LLMClient, LLMResponse, ToolCall
 
 DeltaCallback = Callable[[str], None]
 
@@ -294,6 +294,12 @@ class OpenAICompatClient(LLMClient):
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
+        # Only http(s): urllib would happily open file:// or custom schemes
+        # against whatever base_url a config file carries.
+        if urlparse(self.base_url).scheme not in ("http", "https"):
+            raise LLMError(
+                f"base_url must start with http:// or https:// (got {base_url!r})"
+            )
         self.api_key_env = api_key_env
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -549,14 +555,14 @@ class OpenAICompatClient(LLMClient):
 
     def _request(self, body: bytes) -> LLMResponse:
         # No provider-specific probe here — try chat first, fall back agnostically on 400/500 below
-        request = urllib.request.Request(
+        request = urllib.request.Request(  # noqa: S310 - scheme validated in __init__
             f"{self.base_url}/chat/completions",
             data=body,
             headers=self._headers(),
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - scheme validated in __init__
                 try:
                     raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
                 except TypeError:
@@ -693,13 +699,13 @@ class OpenAICompatClient(LLMClient):
             if resp_tools:
                 resp_payload["tools"] = resp_tools
                 resp_payload["tool_choice"] = "auto"
-        request = urllib.request.Request(
+        request = urllib.request.Request(  # noqa: S310 - scheme validated in __init__
             f"{self.base_url}/responses",
             data=json.dumps(resp_payload).encode("utf-8"),
             headers=self._headers(),
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - scheme validated in __init__
             try:
                 raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
             except TypeError:
@@ -766,14 +772,14 @@ class OpenAICompatClient(LLMClient):
 
     def _request_stream(self, body: bytes, on_delta: DeltaCallback) -> LLMResponse:
         # Try chat first; the responses fallback applies on HTTP errors below.
-        request = urllib.request.Request(
+        request = urllib.request.Request(  # noqa: S310 - scheme validated in __init__
             f"{self.base_url}/chat/completions",
             data=body,
             headers=self._headers(),
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - scheme validated in __init__
 
                 def _line_iter():
                     # Prefer readline for real HTTPResponse; fall back to

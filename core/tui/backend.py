@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, ClassVar
 
 from core.term import term_size
 
@@ -377,7 +377,7 @@ class Backend:
             _fields_ = [("dwSize", COORD)]
 
         class EVENT_UNION(ctypes.Union):
-            _fields_ = [("KeyEvent", KEY_RECORD), ("MouseEvent", MOUSE_RECORD), ("WindowEvent", WINDOW_RECORD)]
+            _fields_: ClassVar[list[tuple[str, Any]]] = [("KeyEvent", KEY_RECORD), ("MouseEvent", MOUSE_RECORD), ("WindowEvent", WINDOW_RECORD)]
 
         class INPUT_RECORD(ctypes.Structure):
             _fields_ = [("EventType", wintypes.WORD), ("Event", EVENT_UNION)]

@@ -7,6 +7,7 @@ import json
 import re
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from typing import Any
 
 from core.agent.exceptions import LLMError
@@ -85,6 +86,9 @@ def fetch_models(
     base = (base_url or "").rstrip("/")
     if not base:
         raise LLMError("no base URL to ask for models")
+    # Only http(s): urllib would happily open file:// or custom schemes.
+    if urlparse(base).scheme not in ("http", "https"):
+        raise LLMError(f"base_url must start with http:// or https:// (got {base_url!r})")
 
     api_key = resolve_key(api_key_env)
     if api_key:
@@ -95,9 +99,10 @@ def fetch_models(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    request = urllib.request.Request(f"{base}/models", headers=headers)
+    request = urllib.request.Request(f"{base}/models", headers=headers)  # noqa: S310 - scheme validated in fetch_models
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # Scheme validated in fetch_models above (http/https only).
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - scheme validated in fetch_models
             try:
                 raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
             except TypeError:

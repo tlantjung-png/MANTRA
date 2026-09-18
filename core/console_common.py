@@ -13,8 +13,16 @@ from urllib.parse import urlparse
 
 from core.agent.keys import has_stored
 from core.agent.settings import endpoint_name_for_url, endpoints as known_endpoints
-from core.llm import KEYLESS_HOSTS  # noqa: F401 - re-exported for the console
+from core.llm import KEYLESS_HOSTS
 from core.term import safe_write
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only: console.py imports this module back, so a runtime import
+    # here would be circular. ruff F821 is otherwise raised on every
+    # forward reference in signatures.
+    from core.console import ConsoleSession
 
 
 HELP_TEXT = """Commands:
@@ -30,6 +38,7 @@ HELP_TEXT = """Commands:
   /cost                 show token usage
   /compact              summarise conversation
   /clear                clear conversation (/reset is an alias)
+  /export [path]        save the conversation to .md or .json
   /goal <text>          set session goal (/goal note, /goal done)
   /todo                 session checklist — /todo add|done|rm|clear
    /skills <name>        attach skill — /skills + space, Tab filter
@@ -98,6 +107,7 @@ SLASH_COMMANDS = [
     ("/cost", "show usage"),
     ("/compact", "summarise chat"),
     ("/clear", "clear chat"),
+    ("/export", "save conversation to .md or .json"),
     ("/goal", "set goal"),
     ("/todo", "session checklist"),
     ("/workflow", "run workflow"),

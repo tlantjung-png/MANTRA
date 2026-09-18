@@ -299,9 +299,9 @@ class ReadFileTool(Tool):
                     continue
                 chunk = f"--- {rel} ---\n{res}\n"
                 if total + len(chunk) > 100_000:
-                    # Count the files not shown at all (the current one
-                    # included); errors and notes were never cap-skipped.
-                    skipped = len(files) - len(out_parts)
+                    # Not-shown = matched minus readable chunks shown minus
+                    # errors (the current one included).
+                    skipped = total_matched - len(out_parts) - unreadable
                     break
                 out_parts.append(chunk)
                 total += len(chunk)

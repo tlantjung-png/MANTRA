@@ -22,6 +22,14 @@ from core.console_common import (
 )
 from core.tui.composer import Completion
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only: console.py imports this module back, so a runtime import
+    # here would be circular. ruff F821 is otherwise raised on every
+    # forward reference in signatures.
+    from core.console import ConsoleSession
+
 
 class ConsoleCompleter:
     """Suggests slash commands after ``/`` and workspace paths after ``@``."""

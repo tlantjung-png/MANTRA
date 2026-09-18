@@ -18,6 +18,14 @@ from core.agent.loop import RunResult
 from core.agent.settings import set_skills_prefs, skills_prefs
 from core.tui.overlays import Option
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only: console.py imports this module back, so a runtime import
+    # here would be circular. ruff F821 is otherwise raised on every
+    # forward reference in signatures.
+    from core.console import ConsoleSession
+
 def _skills(session: "ConsoleSession", argument: str) -> None:
     """/skills — EASY: type "/skills " + Tab shows all, type to filter by name/type.
 

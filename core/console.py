@@ -2125,7 +2125,8 @@ class ConsoleSession:
             self._print(self.style.ember("  save failed: session too large"))
             return False
         try:
-            # Ensure parent dir exists with restricted perms
+            # Parent dirs only need to exist; the session file itself
+            # gets 0o600 below, which is where the privacy boundary sits.
             parent = os.path.dirname(os.path.abspath(path))
             if parent:
                 os.makedirs(parent, exist_ok=True)
@@ -2333,7 +2334,7 @@ class ConsoleSession:
                 else:
                     self._print(f"{self.style.ash('you')} (empty)")
             elif role == "assistant":
-                # Assistant may have content null + tool_calls — render markdown for body so colors show.
+                # Assistant may have null content + tool_calls — render body as markdown.
                 # Model-controlled text is sanitized exactly like the live
                 # reply paths: saved output must not drive the terminal.
                 if isinstance(content, str) and content.strip():
@@ -2856,40 +2857,6 @@ def _is_safe_session_path(path: str, workspace: str) -> bool:
         return False
 
 
-def _set_suggestions(session: ConsoleSession, argument: str) -> None:
-    """Flip the post-task suggestion row at runtime (/suggestions on|off)."""
-    from core.agent.settings import set_ui_prefs
-
-    arg = argument.strip().lower()
-    ui = getattr(session, "ui", None)
-    if arg in ("on", "off"):
-        enabled = arg == "on"
-        # Persist to the settings file on disk (survives restarts), the
-        # session config (this process), and the live TUI flag.
-        if not set_ui_prefs(suggestions=enabled):
-            session._print("warning: could not write the settings file")
-        session.config["suggestions"] = enabled
-        if ui is not None and hasattr(ui, "suggestions_enabled"):
-            ui.suggestions_enabled = enabled
-            if not enabled:
-                ui._dismiss_suggestions()
-        state = "on" if enabled else "off"
-        # The toast rides the TUI when there is one; the plain REPL
-        # gets the same message as a printed line.
-        if ui is not None and hasattr(ui, "toast_message"):
-            ui.toast_message(f"suggestions {state}", seconds=2.0)
-        else:
-            session._print(f"suggestions {state}")
-        return
-    # Bare /suggestions: report the current state.
-    current = None
-    if ui is not None and hasattr(ui, "suggestions_enabled"):
-        current = ui.suggestions_enabled
-    else:
-        current = bool(session.config.get("suggestions", True))
-    session._print(f"suggestions are {'on' if current else 'off'} - usage: /suggestions on|off")
-
-
 def dispatch(session: ConsoleSession, line: str) -> bool:
     """Run a slash command. Returns True when the line was a command."""
     # Be forgiving: strip invisible leading chars and normalize full-width forms
@@ -2927,42 +2894,11 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     elif command == "/workspace":
         session.show_workspace()
     elif command == "/memory":
-        mem = session.memory_path
-        session._print(f"memory file: {mem}")
-        if not os.path.isfile(mem):
-            session._print("(empty)")
-        else:
-            try:
-                # Cap the memory display even though the file itself is capped.
-                if os.path.getsize(mem) > 20000:
-                    with open(mem, encoding="utf-8", errors="replace") as h:
-                        data = h.read(8000) + "\n... [truncated]"
-                else:
-                    with open(mem, encoding="utf-8", errors="replace") as h:
-                        data = h.read()
-                session._print(data or "(empty)")
-            except OSError as exc:
-                session._print(session.style.ember(f"  cannot read memory: {exc}"))
+        _memory(session)
     elif command == "/diff":
-        # In the TUI the changeset opens in the full-screen review;
-        # everywhere else it stays the plain text diff.
-        layout = session.layout
-        if layout is not None and layout.active:
-            diff = session._git("diff", "--no-color", "--unified=3") or ""
-            if diff and getattr(layout, "open_review", None):
-                layout.open_review(diff)
-            else:
-                session.show_diff()
-        else:
-            session.show_diff()
+        _diff(session)
     elif command == "/fix":
-        # Send the most recent failed command/tool result to the agent
-        # for a diagnosis and a suggested (never auto-run) fix.
-        prompt = session._fix_prompt(argument.strip())
-        if prompt is None:
-            session._print(session.style.dim("  no recent failure to fix"))
-        else:
-            session.handle(prompt)
+        _fix(session, argument)
     elif command == "/undo":
         session.undo_changes()
     elif command == "/model":
@@ -2970,76 +2906,19 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         # single name is advertised and nothing else drifts in.
         _model_command(session, argument.split())
     elif command in ("/reasoning", "/effort"):
-        # Reasoning is a property of the model, so this is now the model
-        # menu. Kept as an alias so muscle memory still lands somewhere.
-        if argument:
-            session.set_reasoning(argument)
-        elif not _choose_model(session):
-            session.show_reasoning()
+        _reasoning(session, argument)
     elif command == "/approve":
-        if not argument:
-            # Modes are a fixed list, so they get a menu too.
-            chosen = _menu(
-                session,
-                "approval mode",
-                [Option(value=m, hint="current" if m == session.approvals.mode else "")
-                 for m in MODES],
-                allow_filter=False,
-            )
-            if chosen and chosen in MODES:
-                session.approvals.mode = chosen
-                session.approvals.reset_session()
-                session._print(f"approval mode is now {chosen}")
-                if session.layout is not None and session.layout.active:
-                    session.layout.draw_chrome()
-            else:
-                session._print(f"approval mode: {session.approvals.mode}  (choose: {'/'.join(MODES)})")
-        elif argument in MODES:
-            session.approvals.mode = argument
-            session.approvals.reset_session()
-            session._print(f"approval mode is now {argument}")
-            if session.layout is not None and session.layout.active:
-                session.layout.draw_chrome()
-        else:
-            session._print(f"unknown mode '{argument}'; choose one of {'/'.join(MODES)}")
+        _approve(session, argument)
     elif command == "/cost":
-        arg = argument.strip().lower()
-        session.show_cost(
-            compact=arg in ("compact", "brief", "c", "--compact"),
-            as_json=arg in ("json", "j", "--json"),
-        )
+        _cost(session, argument)
     elif command == "/compact":
-        if not session.compact():
-            session._print("nothing to compact")
+        _compact(session)
     elif command in ("/clear", "/reset"):
-        # /reset is a hidden alias: clearing the conversation is one
-        # action, and advertising two names for it is how they drift.
-        session.message_count = 0
-        session.context.replace_body([])
-        session.approvals.reset_session()
-        session.reported_changes.clear()
-        session.goal = ""
-        session.goal_notes = []
-        session.todos = []
-        session.active_skills = []
-        session.auto_attached = []
-        if session.layout is not None and session.layout.active:
-            session.layout.clear_content()
-        session._print("conversation cleared (files kept)")
+        _clear(session)
     elif command == "/sessions":
-        # The session manager: browse (panel in the TUI, text picker
-        # elsewhere), list, or resume a named session directly.
-        parts = argument.split() if argument else []
-        layout = session.layout
-        if not parts:
-            if layout is not None and layout.active and getattr(layout, "open_sessions", None):
-                layout.open_sessions()
-            else:
-                session.pick_session()
-        elif parts[0] in ("list", "show"):
-            session.show_sessions()
-        else:
-            session.resume_session(parts[0])
+        _sessions(session, argument)
+    elif command == "/export":
+        _export(session, argument)
     elif command == "/goal":
         _goal(session, argument)
     elif command == "/todo":
@@ -3238,7 +3117,18 @@ from core.console_skills import (  # noqa: E402,F401
     _warn_untrusted_skill,
 )
 from core.console_commands import (  # noqa: E402,F401
+    _approve,
+    _clear,
+    _compact,
+    _cost,
+    _diff,
+    _export,
+    _fix,
     _goal,
+    _memory,
+    _reasoning,
+    _sessions,
+    _set_suggestions,
     _todo,
     _workflow,
     _workflow_create,
