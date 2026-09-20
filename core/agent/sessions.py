@@ -141,7 +141,7 @@ def _trim_messages(messages: list[Any]) -> list[Any]:
 def save(name: str, payload: dict[str, Any]) -> str | None:
     """Write a session. Returns the path, or None when it could not be written."""
     target = _path(name)
-    # Ensure directory exists and has restricted permissions
+    # Create the session directory with restricted permissions.
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -320,7 +320,11 @@ def _listing_metadata(file: Path) -> dict[str, Any] | None:
         return None
     key = (str(file), stat.st_mtime_ns, stat.st_size)
     with _LISTING_CACHE_LOCK:
-        cached = _LISTING_CACHE.get(key)
+        # Pop-and-reinsert on access orders the dict coldest-first, so the
+        # insert-time eviction below really drops the least recently used.
+        cached = _LISTING_CACHE.pop(key, None)
+        if cached is not None:
+            _LISTING_CACHE[key] = cached
     if cached is not None:
         return dict(cached)
     try:

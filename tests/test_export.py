@@ -25,9 +25,9 @@ for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-import core.console as console
-from core.console import dispatch
-from _helpers import make_session
+import core.console as console  # noqa: E402
+from core.console import dispatch  # noqa: E402
+from _helpers import make_session  # noqa: E402
 
 
 class _TempSettings:
@@ -71,7 +71,7 @@ class ExportTest(_TempSettings, unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn("# MANTRA conversation export", text)
-        self.assertIn("## You", text)
+        self.assertIn("## Operator", text)
         self.assertIn("fix the header", text)
         self.assertIn("## Agent", text)
         self.assertIn("done, header fixed", text)

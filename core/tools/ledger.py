@@ -10,6 +10,30 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _detect_case_insensitive_fs() -> bool:
+    """True when the local filesystem ignores path case.
+
+    Windows is always case-insensitive. Elsewhere the answer is probed once
+    by looking up a case-flipped variant of this module's own path: it
+    resolves on a case-insensitive volume and does not on a case-sensitive
+    one.
+    """
+    if os.path.normcase("A") == "a":
+        return True
+    try:
+        module = os.path.abspath(__file__)
+        folder, name = os.path.dirname(module), os.path.basename(module)
+        flipped = name.swapcase()
+        if flipped != name and os.path.exists(os.path.join(folder, flipped)):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+_CASE_INSENSITIVE = _detect_case_insensitive_fs()
+
+
 class EditLedger:
     """Per-session path -> hash of last seen content, with partial flag."""
 
@@ -65,6 +89,6 @@ class EditLedger:
         # Remove leading ./ that normpath may leave as "./a"
         if normalized.startswith("./"):
             normalized = normalized[2:]
-        if os.name == "nt":
+        if _CASE_INSENSITIVE:
             normalized = normalized.lower()
         return normalized

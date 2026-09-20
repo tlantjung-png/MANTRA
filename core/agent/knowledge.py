@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any
 
 from core.locking import break_stale_lock as _break_stale_lock_shared
 
@@ -53,6 +52,9 @@ def render_environment(workspace: str) -> str:
 # otherwise spawns up to three git subprocesses.
 _GIT_FACTS_CACHE: dict[str, tuple[float, str]] = {}
 _GIT_FACTS_TTL = 30.0
+# Keyed per workspace; cap it so a long-lived process serving many
+# workspaces cannot grow it without bound.
+_GIT_FACTS_CACHE_MAX = 64
 
 
 def _git_facts(workspace: str) -> str:
@@ -78,6 +80,8 @@ def _git_facts(workspace: str) -> str:
     else:
         git_line = "- git: not a repository"
     _GIT_FACTS_CACHE[workspace] = (now, git_line)
+    while len(_GIT_FACTS_CACHE) > _GIT_FACTS_CACHE_MAX:
+        _GIT_FACTS_CACHE.pop(next(iter(_GIT_FACTS_CACHE)), None)
     return git_line
 
 
@@ -173,7 +177,7 @@ def _read_tail(path: str | None, cap: int) -> str:
     try:
         size = os.path.getsize(path)
         if size > cap * 2:
-            # Avoid loading huge file; seek near tail.
+            # Large file: seek near the tail instead of loading it whole.
             with open(path, "rb") as handle:
                 handle.seek(max(0, size - cap - 500))
                 data = handle.read(cap + 1000)

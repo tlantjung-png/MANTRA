@@ -8,7 +8,6 @@ import pytest
 
 from core.agent.exceptions import LLMError
 from core.llm import KEYLESS_HOSTS, is_keyless_base_url, parse_sse_stream
-from core.types import ToolCall
 
 
 def _sse(*chunks: str, done: bool = True) -> list[str]:

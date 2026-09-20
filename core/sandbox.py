@@ -33,8 +33,8 @@ _MAX_EXEC_BYTES = 1_000_000
 # real gate — this only stops a model-issued command from trivially
 # printing secrets. PATH/SystemRoot/HOME etc. are kept as-is.
 _SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-# Known MANTRA_* variables that are secret stores (the marker filter
-# already catches most of these by name).
+# MANTRA_* variables that hold secrets; the marker filter below already
+# catches most of these by name.
 _MANTRA_SECRET_ENV = frozenset({"MANTRA_CREDENTIALS"})
 
 
@@ -98,7 +98,7 @@ def _scan_traversal_core(text: str) -> bool:
     # Decode common URL-encoding that can hide ".." (e.g. %2e%2e, %252e).
     try:
         import urllib.parse as _up
-        # Two rounds of unquote to catch double-encoding.
+        # Unquote twice to catch double-encoding.
         decoded = _up.unquote(_up.unquote(stripped))
     except (UnicodeError, ValueError):
         decoded = stripped  # undecodable: screening continues on the raw form

@@ -69,8 +69,8 @@ class Tool(ABC):
 
     name: str = ""
     description: str = ""
-    # None means "no arguments": schema() materializes a fresh object per
-    # call instead of exposing one shared mutable class default.
+    # None means "no arguments": schema() builds a fresh object per call,
+    # so no shared mutable class default is exposed.
     parameters: dict[str, Any] | None = None
 
     @abstractmethod

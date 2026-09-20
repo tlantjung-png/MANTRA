@@ -106,6 +106,15 @@ class MenuOverlay:
         elif matches:
             self.cursor = min(len(matches) - 1, self.cursor + 1)
 
+    def wants_wheel(self) -> bool:
+        """True while the box can still act on a notch.
+
+        A list with one entry has nowhere to walk to; claiming the notch
+        anyway would swallow it and leave the operator with a wheel that
+        does nothing at all.
+        """
+        return len(self.matches) > 1
+
     def click(self, mx: int, my: int) -> bool:
         """A press inside the box: walk the highlight to that row; only a
         second click on the already-highlighted row accepts it. Anything
@@ -266,6 +275,15 @@ class QuestionCard:
         limit = max(0, len(self.body.split("\n")) - self._last_view)
         self.scroll = max(0, min(self.scroll + direction, limit))
 
+    def wants_wheel(self) -> bool:
+        """True only while the body is taller than the card.
+
+        A body that fits is not scrollable, so a notch over the card
+        belongs to the conversation behind it rather than being swallowed
+        by a card that cannot move.
+        """
+        return len(self.body.split("\n")) > self._last_view
+
     def click(self, mx: int, my: int) -> bool:
         """A press inside the card: a drawn button answers it, anything
         else is swallowed (a modal must not highlight the page)."""
@@ -383,6 +401,10 @@ class LinePrompt:
             self._view_col = 0 if shown <= span else max(0, min(self.cursor, shown) - span // 2)
         limit = max(0, len(self.buffer) - span)
         self._view_col = max(0, min(self._view_col + direction, limit))
+
+    def wants_wheel(self) -> bool:
+        """True only while the value is wider than the card."""
+        return len(self.buffer) > self._text_cols
 
     def click(self, mx: int, my: int) -> bool:
         """The card has no buttons: a press inside is swallowed so it

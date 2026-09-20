@@ -815,6 +815,107 @@ class ConversationSuggestionsTest(unittest.TestCase):
             app.suggestions,
         )
 
+    def test_suggestions_name_the_files_the_turn_changed(self):
+        # The row is grounded in the turn's own artifacts: a turn that
+        # changed a file and left the tests green offers to commit that
+        # file by name rather than a generic "commit the changes".
+        from core.tui.suggest import suggestions_for
+
+        out = suggestions_for(
+            "fix the parser", "Fixed the parser. All 12 tests pass.", "", False,
+            changed_files=["core/parser.py"],
+        )
+        self.assertTrue(
+            any("parser.py" in s.command for s in out),
+            f"no suggestion names the changed file: {out}",
+        )
+
+    def test_suggestions_run_the_tests_for_the_changed_file(self):
+        from core.tui.suggest import suggestions_for
+
+        out = suggestions_for(
+            "fix the parser", "Edited core/parser.py.", "edit_file: wrote core/parser.py", False,
+            changed_files=["core/parser.py"],
+        )
+        self.assertTrue(
+            any("parser.py" in s.command for s in out),
+            f"no suggestion follows from the edit: {out}",
+        )
+        # A failed run leads the row.
+        failed = suggestions_for(
+            "fix the parser", "It still fails.", "run_command: exit_code: 1", True,
+            changed_files=["core/parser.py"],
+        )
+        self.assertIn("fail", failed[0].label.lower())
+
+    def test_suggestion_row_is_plain_text_not_chips(self):
+        # The row renders as dim numbered text at the tail of the content
+        # area - no reverse-video boxes - and still answers 1-9 and clicks.
+        from core.scripted import final_response
+
+        app, session, backend = _make_app([final_response("done")])
+        with app.lock:
+            for i in range(60):
+                app.transcript.append(f"line {i:03d}")
+        app.submit("hello")
+        self.assertTrue(wait_until(lambda: not app.busy, 10))
+        app.render_frame()
+        row = "".join(
+            app.renderer.buffer.chars[
+                (app._content_top + app._content_height - 1) * app.renderer.buffer.cols:
+                (app._content_top + app._content_height) * app.renderer.buffer.cols
+            ]
+        )
+        self.assertIn("next", row)
+        self.assertIn("1 ", row)
+        # The painted spans carry no reverse-video (SGR 7) style.
+        for _x, _y, _w in app._suggestion_rects:
+            pass
+        params = {
+            app.renderer.buffer.styles_table.params_for(sid)
+            for sid in app.renderer.buffer.styles[
+                (app._content_top + app._content_height - 1) * app.renderer.buffer.cols:
+                (app._content_top + app._content_height) * app.renderer.buffer.cols
+            ]
+        }
+        self.assertNotIn(("7",), params, "the suggestion row still paints chips")
+
+    def test_operator_echo_carries_no_you_label(self):
+        # The operator's own line is the timestamp chip plus the text: a
+        # "you" label reads as chatter in a wall of tool output.
+        app, session, backend = _make_app([])
+        app.submit("what this project does")
+        raw = "\n".join(app.transcript.raw)
+        self.assertIn("what this project does", raw)
+        self.assertNotIn("you", raw.lower().replace("your", ""), raw)
+
+    def test_event_handler_failure_is_reported_not_fatal(self):
+        # One malformed event used to propagate out of the presenter and
+        # kill the session; it is now surfaced as a toast and the loop
+        # keeps draining.
+        from core.tui.loop import Presenter
+
+        app, session, backend = _make_app([])
+        calls = {"n": 0}
+
+        def _boom(event):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                app.running = False  # both events drained: let the loop exit
+            raise RuntimeError("bad event")
+
+        app.handle_event = _boom
+        app.render_frame = lambda: None
+        presenter = Presenter(app, min_draw_interval=0.0)
+        backend.events.put(Key("a"))
+        backend.events.put(Key("b"))
+        try:
+            presenter._run()
+        finally:
+            app.running = True
+        self.assertEqual(calls["n"], 2, "the loop stopped draining after a failure")
+        self.assertIn("input error", app.toast)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

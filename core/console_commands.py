@@ -16,12 +16,14 @@ from __future__ import annotations
 # Patchable seams: _menu, _read_multiline, _choose_model, _model_command.
 from core import console as _c
 
+import json
 import os
 import re
 import time
 
 import core.agent.workflows as workflows
 from core.agent.approvals import MODES
+from core.mcp.client import MCPClient, MCPError, MCPToolAdapter
 from core.tui.overlays import Option
 
 from typing import TYPE_CHECKING
@@ -320,6 +322,7 @@ def _approve(session: "ConsoleSession", argument: str) -> None:
         if chosen and chosen in MODES:
             session.approvals.mode = chosen
             session.approvals.reset_session()
+            _persist_approvals(session, chosen)
             session._print(f"approval mode is now {chosen}")
             if session.layout is not None and session.layout.active:
                 session.layout.draw_chrome()
@@ -328,11 +331,29 @@ def _approve(session: "ConsoleSession", argument: str) -> None:
     elif argument in MODES:
         session.approvals.mode = argument
         session.approvals.reset_session()
+        _persist_approvals(session, argument)
         session._print(f"approval mode is now {argument}")
         if session.layout is not None and session.layout.active:
             session.layout.draw_chrome()
     else:
         session._print(f"unknown mode '{argument}'; choose one of {'/'.join(MODES)}")
+
+
+def _persist_approvals(session: "ConsoleSession", mode: str) -> None:
+    """Carry the approval mode into the next session.
+
+    The mode is an operator preference, not a per-run detail: persisting it
+    means a restarted session picks up where the operator left off instead
+    of silently reverting to the default and prompting again.
+    """
+    try:
+        from core.agent.settings import set_ui_prefs
+
+        set_ui_prefs(approvals=mode)
+    except Exception:
+        # A failed preference write must not block the mode change that
+        # just succeeded in memory.
+        session._print("warning: could not write the settings file")
 
 
 def _cost(session: "ConsoleSession", argument: str) -> None:
@@ -415,13 +436,13 @@ def _export(session: "ConsoleSession", argument: str) -> None:
                 "model": session.model_name(),
                 "messages": messages,
             }
-            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            # Created owner-only: an export carries the whole conversation.
+            with _c.private_write(path) as handle:
                 jsonlib.dump(payload, handle, ensure_ascii=False, indent=2)
-            os.chmod(path, 0o600)
             session._print(session.style.dim(f"  exported {len(messages)} messages to {path}"))
             return
         lines = [
-            f"# MANTRA conversation export",
+            "# MANTRA conversation export",
             "",
             f"- Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             f"- Workspace: `{session.workspace}`",
@@ -432,7 +453,7 @@ def _export(session: "ConsoleSession", argument: str) -> None:
             "",
         ]
         for m in messages:
-            who = "You" if m.get("role") == "user" else "Agent"
+            who = "Operator" if m.get("role") == "user" else "Agent"
             content = m.get("content", "")
             if not isinstance(content, str):
                 # Multimodal block lists: keep the text parts, mark the rest.
@@ -448,9 +469,8 @@ def _export(session: "ConsoleSession", argument: str) -> None:
             lines.append("")
             lines.append(str(content))
             lines.append("")
-        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        with _c.private_write(path) as handle:
             handle.write("\n".join(lines))
-        os.chmod(path, 0o600)
         session._print(session.style.dim(f"  exported {len(messages)} messages to {path}"))
     except (OSError, TypeError, ValueError) as exc:
         session._print(session.style.ember(f"  export failed: {exc}"))
@@ -488,3 +508,274 @@ def _set_suggestions(session: "ConsoleSession", argument: str) -> None:
     else:
         current = bool(session.config.get("suggestions", True))
     session._print(f"suggestions are {'on' if current else 'off'} - usage: /suggestions on|off")
+
+
+# ------------------------------------------------------------------- mcp
+
+# The config file is rewritten by /mcp enable|disable; same cap as the
+# loader so a pathologically large file is refused rather than slurped.
+_MCP_CONFIG_BYTES = 1_000_000
+
+
+def _mcp(session: "ConsoleSession", argument: str) -> None:
+    """/mcp: inspect and toggle the configured external tool servers."""
+    parts = argument.split()
+    if not parts or parts[0] in ("list", "status", "show"):
+        _mcp_status(session)
+    elif parts[0] == "tools":
+        _mcp_tools(session, parts[1] if len(parts) > 1 else "")
+    elif parts[0] in ("enable", "disable") and len(parts) == 2:
+        if parts[0] == "enable":
+            _mcp_enable(session, parts[1])
+        else:
+            _mcp_disable(session, parts[1])
+    else:
+        session._print(
+            session.style.dim(
+                "  usage: /mcp [list] · /mcp tools [server] · "
+                "/mcp enable|disable <name>"
+            )
+        )
+
+
+def _mcp_servers(session: "ConsoleSession") -> dict:
+    """The configured server map, defensively normalised to a dict."""
+    servers = (session.config.get("mcp") or {}).get("servers") or {}
+    return servers if isinstance(servers, dict) else {}
+
+
+def _mcp_client(session: "ConsoleSession", name: str):
+    """The live client for *name*, or None when it is not running."""
+    for client in getattr(session, "mcp_clients", []) or []:
+        if getattr(client, "name", "") == name:
+            return client
+    return None
+
+
+def _mcp_status(session: "ConsoleSession") -> None:
+    servers = _mcp_servers(session)
+    if not servers:
+        session._print(
+            session.style.dim(
+                "  no MCP servers configured - add them under mcp.servers "
+                "in the config file"
+            )
+        )
+        return
+    session._print(session.style.bold("  mcp servers"))
+    for name in sorted(servers):
+        spec = servers[name]
+        if not isinstance(spec, dict):
+            session._print(f"  {name}  {session.style.ember('(malformed entry)')}")
+            continue
+        command = spec.get("command") or []
+        command_text = (
+            " ".join(str(part) for part in command)
+            if isinstance(command, list)
+            else str(command)
+        )
+        client = _mcp_client(session, name)
+        if spec.get("enabled", True) is False and client is None:
+            state = session.style.dim("disabled")
+        elif client is not None:
+            count = sum(
+                1 for tool in session.tools
+                if getattr(tool, "server_name", "") == name
+            )
+            state = session.style.dim(f"connected · {count} tool(s)")
+        else:
+            state = session.style.dim("enabled · not running")
+        session._print(f"  {name}  {state}")
+        session._print(session.style.dim(f"      {command_text}"))
+    session._print(
+        session.style.dim(
+            "  /mcp tools <server> lists a connected server's tools · "
+            "/mcp enable|disable <name>"
+        )
+    )
+
+
+def _mcp_tools(session: "ConsoleSession", name: str) -> None:
+    if not name:
+        session._print(session.style.dim("  usage: /mcp tools <server>"))
+        return
+    client = _mcp_client(session, name)
+    if client is None:
+        session._print(
+            session.style.warn(f"  {name} is not running - /mcp enable {name} starts it")
+        )
+        return
+    try:
+        specs = client.list_tools()
+    except MCPError as exc:
+        session._print(session.style.ember(f"  {name} did not answer: {exc}"))
+        return
+    if not specs:
+        session._print(session.style.dim(f"  {name} advertises no tools"))
+        return
+    session._print(session.style.bold(f"  {name} tools"))
+    for spec in specs:
+        remote = str(spec.get("name", "?"))
+        description = str(spec.get("description") or "").splitlines()[0][:80]
+        session._print(f"  {remote}")
+        if description:
+            session._print(session.style.dim(f"      {description}"))
+
+
+def _mcp_enable(session: "ConsoleSession", name: str) -> None:
+    servers = _mcp_servers(session)
+    spec = servers.get(name)
+    if not isinstance(spec, dict):
+        known = ", ".join(sorted(servers)) or "(none configured)"
+        session._print(
+            session.style.warn(f"  no MCP server named '{name}' (configured: {known})")
+        )
+        return
+    if _mcp_client(session, name) is not None:
+        session._print(session.style.dim(f"  {name} is already running - /mcp tools {name} lists its tools"))
+        return
+    command = spec.get("command")
+    if not command:
+        session._print(session.style.ember(f"  {name} has no command configured - fix mcp.servers.{name}.command first"))
+        return
+    spec["enabled"] = True
+    persisted = _mcp_persist(session, name, True)
+    client = MCPClient(
+        command,
+        name=name,
+        cwd=spec.get("cwd"),
+        env=spec.get("env"),
+        timeout=float(spec.get("timeout") or 30.0),
+    )
+    try:
+        client.start()
+        client.initialize()
+        specs = client.list_tools()
+    except (MCPError, OSError, ValueError) as exc:
+        client.close()
+        session._print(session.style.ember(f"  {name} failed to start: {exc}"))
+        # The flag stays on: the configured intent is honoured again at
+        # the next start rather than silently rewritten by a failure.
+        session._print(session.style.dim("  it stays enabled in the config and is retried on the next start"))
+        return
+    session.mcp_clients.append(client)
+    tools = [MCPToolAdapter(client, item) for item in specs]
+    session.tools.extend(tools)
+    names = ", ".join(tool.name for tool in tools) or "(no tools advertised)"
+    session._print(
+        session.style.dim(f"  {name} connected - {len(tools)} tool(s) available now: {names}")
+    )
+    if not persisted:
+        session._print(
+            session.style.dim(
+                "  (in-memory only - this session has no config file path, "
+                "so the change cannot be saved)"
+            )
+        )
+
+
+def _mcp_disable(session: "ConsoleSession", name: str) -> None:
+    servers = _mcp_servers(session)
+    spec = servers.get(name)
+    client = _mcp_client(session, name)
+    if not isinstance(spec, dict) and client is None:
+        known = ", ".join(sorted(servers)) or "(none configured)"
+        session._print(
+            session.style.warn(f"  no MCP server named '{name}' (configured: {known})")
+        )
+        return
+    running = [c for c in getattr(session, "mcp_clients", []) or [] if getattr(c, "name", "") == name]
+    for stale in running:
+        try:
+            stale.close()
+        except Exception:
+            pass  # a failed shutdown must not block disabling the server
+    session.mcp_clients = [
+        c for c in getattr(session, "mcp_clients", []) or []
+        if getattr(c, "name", "") != name
+    ]
+    removed = sum(1 for tool in session.tools if getattr(tool, "server_name", "") == name)
+    session.tools[:] = [
+        tool for tool in session.tools if getattr(tool, "server_name", "") != name
+    ]
+    if isinstance(spec, dict):
+        spec["enabled"] = False
+        _mcp_persist(session, name, False)
+    if running:
+        session._print(session.style.dim(f"  {name} stopped - {removed} tool(s) removed"))
+    else:
+        session._print(session.style.dim(f"  {name} was not running - disabled in config"))
+
+
+def _mcp_persist(session: "ConsoleSession", name: str, enabled: bool) -> bool:
+    """Write the enabled flag back into the config file. False when not saved.
+
+    The file is re-read and only the one flag is touched, so formatting
+    and every other section survive byte-for-byte semantics: the rest of
+    the parsed document is written back as-is.
+    """
+    path = getattr(session, "config_path", None)
+    if not path:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read(_MCP_CONFIG_BYTES + 1)
+        if len(raw) > _MCP_CONFIG_BYTES:
+            raise OSError(f"config file larger than {_MCP_CONFIG_BYTES} bytes")
+        if path.lower().endswith((".yaml", ".yml")):
+            import yaml
+
+            data = yaml.safe_load(raw) or {}
+        else:
+            data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            raise ValueError("config file must contain an object")
+        section = data.get("mcp")
+        if section is not None and not isinstance(section, dict):
+            raise ValueError("config mcp section is not an object")
+        servers = (section or {}).get("servers") if isinstance(section, dict) else None
+        if servers is not None and not isinstance(servers, dict):
+            raise ValueError("config mcp.servers is not an object")
+        # Never invent a server entry: if the file no longer lists this
+        # one (edited since load), writing a command-less stub would make
+        # the next load fail validation.
+        if not isinstance(servers, dict) or name not in servers:
+            return False
+        entry = servers[name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"config mcp.servers.{name} is not an object")
+        entry["enabled"] = enabled
+        body = (
+            yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+            if path.lower().endswith((".yaml", ".yml"))
+            else json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        )
+        # Same directory so os.replace stays atomic on the same volume.
+        import tempfile
+
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        handle_fd, tmp_path = tempfile.mkstemp(prefix=".mcp-cfg-", dir=directory)
+        try:
+            with os.fdopen(handle_fd, "w", encoding="utf-8") as tmp:
+                tmp.write(body)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return True
+    except (OSError, ValueError) as exc:
+        # Import-time error from the YAML branch surfaces as ImportError,
+        # which is not an OSError; catch it separately so the message
+        # points at the missing library instead of the file.
+        session._print(session.style.ember(f"  could not save config: {exc}"))
+        return False
+    except ImportError:
+        session._print(
+            session.style.ember(
+                "  could not save config: the YAML file needs the YAML library installed"
+            )
+        )
+        return False

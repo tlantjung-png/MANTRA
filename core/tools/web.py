@@ -11,7 +11,6 @@ import socket
 import threading
 import urllib.parse
 import zlib
-from html.parser import HTMLParser
 from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -25,6 +24,7 @@ from urllib.request import (
 )
 
 from core.agent.approvals import _redact_sensitive
+from core.tools._htmltext import html_to_text
 from core.types import Sandbox
 from core.types import Tool
 
@@ -54,77 +54,6 @@ _TEXTUAL = ("text/", "application/json", "application/xml", "application/javascr
 _DNS_CACHE: dict[str, tuple[float, bool]] = {}
 _DNS_LOCK = threading.Lock()
 _DNS_TTL = 300.0
-
-
-class _TextExtractor(HTMLParser):
-    """Collect the visible text of a document.
-
-    Not a renderer: it drops the contents of tags that never reach the
-    screen and turns block-level tags into newlines so paragraphs do not
-    run together. Good enough to read documentation; not good enough to
-    reconstruct a table's layout, which is why the tool says so.
-    """
-
-    _SKIP: ClassVar[set[str]] = {"script", "style", "noscript", "template", "svg", "head", "iframe"}
-    _BREAK: ClassVar[set[str]] = {
-        "p", "div", "br", "li", "tr", "section", "article", "header",
-        "footer", "nav", "table", "ul", "ol", "dl", "blockquote", "pre",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-    }
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        # Stack of open skip-tag names, not a bare depth counter: a
-        # mismatched </style> after <script> must not expose the script's
-        # content early.
-        self._skip_stack: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: Any) -> None:
-        if tag in self._SKIP:
-            self._skip_stack.append(tag)
-        elif tag in self._BREAK:
-            self.parts.append("\n")
-
-    def handle_startendtag(self, tag: str, attrs: Any) -> None:
-        if tag in self._BREAK:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self._SKIP:
-            # An unmatched close tag would otherwise leave the stack
-            # stuck and blank out the rest of the page.
-            if self._skip_stack and self._skip_stack[-1] == tag:
-                self._skip_stack.pop()
-        elif tag in self._BREAK:
-            self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_stack:
-            self.parts.append(data)
-
-    def text(self) -> str:
-        joined = "".join(self.parts)
-        joined = joined.replace("\r\n", "\n").replace("\r", "\n")
-        # Collapse runs of blanks and spaces: stripped HTML is mostly
-        # indentation, and leaving it in wastes most of the budget.
-        joined = re.sub(r"[ \t\f\v]+", " ", joined)
-        joined = re.sub(r" *\n *", "\n", joined)
-        joined = re.sub(r"\n{3,}", "\n\n", joined)
-        return joined.strip()
-
-
-def html_to_text(html: str) -> str:
-    """Readable text from an HTML document."""
-    extractor = _TextExtractor()
-    try:
-        extractor.feed(html)
-        extractor.close()
-    except Exception:  # pragma: no cover - malformed markup
-        # html.parser is strict about nothing, but a half-downloaded
-        # document can still trip it. Partial text beats an exception.
-        pass
-    return extractor.text()
 
 
 def _decode(raw: bytes, encoding: str | None, note: list[str]) -> str:
@@ -323,7 +252,7 @@ def _resolve_limited(host: str, timeout: float) -> list[tuple] | None:
     return results or None
 
 
-def _is_private_hostname(hostname: str | None) -> bool:
+def _is_private_hostname(hostname: str | None, resolve: bool = True) -> bool:
     if not hostname:
         return False
     host = hostname.lower().strip().rstrip(".")
@@ -354,6 +283,10 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 return True
         except (IndexError, ValueError):
             pass
+    if not resolve:
+        # Literal and encoded forms only. The fetch path passes resolve=False
+        # so name resolution has exactly one authority: the pinned connection.
+        return False
     # DNS check with cache to avoid repeated stalls.
     try:
         if re.match(r"^[a-z0-9.-]+$", host):
@@ -395,7 +328,7 @@ def _is_private_hostname(hostname: str | None) -> bool:
             if result:
                 return True
     except (OSError, UnicodeError, ValueError):
-        pass  # resolution failure is not proof of privacy; fail open to fetch
+        pass  # inconclusive resolution proceeds; the pinned connect below is the gate
     return False
 
 
@@ -481,13 +414,13 @@ def _check_url_allowed(url: str) -> str | None:
             hostname = _fully_decode(hostname)
         except (UnicodeError, ValueError):
             pass  # undecodable host: the raw form is still checked below
-    if _is_private_hostname(hostname):
+    if _is_private_hostname(hostname, resolve=False):
         return f"fetch failed: blocked private or internal host {parsed.hostname!r}"
     if not hostname and parsed.netloc:
         try:
             raw = parsed.netloc.split("@")[-1].split(":")[0]
             netloc = _fully_decode(raw)
-            if _is_private_hostname(netloc):
+            if _is_private_hostname(netloc, resolve=False):
                 return f"fetch failed: blocked private or internal host {netloc!r}"
         except (UnicodeError, ValueError):
             pass  # same: raw netloc form was already checked

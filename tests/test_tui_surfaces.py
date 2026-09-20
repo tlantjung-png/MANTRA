@@ -392,6 +392,67 @@ class WheelRoutingTest(_SurfaceTest):
         self.assertIs(app.overlay, card)
         self.assertFalse(app.selection.active)
 
+    def test_card_with_nothing_to_scroll_does_not_swallow_the_wheel(self):
+        # A card whose body fits cannot act on a notch. Claiming it anyway
+        # left the operator with a wheel that did nothing at all while a
+        # modal was open - the notch now falls through to the conversation.
+        app, session, backend = _make_app([])
+        with app.lock:
+            for i in range(80):
+                app.transcript.append(f"line {i:03d}")
+        app.overlay = QuestionCard("allow?", "a short body", choices="yna")
+        app.render_frame()
+        card = app.overlay
+        self.assertFalse(card.wants_wheel(), "a fitting body must not claim the wheel")
+        x, y, _w, _h = card.rect
+
+        before = app.transcript.scrolled
+        app.handle_event(Mouse("wheel", 64, x + 2, y + 2, frozenset()))
+        self.assertGreater(
+            app.transcript.scrolled, before,
+            "a card with nothing to scroll swallowed the notch",
+        )
+
+    def test_line_prompt_with_a_short_value_does_not_swallow_the_wheel(self):
+        app, session, backend = _make_app([])
+        with app.lock:
+            for i in range(80):
+                app.transcript.append(f"line {i:03d}")
+        app.overlay = LinePrompt("api key", default="short")
+        app.render_frame()
+        card = app.overlay
+        self.assertFalse(card.wants_wheel())
+        x, y, _w, _h = card.rect
+        before = app.transcript.scrolled
+        app.handle_event(Mouse("wheel", 64, x + 2, y + 2, frozenset()))
+        self.assertGreater(app.transcript.scrolled, before)
+
+    def test_wheel_over_a_slash_popup_scrolls_the_conversation(self):
+        # Regression: with a completion dropdown open (the state right
+        # after typing "/" or "@"), the wheel must still scroll the
+        # conversation - the dropdown is a shortcut, never a scroll
+        # target, wherever the pointer sits.
+        app, session, backend = _make_app([])
+        app.composer.completer = _FakeCompleter()
+        with app.lock:
+            for i in range(120):
+                app.transcript.append(f"line {i:03d}")
+        for ch in "/fi":
+            app.handle_event(Key(ch))
+        app.render_frame()
+        self.assertTrue(app.composer.popup_open, "popup did not open")
+        self.assertIsNotNone(app._popup_rect)
+
+        # Over the prompt box, over the dropdown, and over the plain
+        # transcript: every one of them scrolls the conversation.
+        for x, y in ((10, app.rows - 2), (40, app.rows - 8), (10, app._content_top)):
+            before = app.transcript.scrolled
+            app.handle_event(Mouse("wheel", 64, x, y, frozenset()))
+            self.assertGreater(
+                app.transcript.scrolled, before,
+                f"wheel at ({x},{y}) with the dropdown open did not scroll",
+            )
+
     def test_wheel_on_the_scrollbar_drags_the_thumb_one_step(self):
         # The bar is a drag target, not just a readout: a notch on its own
         # column moves the view by exactly one thumb-step (the inverse of

@@ -22,22 +22,22 @@ _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
-from _helpers import make_config, make_session
-from core.console import Style, _render_md_line
-from core.console import _repl_plain as repl
-from core.agent.loop import AgentLoop
-from core.agent.approvals import ApprovalPolicy, classify, classify_command
-from core.agent.context import ContextManager
-from core.agent.events import EventBus
-from core.agent.settings import add_endpoint
-from core.evaluators import NullEvaluator
-from core.scripted import (
+from _helpers import make_session  # noqa: E402
+from core.console import Style, _render_md_line  # noqa: E402
+from core.console import _repl_plain as repl  # noqa: E402
+from core.agent.loop import AgentLoop  # noqa: E402
+from core.agent.approvals import ApprovalPolicy, classify, classify_command  # noqa: E402
+from core.agent.context import ContextManager  # noqa: E402
+from core.agent.events import EventBus  # noqa: E402
+from core.agent.settings import add_endpoint  # noqa: E402
+from core.evaluators import NullEvaluator  # noqa: E402
+from core.scripted import (  # noqa: E402
     ScriptedLLMClient,
     final_response,
     tool_call_response,
 )
-from core.logs import JsonlLogger
-from core.sandbox import LocalSandbox
+from core.logs import JsonlLogger  # noqa: E402
+from core.sandbox import LocalSandbox  # noqa: E402
 
 
 class WorkspacePersistenceTest(unittest.TestCase):
@@ -620,7 +620,6 @@ class ReplyRenderingTest(unittest.TestCase):
     def _framed_output(self, script):
         """Run one turn, return everything drawn (compact, no frame)."""
         import io
-        from contextlib import redirect_stdout
 
         session = make_session(self.workspace, script)
         buffer = io.StringIO()

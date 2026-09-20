@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from core.main import _HeadlessApprover, _resolve_path, main
 from core.scripted import final_response

@@ -26,17 +26,17 @@ _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
 for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-import core.console as console
-from core.console import (
+import core.console as console  # noqa: E402
+from core.console import (  # noqa: E402
     SLASH_COMMANDS,
     _connect,
     _derive_key_env,
     _derive_name,
     _needs_first_run,
 )
-from core.agent.keys import has_stored, resolve
-from core.agent.settings import endpoints, settings_path
-from _helpers import make_session
+from core.agent.keys import has_stored, resolve  # noqa: E402
+from core.agent.settings import endpoints, settings_path  # noqa: E402
+from _helpers import make_session  # noqa: E402
 
 
 class TempStorage:

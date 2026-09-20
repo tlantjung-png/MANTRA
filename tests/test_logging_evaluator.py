@@ -8,8 +8,6 @@ import pytest
 
 from core.evaluators import CommandEvaluator, NullEvaluator
 from core.logs import JsonlLogger
-from core.sandbox import LocalSandbox
-from core.types import EvaluationResult
 
 
 class _FakeSandbox:
@@ -85,10 +83,6 @@ def test_command_evaluator_fails_on_nonzero() -> None:
 
 
 def test_command_evaluator_fails_on_timeout() -> None:
-    evaluator = CommandEvaluator(test_cmd="x")
-    sandbox = _FakeSandbox(-1)
-    sandbox.exec = lambda command, timeout=120.0: EvaluationResult  # type: ignore[method-assign]
-    # Simpler: build a result with timed_out set.
     from core.types import ExecResult
 
     class _TimedOut(_FakeSandbox):

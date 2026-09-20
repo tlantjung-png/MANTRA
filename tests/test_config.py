@@ -121,6 +121,27 @@ def test_reasoning_effort_enum(tmp_path) -> None:
         load_config(path)
 
 
+def test_context_digest_keys_are_validated(tmp_path) -> None:
+    # The digest is on by default; a bad switch or ceiling is rejected here
+    # rather than reaching the loop, where it would silently disable the
+    # mechanism.
+    assert DEFAULTS["context"]["digest"] is True
+    assert DEFAULTS["context"]["digest_max_chars"] == 4000
+
+    path = _write(tmp_path, {"context": {"digest": "on"}})
+    with pytest.raises(ConfigError, match="context.digest"):
+        load_config(path)
+    path = _write(tmp_path, {"context": {"digest_max_chars": "4000"}})
+    with pytest.raises(ConfigError, match="context.digest_max_chars"):
+        load_config(path)
+    path = _write(tmp_path, {"context": {"digest_max_chars": -1}})
+    with pytest.raises(ConfigError, match="context.digest_max_chars"):
+        load_config(path)
+
+    config = load_config(_write(tmp_path, {"context": {"digest": False}}))
+    assert config["context"]["digest"] is False
+
+
 def test_merge_defaults_rejects_non_dict() -> None:
     with pytest.raises(ConfigError):
         merge_defaults(["nope"])  # type: ignore[arg-type]
@@ -140,3 +161,30 @@ def test_yaml_requires_optional_dependency(tmp_path) -> None:
 def test_defaults_are_not_mutated_by_merge() -> None:
     merge_defaults({"llm": {"model": "changed"}})
     assert DEFAULTS["llm"]["model"] == "gpt-4o"
+
+
+def test_observations_section_defaults_and_validation(tmp_path) -> None:
+    # Reshaping is on by default, with a per-observation character ceiling.
+    assert DEFAULTS["observations"] == {"reshape": True, "max_chars": 12000}
+    config = load_config(_write(tmp_path, {}))
+    assert config["observations"]["reshape"] is True
+
+    # A non-boolean switch and a non-integer ceiling are both rejected
+    # here rather than reaching the loop, where a bad comparison would
+    # silently disable the mechanism.
+    path = _write(tmp_path, {"observations": {"reshape": "yes"}})
+    with pytest.raises(ConfigError, match="observations.reshape"):
+        load_config(path)
+    path = _write(tmp_path, {"observations": {"max_chars": "9000"}})
+    with pytest.raises(ConfigError, match="observations.max_chars"):
+        load_config(path)
+    path = _write(tmp_path, {"observations": {"max_chars": -1}})
+    with pytest.raises(ConfigError, match="observations.max_chars"):
+        load_config(path)
+    path = _write(tmp_path, {"observations": {"unknown": 1}})
+    with pytest.raises(ConfigError, match="unknown config keys in 'observations'"):
+        load_config(path)
+
+    # A zero ceiling is valid and means "do not reshape".
+    config = load_config(_write(tmp_path, {"observations": {"max_chars": 0}}))
+    assert config["observations"]["max_chars"] == 0

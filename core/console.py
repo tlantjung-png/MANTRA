@@ -10,15 +10,11 @@ seam patches) keep working unchanged.
 from __future__ import annotations
 
 import argparse
-import difflib
-import glob
-import json
 import os
 import re
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import Any
@@ -30,31 +26,30 @@ from core.agent.approvals import MODES, ApprovalPolicy
 from core.agent.context import ContextManager
 from core.agent.events import EventBus
 from core.agent.exceptions import AbortError, ConfigError, HarnessError
-from core.agent.keys import has_stored, mask, store as store_key, stored_keys
-from core.agent.models import fetch_models, is_reasoning_model
-import core.agent.sessions as sessions
+from core.agent.keys import has_stored, mask, store as store_key, stored_keys  # noqa: F401
+from core.agent.models import fetch_models, is_reasoning_model  # noqa: F401 - seam patches target console.fetch_models
 import core.agent.skills as skills
-import core.agent.workflows as workflows
+import core.agent.workflows as workflows  # noqa: F401
 from core.agent.settings import (
     active as get_active,
-    add_endpoint,
-    endpoint_name_for_url,
+    add_endpoint,  # noqa: F401
+    endpoint_name_for_url,  # noqa: F401
     endpoints as known_endpoints,
-    models_for,
-    remove_endpoint,
-    set_active,
-    set_models,
-    set_skills_prefs,
-    settings_path,
+    models_for,  # noqa: F401
+    remove_endpoint,  # noqa: F401
+    set_active,  # noqa: F401
+    set_models,  # noqa: F401
+    set_skills_prefs,  # noqa: F401
+    settings_path,  # noqa: F401
     skills_prefs,
-    validate_endpoint,
+    validate_endpoint,  # noqa: F401
 )
 from core.agent.knowledge import (
-    append_memory,
-    plan_memory_write,
-    read_raw_tail,
+    append_memory,  # noqa: F401
+    plan_memory_write,  # noqa: F401
+    read_raw_tail,  # noqa: F401
     relevant_memory,
-    rewrite_memory,
+    rewrite_memory,  # noqa: F401
     assemble_system_prompt,
     find_instructions_file,
     render_environment,
@@ -62,17 +57,17 @@ from core.agent.knowledge import (
 from core.evaluators import NullEvaluator
 from core.logs import JsonlLogger
 from core.sandbox import LocalSandbox
-from core.tui.overlays import Option
-from core.tui.composer import Completion
+from core.tui.overlays import Option  # noqa: F401
+from core.tui.composer import Completion  # noqa: F401
+from core.mcp import build_mcp_tools
 from core.registry import build_llm, build_tools
 
 from core.term import (
-    enable_vt,
+    enable_vt,  # noqa: F401
     force_utf8_output,
-    safe_write,
+    safe_write,  # noqa: F401
     selection_in_progress,
-    term_size,
-    visible_len,
+    term_size,  # noqa: F401
 )  # shared wide-aware impl
 
 # Presentation layer (re-exported for compatibility).
@@ -100,6 +95,7 @@ from core.console_common import (  # noqa: F401
     KEYLESS_HOSTS,
     MAX_INDEX_ENTRIES,
     MENTION_RE,
+    PROJECT_ROOT,
     SLASH_COMMANDS,
     _MENTION_TRIM,
     _SKIP_DIRS,
@@ -113,15 +109,38 @@ from core.console_common import (  # noqa: F401
     _read_multiline,
     _read_one,
     _read_secret,
+    _short,
     _strip_leading_invisible,
+    private_write,
     provider_needs_key,
 )
 
 # Completer (no seam patching; plain import).
 from core.console_completer import ConsoleCompleter  # noqa: F401
 
-
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Session state split across focused mixins: mentions, goals/todos,
+# usage/compaction, persistence, workspace inspection, endpoints. The
+# class below composes them; every method stays reachable as before.
+from core.console_boxes import BoxRenderingMixin  # noqa: F401
+from core.console_session_mentions import MentionsMixin  # noqa: F401
+from core.console_session_goals import GoalsTodosMixin  # noqa: F401
+from core.console_session_usage import UsageMixin  # noqa: F401
+from core.console_session_workspace import WorkspaceMixin  # noqa: F401
+from core.console_session_persist import PersistenceMixin  # noqa: F401
+from core.console_session_endpoints import EndpointsMixin  # noqa: F401
+# Module-level helpers and constants that moved with their mixin; kept
+# importable from here so callers and the test suite never notice.
+from core.console_session_mentions import (  # noqa: F401
+    MAX_ATTACH_CHARS,
+    MAX_GLOB_HITS,
+    MAX_LISTING_ENTRIES,
+    MAX_TOTAL_ATTACH_CHARS,
+)
+from core.console_session_usage import _format_elapsed, _transcript  # noqa: F401
+from core.console_session_persist import (  # noqa: F401
+    _is_safe_session_path,
+    _safe_int,
+)
 
 
 def _resolve_data_path(*parts: str) -> str:
@@ -145,74 +164,19 @@ def _resolve_data_path(*parts: str) -> str:
 KNOWN_FAILURES_PATH = _resolve_data_path("knowledge", "known-failures.md")
 
 
-MAX_ATTACH_CHARS = 20_000
-MAX_TOTAL_ATTACH_CHARS = 60_000
-MAX_GLOB_HITS = 20
-MAX_LISTING_ENTRIES = 100
 SYSTEM_PROMPT_CAP = 20_000
 
 
-def _short(count: int) -> str:
-    """1234 -> 1.2k. Token counts only ever need two significant figures."""
-    if count < 1000:
-        return str(count)
-    if count < 10_000:
-        return f"{count / 1000:.1f}k"
-    return f"{round(count / 1000)}k"
-
-
-def _safe_int(value: Any) -> int:
-    """Total from a session file as an int; corrupt values read as zero.
-
-    Session files are hand-editable JSON, so one non-numeric total must
-    cost that counter, not the whole restore command.
-    """
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _format_elapsed(seconds: float) -> str:
-    """Format elapsed time: '1.6s', 'done in 1m23s', 'done in 1h05m'."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    if seconds < 3600:
-        m = int(seconds) // 60
-        s = int(seconds) % 60
-        return f"done in {m}m{s:02d}s"
-    h = int(seconds) // 3600
-    m = (int(seconds) % 3600) // 60
-    return f"done in {h}h{m:02d}m"
-
-
-def _transcript(messages: list[dict[str, Any]]) -> str:
-    """Flatten history to plain text for the summariser."""
-    lines = []
-    for message in messages:
-        role = message.get("role", "?")
-        content = message.get("content") or ""
-        if role == "system":
-            continue
-        if role == "assistant" and message.get("tool_calls"):
-            names = ", ".join(
-                (call.get("function") or {}).get("name", "?")
-                for call in message["tool_calls"]
-            )
-            lines.append(f"assistant: [called {names}]")
-            if content:
-                lines.append(f"assistant: {content}")
-            continue
-        if role == "tool":
-            body = content if len(content) <= 300 else content[:300] + " ..."
-            lines.append(f"result of {message.get('name', 'tool')}: {body}")
-            continue
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
 # ------------------------------------------------------------------- session
-class ConsoleSession:
+class ConsoleSession(
+    MentionsMixin,
+    GoalsTodosMixin,
+    UsageMixin,
+    WorkspaceMixin,
+    BoxRenderingMixin,
+    PersistenceMixin,
+    EndpointsMixin,
+):
     """One REPL session over one persistent local workspace."""
 
     def __init__(
@@ -222,10 +186,15 @@ class ConsoleSession:
         style: Style,
         llm: Any = None,
         ask: Any = None,
+        config_path: str | None = None,
     ) -> None:
         self.config = config
         self.style = style
         self.workspace = workspace
+        # Where the config was loaded from, so commands that change the
+        # configuration (/mcp enable|disable) can persist it. None for
+        # programmatically built sessions: those then stay in-memory only.
+        self.config_path = config_path
         self.sandbox = LocalSandbox(workspace)
         self.sandbox.setup({})
         self._isolate_git(workspace)
@@ -274,13 +243,23 @@ class ConsoleSession:
             environment=env,
         )
         self.tools = build_tools(config["tools"])
+        # External MCP tools join the same list, so the loop, the approval
+        # policy, and the schema sent to the model need no special case. A
+        # server that fails to start is reported and skipped rather than
+        # blocking the console.
+        self.mcp_clients: list[Any] = []
+        mcp_tools, self.mcp_clients = build_mcp_tools(
+            config.get("mcp"), on_error=lambda message: self._note(f"MCP: {message}")
+        )
+        self.tools.extend(mcp_tools)
         self.llm = llm if llm is not None else build_llm(config["llm"])
         self.approvals = ApprovalPolicy(
-            mode=config.get("approvals", "default"),
+            mode=config.get("approvals", "yolo"),
             ask=ask or self._ask,
             note=self._note,
         )
-        self.totals = {"tokens_in": 0, "tokens_out": 0, "turns": 0, "tool_errors": 0, "cache_hit": 0}
+        self.totals = {"tokens_in": 0, "tokens_out": 0, "turns": 0, "tool_errors": 0, "cache_hit": 0,
+                   "observation_saved": 0, "digest_turns": 0, "digest_chars": 0, "digest_failures": 0}
         self.last_reply = ""  # the finished turn's assistant reply (suggestion engine input)
         self.reported_changes: set[str] = set()
         # Model ids discovered from the endpoint, so `/model <tab>` can
@@ -437,108 +416,6 @@ class ConsoleSession:
         if self.ui is not None:
             self.ui.set_busy(on, label="Chanting")
 
-    def _format_diff(self, diff_text: str, max_lines: int = 60, title: str = "") -> str:
-        """Colour a unified diff inside a small box, optionally titled."""
-        if not diff_text:
-            return ""
-        lines = diff_text.splitlines()
-        total = len(lines)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            lines.append(self.style.dim(f"... ({total - max_lines} more lines)"))
-        if title:
-            top = self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.BONE, title)
-        else:
-            top = self.style._wrap(theme.HAIR, "┌" + "─" * 38)
-        out = [top]
-        for line in lines:
-            if line.startswith("+"):
-                out.append(self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.DIFF_ADD, line))
-            elif line.startswith("-"):
-                out.append(self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.DIFF_REMOVE, line))
-            else:
-                out.append(self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.FAINT, line))
-        out.append(self.style._wrap(theme.HAIR, "└" + "─" * 38))
-        return "\n".join(out)
-
-    def _file_text(self, rel: str) -> str | None:
-        """Full text of a workspace-relative file, or None when unreadable."""
-        if not rel:
-            return None
-        # The path can arrive from model-supplied tool arguments, so the
-        # join is confined like every other workspace read: a "..", an
-        # absolute path, or a symlink must not widen the snapshot read
-        # beyond the workspace.
-        try:
-            root = os.path.realpath(self.workspace)
-            full = os.path.realpath(os.path.join(root, rel))
-            if not (full == root or full.startswith(root + os.sep)):
-                return None
-        except OSError:
-            return None
-        try:
-            if not os.path.isfile(full):
-                return None
-            if os.path.getsize(full) > 1_000_000:
-                return None
-            with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                return fh.read()
-        except OSError:
-            return None
-
-    def _render_file_change(self, tool: str, result: str) -> str:
-        """Readable result of edit_file / write_file.
-
-        edit_file gets a coloured before/after diff against the snapshot
-        taken when the tool_call arrived; write_file shows a syntax
-        preview of the new file. Falls back to the tool's own message
-        when the file is missing or too large to snapshot, so the
-        operator always sees the file that was just edited, capped and
-        wrapped instead of dumped raw.
-        """
-        path = self._last_edit_path or ""
-        # The path is model-supplied tool-argument text, so the display
-        # form must not carry ANSI escapes into box titles or diff labels.
-        display = _sanitize_output(path)
-        new = self._file_text(path) if path else None
-        if new is None:
-            if isinstance(result, str) and result.strip():
-                return self._format_diff(result.strip(), max_lines=20)
-            return ""
-        old = self._edit_snapshots.get(path)
-        if tool == "write_file" and old is None:
-            # A brand-new file: syntax preview, capped so a long file
-            # stays readable.
-            lines = new.splitlines()
-            total = len(lines)
-            if total > 120:
-                lines = lines[:120]
-            out = [self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.BONE, f"wrote {display} ({total} lines)")]
-            for line in lines:
-                out.append(_syntax_highlight(line, self.style))
-            if total > 120:
-                out.append(self.style.dim(f"  ... {total - 120} more lines"))
-            out.append(self.style._wrap(theme.HAIR, "└" + "─" * 38))
-            return "\n".join(out)
-        body = "\n".join(
-            difflib.unified_diff(
-                (old or "").splitlines(),
-                new.splitlines(),
-                fromfile=display + " (before)",
-                tofile=display + " (after)",
-                lineterm="",
-                n=2,
-            )
-        )
-        if body.strip():
-            pane = self._diff_pane_rows(body, max_lines=220)
-            if pane is not None:
-                return self._box(f"edit {display}", pane)
-            return self._format_diff(body, max_lines=220, title=f"edit {display}")
-        if isinstance(result, str) and result.strip():
-            return self._format_diff(result.strip(), max_lines=20)
-        return ""
-
     # Tool-output boxes are budgeted in *viewport rows*, not raw lines: one
     # long line can wrap to several screen rows, and a huge read or log dump
     # must not flood the viewport mid-run. Roughly a screenful is shown and
@@ -553,228 +430,6 @@ class ConsoleSession:
         self._show_tool_output = not self._show_tool_output
         state = "on" if self._show_tool_output else "off"
         self._print(self.style.dim(f"  (tool output boxes {state} — ctrl+o to toggle)"))
-
-    def _output_cols(self) -> int:
-        """Current viewport width, or a sane default when not on a TUI."""
-        try:
-            layout = getattr(self, "layout", None)
-            cols = getattr(layout, "_cols", 0)
-            if layout is not None and getattr(layout, "active", False) and cols >= 30:
-                return int(cols)
-        except Exception:
-            pass  # duck-typed bridge in an unexpected shape; use the fallback
-        return self._OUTPUT_COLS_FALLBACK
-
-    def _row_cost(self, line: str) -> int:
-        """Approx wrapped screen rows one line will occupy inside a box."""
-        cols = max(1, self._output_cols())
-        width = visible_len(line) + 2  # '│ ' gutter
-        return max(1, (width + cols - 1) // cols)
-
-    def _rows_of(self, lines: list[str]) -> int:
-        return sum(self._row_cost(ln) for ln in lines)
-
-    def _head_lines(self, lines: list[str], budget: int) -> tuple[list[str], int]:
-        """Take from the start of a stream until the row budget is spent."""
-        shown: list[str] = []
-        used = 0
-        for ln in lines:
-            cost = self._row_cost(ln)
-            if used + cost > budget and shown:
-                break
-            shown.append(ln)
-            used += cost
-        return shown, len(lines) - len(shown)
-
-    def _box(self, title: str, body: list[str]) -> str:
-        """Assemble a titled box with '│ ' gutter rows."""
-        out = [self.style._wrap(theme.HAIR, "┌ ") + self.style._wrap(theme.BONE, title)]
-        out.extend(body)
-        out.append(self.style._wrap(theme.HAIR, "└" + "─" * 38))
-        return "\n".join(out)
-
-    def _row(self, ln: str) -> str:
-        """One styled '│ ' gutter row inside a tool-output box."""
-        if ln.startswith("exit_code:"):
-            code = -1
-            try:
-                code = int(ln.split(":", 1)[1].split()[0])
-            except (ValueError, IndexError):
-                pass  # malformed exit_code line: keep the error colour
-            color = theme.SAGE if code == 0 else theme.EMBER
-            return self.style._wrap(color, "│ " + ln)
-        if ln.startswith(("stdout:", "stderr:", "log:", "Note:")):
-            return self.style._wrap(theme.FAINT, "│ " + ln)
-        if ln.startswith("+") and not ln.startswith("+++"):
-            return self.style._wrap(theme.DIFF_ADD, "│ " + ln)
-        if ln.startswith("-") and not ln.startswith("---"):
-            return self.style._wrap(theme.DIFF_REMOVE, "│ " + ln)
-        if ln.startswith(("@@", "index ", "diff --git", "--- ", "+++ ")):
-            return self.style._wrap(theme.FAINT, "│ " + ln)
-        return "│ " + ln
-
-    # ---- before/after diff panes ---------------------------------------
-    #
-    # Structured unified diffs (agent edits, /diff, git-diff boxes) render
-    # as two stacked panes per hunk instead of a +/- line stream: first
-    # the before-state with removed lines in a soft dusty red, then the
-    # after-state with added lines in a soft sage green - text colour
-    # only, no backgrounds. A context line exists on both sides, so it is
-    # shown only once - in the pane whose change sits nearest - which
-    # keeps each pane anchored without doubling the code.
-
-    def _pane_row(self, body: str, code: str | None) -> str:
-        """One '│ ' gutter row; *code* colours the changed text softly."""
-        gutter = self.style._wrap(theme.HAIR, "│ ")
-        if not code:
-            return gutter + body
-        return gutter + self.style._wrap(code, body)
-
-    def _pane_chip(self, label: str) -> str:
-        """A small 'old' / 'new' marker row that opens a pane."""
-        return self.style._wrap(theme.HAIR, "│ ") + self.style._wrap(theme.ASH, label)
-
-    def _diff_pane_rows(self, diff_text: str, max_lines: int = 60) -> list[str] | None:
-        """Styled old/new pane rows for a unified diff.
-
-        Returns None when *diff_text* is not a parseable unified diff (no
-        hunks, or foreign content before the first hunk), so callers can
-        fall back to the plain diff renderer.
-        """
-        groups: list[tuple[str | None, str | None, list[list[str]]]] = []
-        cur: tuple[str | None, str | None, list[list[str]]] | None = None
-        hunk: list[str] | None = None
-        seen_hunk = False
-        for ln in diff_text.splitlines():
-            if ln.startswith("--- "):
-                cur = [ln[4:].strip(), None, []]
-                groups.append(cur)
-                hunk = None
-            elif ln.startswith("+++ "):
-                if cur is None:
-                    cur = [None, None, []]
-                    groups.append(cur)
-                cur[1] = ln[4:].strip()
-            elif ln.startswith("@@"):
-                if cur is None:
-                    cur = [None, None, []]
-                    groups.append(cur)
-                hunk = []
-                cur[2].append(hunk)
-                seen_hunk = True
-            elif hunk is not None and ln[:1] in (" ", "-", "+"):
-                hunk.append(ln)
-            elif not seen_hunk and ln and not ln.startswith(
-                ("diff ", "index ", "new file", "deleted file", "old mode", "new mode", "similarity ", "rename ", "Binary ")
-            ):
-                # Foreign content before any hunk (command output, notes):
-                # this is not a diff we should pane-ify.
-                return None
-        if not any(hs for _, _, hs in groups):
-            return None
-
-        def _file_base(label: str | None) -> str | None:
-            """'a/src/x.py' -> 'src/x.py'; 'x.py (after)' -> 'x.py'."""
-            if not label:
-                return None
-            base = label.replace("\\", "/")
-            if base.startswith(("a/", "b/")):
-                base = base[2:]
-            for suffix in (" (before)", " (after)"):
-                if base.endswith(suffix):
-                    base = base[: -len(suffix)]
-            return base or None
-
-        rows: list[str] = []
-        for old_lbl, new_lbl, hunks in groups:
-            # A per-file chip before a group's first hunk. Agent-edit diffs
-            # already name the file in their box title (labels end in
-            # "(before)"), so only git-style output gets the chip.
-            file_base = _file_base(old_lbl or new_lbl)
-            git_style = not ((old_lbl or "").endswith(" (before)") and (new_lbl or "").endswith(" (after)"))
-            if file_base and git_style:
-                rows.append(self._pane_chip(file_base))
-            for hunk_lines in hunks:
-                seq: list[tuple[str, str]] = []
-                for ln in hunk_lines:
-                    seq.append((ln[0], ln[1:]))
-                minus_idx = [i for i, (kind, _) in enumerate(seq) if kind == "-"]
-                plus_idx = [i for i, (kind, _) in enumerate(seq) if kind == "+"]
-                old: list[tuple[str, bool]] = []
-                new: list[tuple[str, bool]] = []
-                for i, (kind, body) in enumerate(seq):
-                    if kind == "-":
-                        old.append((body, True))
-                    elif kind == "+":
-                        new.append((body, True))
-                    else:
-                        # Context is identical on both sides: show it once,
-                        # in whichever pane holds the change nearest it.
-                        d_old = min((abs(i - j) for j in minus_idx), default=10**9)
-                        d_new = min((abs(i - j) for j in plus_idx), default=10**9)
-                        if d_old <= d_new:
-                            old.append((body, False))
-                        else:
-                            new.append((body, False))
-                if old:
-                    rows.append(self._pane_chip("old"))
-                    rows.extend(self._pane_row(b, theme.DIFF_REMOVE if changed else None) for b, changed in old)
-                if new:
-                    rows.append(self._pane_chip("new"))
-                    rows.extend(self._pane_row(b, theme.DIFF_ADD if changed else None) for b, changed in new)
-        total = len(rows)
-        if total > max_lines:
-            rows = rows[:max_lines]
-            rows.append(
-                self.style._wrap(theme.HAIR, "│ ")
-                + self.style._wrap(theme.FAINT, f"… {total - max_lines} more diff lines")
-            )
-        return rows
-
-    def _render_diff_pages(self, title: str, rows: list[str], lead: list[str] | None = None) -> str:
-        """Box for pre-styled diff-pane rows, paged like other tool boxes."""
-        lead_rows = [self._row(ln) for ln in (lead or [])]
-        if self._rows_of(lead_rows) + self._rows_of(rows) <= self._TOOL_OUTPUT_BUDGET_ROWS:
-            return self._box(title, lead_rows + rows)
-        preview, _ = self._head_lines(rows, self._READ_PAGE_ROWS)
-        remaining = rows[len(preview):]
-        if remaining:
-            with self._pager_lock:
-                self._pending_pages.append((title, remaining))
-                self._pending_styled.append(True)
-        shown = lead_rows + preview
-        shown.append(
-            self.style.dim(
-                f"│ … {len(remaining)} more rows — press Enter (empty prompt) to page through the diff"
-            )
-        )
-        return self._box(title, shown)
-
-    def _render_paged_box(self, title: str, content: list[str], lead: list[str] | None = None) -> str:
-        """Box for any tool output that may exceed a screenful.
-
-        Fits the budget → shown whole. Overflows → a compact first page
-        and the remainder queued (title + lines) for the empty-Enter
-        pager, so nothing is lost and the viewport is never flooded
-        mid-run - reads, commands, diffs and background logs alike.
-        """
-        lead_rows = lead or []
-        if self._rows_of(lead_rows) + self._rows_of(content) <= self._TOOL_OUTPUT_BUDGET_ROWS:
-            rows = [self._row(ln) for ln in lead_rows] + [self._row(ln) for ln in content]
-            return self._box(title, rows)
-        preview, _ = self._head_lines(content, self._READ_PAGE_ROWS)
-        remaining = content[len(preview):]
-        if remaining:
-            with self._pager_lock:
-                self._pending_pages.append((title, remaining))
-                self._pending_styled.append(False)
-        rows = [self._row(ln) for ln in lead_rows] + [self._row(ln) for ln in preview]
-        rows.append(
-            self.style.dim(
-                f"│ … {len(remaining)} more lines — press Enter (empty prompt) to page through the output"
-            )
-        )
-        return self._box(title, rows)
 
     def _capture_last_error(self, tool: str, observation: str) -> None:
         """Keep the most recent failed tool/command result for /fix."""
@@ -827,6 +482,14 @@ class ConsoleSession:
         # filter: read_file errors matter as much as command failures.
         if isinstance(observation, str) and observation.strip():
             self._capture_last_error(tool, observation)
+        # Turn-scoped evidence for the TUI's post-task suggestion engine:
+        # it names the tools that ran and the artifacts they touched, so
+        # the next-step rows follow the work that actually happened.
+        ui = getattr(self, "ui", None)
+        if ui is not None and isinstance(observation, str) and observation.strip():
+            collector = getattr(ui, "_turn_tool_text", None)
+            if isinstance(collector, list):
+                collector.append(f"{tool}: {observation.strip()[:600]}")
         if not self._show_tool_output:
             return
         if not isinstance(observation, str) or not observation.strip():
@@ -1135,163 +798,6 @@ class ConsoleSession:
 
     # ---- @ mentions -------------------------------------------------------
 
-    def expand_mentions(self, text: str) -> tuple[str, list[str]]:
-        """Turn ``@path`` tokens into real context the model can see.
-
-        Keeps the operator's wording intact and appends an "Attached
-        context" block, which is what every mainstream agent CLI does and
-        what the model already understands. Unknown references are left
-        alone and reported rather than silently dropped.
-        """
-        # Normalize full-width variants before matching so ＠ and ／ work
-        text_norm = text.replace("＠", "@").replace("／", "/")
-        tokens = MENTION_RE.findall(text_norm)
-        if not tokens:
-            # Also try finding full-width mentions directly if normal found none
-            tokens = MENTION_RE.findall(text)
-            if not tokens:
-                return text, []
-
-        # Normalize: a root given with forward slashes compares unequal to
-        # normpath output on Windows, which made every mention "no match".
-        # Realpath (not just abspath) so the containment checks below and
-        # in _resolve_mention measure against the same canonical root.
-        root = os.path.realpath(os.path.abspath(self.sandbox.root))
-        blocks: list[str] = []
-        attached: list[str] = []
-        total = 0
-        seen: set[str] = set()
-        budget_note_shown = False
-
-        for token in tokens:
-            # Strip surrounding quotes and trailing punctuation that is
-            # sentence punctuation, not part of the path.
-            raw = token.strip().strip("'\"`")
-            trimmed = raw.rstrip(_MENTION_TRIM)
-            # Also handle "@\"src/app.py\"" style where quotes were part of token
-            trimmed = trimmed.strip("'\"`")
-            if not trimmed:
-                continue
-            if total >= MAX_TOTAL_ATTACH_CHARS:
-                # Say it once, then stop scanning: one note per skipped
-                # mention just spams the transcript.
-                if not budget_note_shown:
-                    budget_note_shown = True
-                    self._note("attachment budget reached - remaining mentions skipped")
-                break
-            dedup_key = trimmed.lower() if os.name == "nt" else trimmed
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            # Try several variations to be forgiving
-            candidates_to_try = [trimmed]
-            if trimmed != token:
-                candidates_to_try.append(token.strip("'\"`").rstrip(_MENTION_TRIM))
-            # Also try without leading ./ if present
-            if trimmed.startswith("./"):
-                candidates_to_try.append(trimmed[2:])
-            if trimmed.startswith(".\\"):
-                candidates_to_try.append(trimmed[2:])
-            paths: list[str] = []
-            for cand in candidates_to_try:
-                paths = self._resolve_mention(cand, root)
-                if paths:
-                    break
-            if not paths:
-                # Show the trimmed form in the note so the operator sees
-                # what was actually tried, not the raw token with punctuation.
-                self._note(f"no match for @{trimmed} (tried {candidates_to_try[0]!r})")
-                continue
-            for rel in paths:
-                if total >= MAX_TOTAL_ATTACH_CHARS:
-                    # Say it once, then stop scanning: one note per
-                    # skipped mention just spams the transcript.
-                    if not budget_note_shown:
-                        budget_note_shown = True
-                        self._note("attachment budget reached - remaining mentions skipped")
-                    break
-                full = os.path.join(root, rel)
-                # Re-validate at read time: the path could have been
-                # swapped for a symlink since the mention was resolved.
-                # Resolve again so the containment check sits as close
-                # to the open as possible, then render the canonical
-                # path itself. Residual TOCTOU window: the symlink could
-                # still be swapped between this check and the open below.
-                # No dirfd-based read exists on Windows; accepted because
-                # the model already controls the workspace contents.
-                real = os.path.realpath(full)
-                if real != root and not real.startswith(root + os.sep):
-                    continue
-                block = (
-                    self._render_listing(rel, real)
-                    if os.path.isdir(real)
-                    else self._render_file(rel, real)
-                )
-                if not block:
-                    continue
-                blocks.append(block)
-                attached.append(rel)
-                total += len(block)
-
-        if not blocks:
-            return text, []
-        return text + "\n\nAttached context:\n\n" + "\n\n".join(blocks), attached
-
-    def _resolve_mention(self, token: str, root: str) -> list[str]:
-        """Resolve one mention to workspace-relative paths. Escapes refused."""
-        root = os.path.realpath(os.path.abspath(root))
-        # Robust trimming: quotes and trailing punctuation, and leading ./
-        token = token.strip().strip("'\"`").rstrip(_MENTION_TRIM).strip("'\"`")
-        if not token:
-            return []
-        # Normalize separators to the host's convention before probing.
-        candidate = token.replace("/", os.sep).replace("\\", os.sep)
-        if "*" in token:
-            # Normalize pattern for glob: use forward slashes for root_dir glob
-            # which expects POSIX-style patterns on all platforms.
-            cand_posix = token.replace("\\", "/").lstrip("/")
-            hits = sorted(glob.glob(cand_posix, root_dir=root, recursive=True))
-            valid: list[str] = []
-            for hit in hits:
-                full_hit = os.path.realpath(os.path.join(root, hit))
-                if not (full_hit == root or full_hit.startswith(root + os.sep)):
-                    continue
-                if os.path.isfile(os.path.join(root, hit)):
-                    valid.append(hit)
-                if len(valid) >= MAX_GLOB_HITS:
-                    break
-            return valid
-        full = os.path.realpath(os.path.join(root, candidate))
-        # Never read outside the workspace, however the path was written.
-        if full != root and not full.startswith(root + os.sep):
-            return []
-        return [os.path.relpath(full, root)] if os.path.exists(full) else []
-
-    @staticmethod
-    def _render_file(rel: str, full: str) -> str:
-        try:
-            with open(full, "r", encoding="utf-8", errors="replace") as handle:
-                content = handle.read(MAX_ATTACH_CHARS + 1)
-        except OSError:
-            return ""
-        truncated = len(content) > MAX_ATTACH_CHARS
-        body = content[:MAX_ATTACH_CHARS].rstrip()
-        if truncated:
-            body += "\n* [truncated]"
-        return f"* @{rel.upper()} *\n{body}"
-
-    @staticmethod
-    def _render_listing(rel: str, full: str) -> str:
-        try:
-            entries = sorted(os.listdir(full))[:MAX_LISTING_ENTRIES]
-        except OSError:
-            return ""
-        lines = [f"* @{rel.upper()} ({len(entries)} entries) *"]
-        for entry in entries:
-            kind = "DIR " if os.path.isdir(os.path.join(full, entry)) else "FILE"
-            lines.append(f"{kind} {entry}")
-        return "\n".join(lines)
-
     # ---- interrupt handling ----------------------------------------------
 
     def _install_sigint(self) -> None:
@@ -1423,273 +929,6 @@ class ConsoleSession:
         ]
         return lines
 
-    def set_goal(self, text: str) -> None:
-        self.goal = text.strip()
-        if not self.goal:
-            return
-        self._print(self.style.dim(f"  goal set: {self.goal}"))
-        self._print(self.style.dim("  /goal to check it · /goal done to clear it"))
-
-    def show_goal(self) -> None:
-        if not self.goal:
-            self._print(self.style.dim("  no goal set - /goal <what you want done>"))
-            return
-        self._print(f"  {self.style.bold('goal')} {self.goal}")
-        for note in self.goal_notes:
-            self._print(self.style.dim(f"    · {note}"))
-        if not self.goal_notes:
-            self._print(self.style.dim("    (no notes - /goal note <text> to add one)"))
-
-    def clear_goal(self, reason: str = "") -> None:
-        if not self.goal:
-            self._print(self.style.dim("  no goal set"))
-            return
-        finished = self.goal
-        self.goal = ""
-        self.goal_notes = []
-        self._print(self.style.dim(f"  goal cleared: {finished}"))
-        if reason:
-            self._print(self.style.dim(f"  {reason}"))
-
-    def add_goal_note(self, text: str) -> None:
-        if not self.goal:
-            self._print(self.style.dim("  set a goal first: /goal <what you want done>"))
-            return
-        self.goal_notes.append(text.strip())
-        self._print(self.style.dim(f"  noted ({len(self.goal_notes)} on this goal)"))
-
-    def _check_goal_completion(self, result: "RunResult | None") -> None:
-        """Notice an agent that declared the goal met.
-
-        The agent cannot clear the goal itself - only report - so a wrong
-        claim costs nothing but a line the operator can ignore.
-        """
-        if not self.goal or result is None or not result.final_message:
-            return
-        if "GOAL COMPLETE" not in result.final_message.upper():
-            return
-        self._print(
-            self.style.dim("  the agent reports the goal is met - /goal done to clear it")
-        )
-
-    # ---- todos ----------------------------------------------------------
-
-    def _normalise_todo(self, text: str) -> str:
-        return re.sub(r"\s+", " ", text.strip()).casefold()
-
-    def _find_todo(self, query: str, open_only: bool = True) -> int | None:
-        """Resolve a numbered item (1-based) or a text match to an index.
-
-        Text must match an item's whole text (after normalising
-        whitespace and case), never a fragment: a phrase that merely
-        sits inside a longer item would check the wrong thing off. To
-        pick among similar items or reach a done one, use the number
-        shown by /todo. With ``open_only`` (the default) done items are
-        never auto-selected - the operator explicitly re-numbers an item
-        to reopen it. Removal passes ``open_only=False`` because a done
-        item still needs to be findable to drop.
-        """
-        query = query.strip()
-        if query.isdigit():
-            index = int(query) - 1
-            return index if 0 <= index < len(self.todos) else None
-        target = self._normalise_todo(query)
-        for index, item in enumerate(self.todos):
-            if (not open_only or not item["done"]) and self._normalise_todo(item["text"]) == target:
-                return index
-        return None
-
-    def add_todo(self, text: str) -> None:
-        text = text.strip()
-        if not text:
-            self._print(self.style.dim("  usage: /todo add <what needs doing>"))
-            return
-        self.todos.append({"text": text, "done": False})
-        self._print(f"  {self.style.brand(str(len(self.todos)) + '.')} {text}")
-        self._print(self.style.dim("  /todo to see the list · /todo done <n> when it's done"))
-
-    def show_todos(self) -> None:
-        if not self.todos:
-            self._print(self.style.dim("  no todos - /todo add <what needs doing>"))
-            return
-        for index, item in enumerate(self.todos, 1):
-            marker = self.style.ash("[ ]") if not item["done"] else self.style.hair("[x]")
-            body = item["text"] if not item["done"] else self.style.strike(item["text"])
-            self._print(f"  {index:>2} {marker} {body}")
-        open_count = sum(1 for t in self.todos if not t["done"])
-        if open_count:
-            self._print("")
-            self._print(self.style.dim(f"  {open_count} open · /todo done <n> to check one off · /todo rm <n> to drop one"))
-
-    def mark_todo_done(self, query: str) -> bool:
-        """Mark an item done by 1-based number or text match. Returns True when found."""
-        index = self._find_todo(query, open_only=True)
-        if index is None:
-            # Distinguish "not in the list at all" from "already done".
-            existing = self._find_todo(query, open_only=False)
-            if existing is not None:
-                self._print(self.style.dim(f"  already done: {self.todos[existing]['text']}"))
-                return False
-            self._print(self.style.dim("  no open todo matches - /todo lists them"))
-            return False
-        item = self.todos[index]
-        if item["done"]:
-            self._print(self.style.dim(f"  already done: {item['text']}"))
-            return False
-        item["done"] = True
-        self._print(self.style.dim(f"  done: {item['text']}"))
-        remaining = sum(1 for t in self.todos if not t["done"])
-        if not remaining:
-            self._print(self.style.dim("  all todos done - /todo clear to drop the list"))
-        return True
-
-    def rm_todo(self, query: str) -> bool:
-        """Drop an item by 1-based number or text match. Returns True when found."""
-        index = self._find_todo(query, open_only=False)
-        if index is None:
-            self._print(self.style.dim("  no todo matches - /todo lists them"))
-            return False
-        removed = self.todos.pop(index)["text"]
-        self._print(self.style.dim(f"  removed: {removed}"))
-        return True
-
-    def clear_todos(self) -> None:
-        if not self.todos:
-            self._print(self.style.dim("  no todos to clear"))
-            return
-        count = len(self.todos)
-        self.todos = []
-        self._print(self.style.dim(f"  cleared {count} todos"))
-
-    def _todo_status_snippet(self) -> str:
-        """Styled open-item count for the border row while a turn runs.
-
-        Deprecated: no border row exists since the frame shims were
-        removed; kept because the test suite still exercises it.
-        Empty string when nothing is open, so the spinner row only gains
-        the ``[ ] N open`` readout when the checklist actually has work
-        left - and it drains live as the agent checks items off.
-        """
-        open_count = sum(1 for t in self.todos if not t["done"])
-        if not open_count:
-            return ""
-        plural = "" if open_count == 1 else "s"
-        return self.style.dim(f"[ ] {open_count} open item{plural}")
-
-    def _check_todo_completion(self, result: "RunResult | None") -> None:
-        """Apply the agent's TODO reports from its final message.
-
-        Two reports, each on its own line:
-
-        - ``TODO DONE: <text>`` checks an open item off. Matching is
-          exact after normalising whitespace, so the agent echoing an
-          item's text is the only thing that checks it off; a paraphrase
-          does nothing and the operator can mark it with /todo done <n>.
-        - ``TODO ADD: <text>`` appends a new item the agent discovered
-          along the way (follow-up work a task turned up). Deduplicated
-          against the list verbatim so repeated reports do not stack.
-
-        The agent can add and complete items, but never remove or edit
-        them - the operator owns the list.
-
-        Reports already applied inline by the streaming hook are skipped
-        here: their state change happened as the reply streamed and their
-        note is already on screen, so the end-of-turn pass only handles
-        what the stream never saw (non-streamed replies, reports whose
-        line fell outside the stream path).
-        """
-        if result is None or not result.final_message:
-            return
-        # Two passes, adds first: an item added and completed in the same
-        # message must check off regardless of which line came first.
-        reports = []
-        for line in result.final_message.splitlines():
-            head, _, rest = line.partition(":")
-            head = head.strip().upper()
-            reported = self._normalise_todo(rest)
-            if not reported:
-                continue
-            if head in ("TODO DONE", "TODO ADD"):
-                reports.append((head, rest.strip(), reported))
-        # Adds first, then completions; reports already applied inline
-        # by the streaming hook are skipped inside _apply_todo_report.
-        for head, text, reported in reports:
-            if head != "TODO ADD":
-                continue
-            if self._apply_todo_report(head, text, reported):
-                self._print(self.style.dim(f"  todo added ({len(self.todos)}): {text}"))
-        for head, text, reported in reports:
-            if head != "TODO DONE":
-                continue
-            if self._apply_todo_report(head, text, reported):
-                self._print(self.style.dim(f"  checked off: {text}"))
-
-    def _handle_stream_todo_report(self, line: str) -> str:
-        """Stream hook: apply a TODO report the moment its line arrives.
-
-        The raw ``TODO ADD: …`` protocol text never reaches the screen.
-        Instead the change is applied to the live list and a quiet note is
-        returned in its place, so the operator watches the checklist grow
-        and drain inside the streamed reply rather than reading a marker
-        line or waiting for the turn to end.
-        """
-        head, _, text = line.partition(":")
-        reported = self._normalise_todo(text)
-        if not reported:
-            return ""
-        # Normalise the case: the report pattern is case-insensitive, so
-        # "todo done: ..." must reach the applier, which compares exact
-        # uppercase heads.
-        applied = self._apply_todo_report(head.strip().upper(), text.strip(), reported)
-        if not applied:
-            # Already applied inline earlier in this stream (or a done
-            # item re-reported): return empty so the renderer swallows
-            # the raw protocol line instead of showing it again.
-            return ""
-        # ASCII checkboxes, dimmed: an open item carries the [ ] marker
-        # (the same mark /todo shows), a finished one the [x] with
-        # the text struck through - so a note reads exactly like a row of
-        # the checklist, only quieter than the reply around it.
-        if head.strip().upper() == "TODO DONE":
-            return self.style.dim(
-                self.style.hair("[x]") + " " + self.style.strike(text.strip())
-            )
-        open_count = sum(1 for t in self.todos if not t["done"])
-        plural = "" if open_count == 1 else "s"
-        return self.style.dim(
-            "[ ] " + text.strip()
-            + f" ({open_count} open item{plural})"
-        )
-
-
-    def _apply_todo_report(self, head: str, text: str, reported: str) -> bool:
-        """Apply one TODO ADD / TODO DONE report. Shared by both paths.
-
-        Returns True when a change was applied (an item added or checked
-        off). Callers decide how to announce it - the stream path returns
-        a styled note inline, the end-of-turn path prints after the turn.
-        Either way the state change happens once: reports already applied
-        inline are recorded in ``_turn_todo_reports`` so the end-of-turn
-        pass never re-adds, re-checks, or re-announces them.
-        """
-        if (head, reported) in self._turn_todo_reports:
-            return False  # already applied inline while the reply streamed
-        if head == "TODO ADD":
-            if any(self._normalise_todo(t["text"]) == reported for t in self.todos):
-                return False  # already tracked - do not stack duplicates
-            self.todos.append({"text": text, "done": False})
-            self._turn_todo_reports.append(("TODO ADD", reported))
-            return True
-        if head == "TODO DONE":
-            for item in self.todos:
-                if item["done"]:
-                    continue
-                if self._normalise_todo(item["text"]) == reported:
-                    item["done"] = True
-                    self._turn_todo_reports.append(("TODO DONE", reported))
-                    return True
-        return False
-
     def auto_route(self, text: str) -> str | None:
         """Attach the skill this request is asking for, without being asked.
 
@@ -1803,12 +1042,14 @@ class ConsoleSession:
             logger=self.logger,
             events=self.bus,
             system_prompt=self._effective_system_prompt(request_text),
-            max_steps=self.max_steps,
-            on_delta=self._on_delta,
+            max_steps=self.max_steps,            on_delta=self._on_delta,
             context=self.context,
             abort=self._abort,
             approver=self.approvals,
             on_tool_result=self._on_tool_observation,
+            observation_max_chars=self._observation_max_chars(),
+            digest=bool((self.config.get("context") or {}).get("digest", True)),
+            digest_max_chars=int((self.config.get("context") or {}).get("digest_max_chars", 4000) or 0),
         )
         self._streamed_this_run = False
         self._stream_header_done = False
@@ -1945,810 +1186,9 @@ class ConsoleSession:
         if result is not None:
             self._print(f"  {self.style.dim(self._usage_line(result))}")
 
-    def _record_usage(self, result: RunResult) -> None:
-        self.totals["turns"] += 1
-        tin = int(result.metrics.get("tokens_in", 0))
-        tout = int(result.metrics.get("tokens_out", 0))
-        cache = int(result.metrics.get("cache_hit", 0))
-        # Fallback to estimated tokens when provider gave no usage or all zeros.
-        # This keeps /cost and the top-bar CACHE useful even when the
-        # endpoint does not return usage (e.g. after stream_options downgrade).
-        if tin == 0 and tout == 0:
-            est_in = self.context.tokens
-            est_out = max(1, len(result.final_message) // 4) if result.final_message else 0
-            # If cache was reported but prompt was 0, use cache as at least part of input
-            if cache > 0 and est_in == 0:
-                est_in = cache
-            # Only estimate if we have something to estimate from
-            if est_in > 0 or est_out > 0:
-                if tin == 0:
-                    tin = est_in
-                    result.metrics["tokens_in"] = tin
-                if tout == 0:
-                    tout = est_out
-                    result.metrics["tokens_out"] = tout
-                result.metrics["usage_estimated"] = 1
-        # Cache-hit tokens also ride inside tokens_in when the provider
-        # reports them, and they are re-counted in cache_hit below; the
-        # input total keeps tin as reported so the same tokens are not
-        # counted twice in the /cost figures.
-        self.totals["tokens_in"] += tin
-        self.totals["tokens_out"] += tout
-        self.totals["tool_errors"] += int(result.metrics.get("tool_errors", 0))
-        self.totals["cache_hit"] += cache
-        # Record per-turn metrics for trend analysis.
-        rate = min(100, cache * 100 // tin) if tin > 0 else 0
-        self.turn_history.append({
-            "turn": self.totals["turns"],
-            "tokens_in": tin,
-            "tokens_out": tout,
-            "cache_hit": cache,
-            "cache_rate": rate,
-        })
-        # Wire CACHE instantly — top bar shows hit rate without waiting for next chrome redraw
-        if self.layout is not None and getattr(self.layout, "active", False):
-            try:
-                self.layout.draw_chrome()
-            except Exception:
-                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
-
-    def _usage_line(self, result: RunResult) -> str:
-        tin = int(result.metrics.get("tokens_in", 0))
-        tout = int(result.metrics.get("tokens_out", 0))
-        cache = int(result.metrics.get("cache_hit", 0))
-        steps = result.steps_used
-        elapsed = time.monotonic() - self._turn_started
-        elapsed_str = _format_elapsed(elapsed)
-        cache_bit = f" · {_short(cache)} CACHED" if cache else ""
-        if not tin and not tout:
-            return f"{elapsed_str} · {steps} STEP{cache_bit} · CTX {_short(self.context.tokens)}"
-        return (
-            f"{elapsed_str} · {steps} STEP · "
-            f"I/O {_short(tin)} / {_short(tout)}{cache_bit} · CTX {_short(self.context.tokens)}"
-        )
-
-    def _record_memory(self, task: dict, result: RunResult) -> None:
-        final = (result.final_message or "").strip().replace("\n", " ")[:300]
-        entry = (
-            f"- {time.strftime('%Y-%m-%d %H:%M')} | {task['task_id']} | "
-            f"{result.stopped_reason}: {final} | status=active"
-        )
-        # Search-before-write: a near-duplicate is skipped entirely, and
-        # a new entry on a topic already covered marks the old one
-        # superseded instead of stacking copies (memory rot).
-        existing = read_raw_tail(self.memory_path)
-        action, updated = plan_memory_write(existing, entry)
-        if action == "skip":
-            return
-        if action == "supersede":
-            rewrite_memory(self.memory_path, updated, new_entry=entry)
-            return
-        ok = append_memory(
-            self.memory_path,
-            entry,
-        )
-        if not ok:
-            self._print("(memory write skipped: store busy or unwritable)")
-
-    def _report_changes(self) -> None:
-        """Announce files the agent touched, newest first, once each."""
-        changed = getattr(self.sandbox, "changed", set()) or set()
-        fresh = sorted(changed - self.reported_changes)
-        if not fresh:
-            return
-        self.reported_changes.update(fresh)
-        shown = fresh[:8]
-        more = "" if len(fresh) <= 8 else f" (+{len(fresh) - 8} more)"
-        self._print(f"  {self.style.dim('changed: ' + ', '.join(shown) + more)}")
-
-    # ---- context management ----------------------------------------------
-
-    def _auto_compact(self) -> None:
-        # merge_defaults rejects non-integer values, but stay defensive:
-        # a bad value must disable compaction, not crash the first turn.
-        raw = self.config.get("auto_compact_tokens", 0) or 0
-        limit = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
-        if limit and self.context.tokens > limit:
-            self._print(self.style.dim(f"  (context ~{self.context.tokens} tokens, compacting)"))
-            self.compact()
-
-    def compact(self) -> bool:
-        """Summarise the conversation, keeping the system prompt and summary."""
-        if len(self.context.messages) <= 3:
-            return False
-        transcript = _transcript(self.context.messages)
-        request = (
-            "Summarise this coding session so work can continue without the "
-            "original transcript. Cover: the goal, every file created or "
-            "modified and why, commands that were run and their outcome, any "
-            "error encountered and how it was resolved, and the exact state "
-            "left off at. Be dense and concrete; no preamble.\n\n"
-            f"{transcript}"
-        )
-        try:
-            response = self.llm.chat(
-                [{"role": "user", "content": request}], tools=None, on_delta=None
-            )
-        except HarnessError as exc:
-            self._print(self.style.ember(f"  compaction failed: {exc}"))
-            return False
-        summary = (response.content or "").strip()
-        if not summary:
-            return False
-        before = self.context.tokens
-        self.context.replace_body(
-            [
-                {
-                    "role": "user",
-                    "content": "Earlier in this session (compressed summary):\n" + summary,
-                }
-            ]
-        )
-        self._print(
-            self.style.dim(f"  compacted: ~{before} -> ~{self.context.tokens} tokens")
-        )
-        return True
-
-    # ---- session persistence ---------------------------------------------
-
-    def save_session(self, path: str) -> bool:
-        """Persist the session to *path*, validated inside the allowed directories. Returns True on success."""
-        # Validate path is inside allowed directories to prevent arbitrary write
-        if not _is_safe_session_path(path, self.workspace):
-            self._print(self.style.warn(f"  refusing to save outside allowed dirs: {path}"))
-            self._print(self.style.dim(f"  allowed: workspace, {sessions.sessions_dir()}, temp"))
-            return False
-        # Enforce size cap on file path length and payload
-        if len(path) > 500:
-            self._print(self.style.ember("  save failed: path too long"))
-            return False
-        payload = {
-            "version": 1,
-            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "workspace": self.workspace,
-            "model": self.config.get("llm", {}).get("model", "?"),
-            "totals": self.totals,
-            "messages": self.context.messages,
-            "show_tool_output": self._show_tool_output,
-            "pending_pages": self._pending_pages_snapshot(),
-        }
-        # Cap file size via payload size check. A failure here (e.g. the
-        # payload contains something json can't serialize) means the write
-        # below will fail the same way, so surface it now instead of
-        # silently skipping the check and hitting an uncaught error later.
-        try:
-            data = json.dumps(payload, ensure_ascii=False)
-        except (TypeError, ValueError) as exc:
-            self._print(self.style.ember(f"  save failed: {exc}"))
-            return False
-        if len(data) > 10_000_000:
-            self._print(self.style.ember("  save failed: session too large"))
-            return False
-        try:
-            # Parent dirs only need to exist; the session file itself
-            # gets 0o600 below, which is where the privacy boundary sits.
-            parent = os.path.dirname(os.path.abspath(path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-        except (OSError, TypeError, ValueError) as exc:
-            self._print(self.style.ember(f"  save failed: {exc}"))
-            return False
-        self._print(self.style.dim(f"  saved {len(self.context.messages)} messages to {path}"))
-        return True
-
-    def load_session(self, path: str) -> bool:
-        """Restore a session from *path* (size-capped, allow-listed). Returns True on success."""
-        if not _is_safe_session_path(path, self.workspace):
-            self._print(self.style.warn(f"  refusing to load outside allowed dirs: {path}"))
-            return False
-        try:
-            # Size check before load
-            try:
-                if os.path.getsize(path) > 10_000_000:
-                    self._print(self.style.ember("  load failed: file too large"))
-                    return False
-            except OSError:
-                pass
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            self._print(self.style.ember(f"  load failed: {exc}"))
-            return False
-        if not isinstance(payload, dict):
-            # A top-level list/string would crash the payload.get below.
-            self._print(self.style.ember("  load failed: session file must contain a JSON object"))
-            return False
-        messages = payload.get("messages")
-        if not isinstance(messages, list) or not messages:
-            self._print(self.style.ember("  load failed: no messages in file"))
-            return False
-        if len(messages) > 500:
-            # Cap restored sessions so a huge transcript cannot blow the budget.
-            self._print(self.style.warn(f"  warning: large session {len(messages)} messages, truncating"))
-            messages = messages[-500:]
-        # A hand-edited session file can carry non-dict elements; the
-        # budget pass calls message.get() on each entry, so filter to
-        # dicts first (the replay loop applies the same guard).
-        self.context.messages = [m for m in messages if isinstance(m, dict)]
-        self.context.enforce_budget()
-        totals = payload.get("totals")
-        if isinstance(totals, dict):
-            self.totals.update({k: _safe_int(v) for k, v in totals.items() if k in self.totals})
-        output_pref = payload.get("show_tool_output")
-        if isinstance(output_pref, bool):
-            self._show_tool_output = output_pref
-        remaining_pages = self._restore_pending_pages(payload)
-        self._print(
-            self.style.dim(f"  restored {len(messages)} messages (~{self.context.tokens} tokens)")
-        )
-        if remaining_pages:
-            self._print(
-                self.style.dim(
-                    "  (capped outputs from the saved run remain — press Enter with an empty prompt to page through them)"
-                )
-            )
-        return True
-
-    # ---- resumable sessions ----------------------------------------------
-
-    def autosave(self) -> None:
-        """Keep the session resumable without being asked.
-
-        Silent by design: the only time the operator learns the file
-        exists is when /sessions lists it. Nothing is written until there
-        is a real conversation.
-        """
-        if len(self.context.messages) < 2:
-            return
-        if not self.session_name:
-            self.session_name = sessions.derive_name(self.workspace, self.model_name())
-        saved = sessions.save(
-            self.session_name,
-            {
-                "workspace": self.workspace,
-                "model": self.model_name(),
-                "summary": sessions._summarise(self.context.messages),
-                "totals": self.totals,
-                "goal": self.goal,
-                "goal_notes": self.goal_notes,
-                "todos": self.todos,
-                "messages": self.context.messages,
-                "show_tool_output": self._show_tool_output,
-                "pending_pages": self._pending_pages_snapshot(),
-            },
-        )
-        if saved is None and not self._autosave_warned:
-            # A lock-contention or write failure leaves no session file;
-            # say so once rather than silently believing the save landed.
-            self._autosave_warned = True
-            self._print(self.style.dim("  (autosave failed - session not written to disk)"))
-
-    def model_name(self) -> str:
-        return str(self.config.get("llm", {}).get("model", "") or "")
-
-    def resume_session(self, name: str) -> bool:
-        """Restore a saved session by name."""
-        data = sessions.load(name)
-        if data is None:
-            known = sessions.list_sessions()
-            if not known:
-                self._print(self.style.dim("  no saved sessions yet"))
-                return False
-            self._print(self.style.ember(f"  no session named '{name}'"))
-            self._print(self.style.dim("  /sessions lists them"))
-            return False
-        # Workspace guard: a session saved in one workspace is not
-        # resumed in another.
-        saved_ws = data.get("workspace") or ""
-        if saved_ws and not self._is_same_workspace(saved_ws):
-            self._print(self.style.warn(f"  session '{name}' belongs to workspace {saved_ws}"))
-            self._print(self.style.dim(f"  current workspace is {self.workspace} — switch workspace or use /sessions list to see this workspace's sessions"))
-            return False
-        messages = data.get("messages")
-        if not isinstance(messages, list) or not messages:
-            self._print(self.style.ember(f"  session '{name}' has no conversation"))
-            return False
-        # Filter to dict entries before the budget pass: a hand-edited
-        # session file can carry non-dict elements that would crash the
-        # message.get() calls inside enforce_budget().
-        self.context.messages = [m for m in messages if isinstance(m, dict)]
-        self.context.enforce_budget()
-        totals = data.get("totals")
-        if isinstance(totals, dict):
-            self.totals.update({k: _safe_int(v) for k, v in totals.items() if k in self.totals})
-        self.message_count = sum(
-            1 for m in messages if isinstance(m, dict) and m.get("role") == "user"
-        )
-        # The goal travels with the conversation: resuming a session to
-        # finish something and finding the objective gone defeats the
-        # point of resuming it.
-        self.goal = str(data.get("goal") or "")
-        notes = data.get("goal_notes")
-        self.goal_notes = [str(n) for n in notes] if isinstance(notes, list) else []
-        # The todo checklist travels with the conversation too: resuming
-        # a session to finish a multi-part task and finding its list
-        # wiped would scatter the remaining work.
-        saved_todos = data.get("todos")
-        self.todos = []
-        if isinstance(saved_todos, list):
-            for entry in saved_todos:
-                if isinstance(entry, dict) and "text" in entry:
-                    self.todos.append({"text": str(entry["text"]), "done": bool(entry.get("done"))})
-        # Adopt the name, so the next autosave continues this session
-        # rather than starting a second file beside it.
-        self.session_name = name
-        # The operator's display preference travels with the session, so
-        # resuming one where the tool-output boxes were hidden stays that
-        # way (Ctrl+O flips it back live).
-        output_pref = data.get("show_tool_output")
-        if isinstance(output_pref, bool):
-            self._show_tool_output = output_pref
-        # An interrupted paging session resumes where it left off: any
-        # capped tool output not yet paged through comes back with the
-        # conversation, ready for the empty-Enter pager.
-        remaining_pages = self._restore_pending_pages(data)
-        # Hide splash so full history is visible immediately — splash otherwise
-        # covers viewport until next resize/handle hides it.
-        if self.layout is not None and getattr(self.layout, "_splash_visible", False):
-            try:
-                self.layout.hide_splash()
-            except Exception:
-                pass  # duck-typed bridge: splash removal is cosmetic
-            self._splash_visible = False
-        if not self._show_tool_output:
-            self._print(self.style.dim("  (tool output boxes are hidden in this session — ctrl+o to show)"))
-        self._print(
-            self.style.dim(
-                f"  resumed '{name}' - {len(messages)} messages "
-                f"(~{self.context.tokens} tokens)"
-            )
-        )
-        if remaining_pages:
-            self._print(
-                self.style.dim(
-                    "  (capped outputs from the interrupted run remain — press Enter with an empty prompt to page through them)"
-                )
-            )
-        # Replay conversation history in the viewport.
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            # Handle multimodal/list content
-            if isinstance(content, list):
-                try:
-                    content = " ".join(part.get("text","") for part in content if isinstance(part, dict) and part.get("type")=="text") or str(content)
-                except (TypeError, AttributeError):
-                    content = str(content)  # unexpected part shape: stringify
-            if role == "user":
-                text = content if isinstance(content, str) else str(content or "")
-                if text.strip():
-                    self._print(f"{self.style.ash('you')} {_sanitize_output(text)}")
-                else:
-                    self._print(f"{self.style.ash('you')} (empty)")
-            elif role == "assistant":
-                # Assistant may have null content + tool_calls — render body as markdown.
-                # Model-controlled text is sanitized exactly like the live
-                # reply paths: saved output must not drive the terminal.
-                if isinstance(content, str) and content.strip():
-                    self._print(f"{self.style.brand('ENCHANTER')}")
-                    self._print(render_markdown(_sanitize_output(content), self.style))
-                elif msg.get("tool_calls"):
-                    calls = ", ".join((c.get("function") or {}).get("name","?") for c in msg.get("tool_calls") or [])
-                    self._print(f"{self.style.brand('ENCHANTER')} [called {calls}]")
-                    if isinstance(content, str) and content.strip():
-                        self._print(render_markdown(_sanitize_output(content), self.style))
-                elif isinstance(content, str):
-                    self._print(f"{self.style.brand('ENCHANTER')} {_sanitize_output(content)}")
-            elif role == "tool":
-                text = content if isinstance(content, str) else str(content or "")
-                if text.strip():
-                    # Keep the replay compact: 300 chars per tool result.
-                    self._print(f"{self.style.dim('tool')} {self.style.dim(_sanitize_output(text)[:300])}")
-                else:
-                    self._print(f"{self.style.dim('tool')} (no output)")
-        summary = data.get("summary") or ""
-        if summary:
-            self._print(self.style.dim(f"  started with: {summary}"))
-        # Flush viewport so history appears immediately — without this the
-        # throttled writes in the terminal application stay buffered until flush.
-        if self.layout is not None and getattr(self.layout, "active", False):
-            try:
-                self.layout.flush()
-            except Exception:
-                pass  # duck-typed bridge: flush is cosmetic, never fatal
-        return True
-
-    def _is_same_workspace(self, saved_ws: str) -> bool:
-        try:
-            cur = os.path.realpath(os.path.abspath(self.workspace or ""))
-            saved = os.path.realpath(os.path.abspath(saved_ws or ""))
-            if os.name == "nt":
-                return cur.lower() == saved.lower()
-            return cur == saved
-        except (OSError, ValueError):
-            # Unresolvable paths (deleted cwd, bad chars): compare raw.
-            return (saved_ws or "") == (self.workspace or "")
-
-    def show_sessions(self) -> None:
-        """List what can be resumed — filtered to current workspace."""
-        all_known = sessions.list_sessions()
-        known = [item for item in all_known if self._is_same_workspace(item.get("workspace") or "")]
-        if not known:
-            if all_known:
-                self._print(self.style.dim(f"  no saved sessions for this workspace ({self.workspace})"))
-                self._print(self.style.dim(f"  {len(all_known)} session(s) exist for other workspaces — switch workspace to see them"))
-            else:
-                self._print(self.style.dim("  no saved sessions yet - they are saved as you go"))
-            return
-        self._print(self.style.bold(f"  saved sessions for {self.workspace}"))
-        for item in known:
-            when = item["saved_at"] or "unknown time"
-            turns = item["turns"]
-            label = f"{turns} turn" if turns == 1 else f"{turns} turns"
-            head = f"  {item['name']}"
-            if item["name"] == self.session_name:
-                head += self.style.dim(" (current)")
-            self._print(head)
-            extra = ""
-            if item.get("show_tool_output") is False:
-                extra = " · output boxes hidden"
-            self._print(self.style.dim(f"      {when} · {label} · {item['model'] or '?'}{extra}"))
-            if item["summary"]:
-                self._print(self.style.dim(f"      {item['summary']}"))
-        self._print("")
-        self._print(self.style.dim("  /sessions <name> to pick one up"))
-
-    def pick_session(self) -> bool:
-        """Resume from a menu — filtered to current workspace. False when nothing was chosen."""
-        all_known = sessions.list_sessions()
-        known = [item for item in all_known if self._is_same_workspace(item.get("workspace") or "")]
-        if not known:
-            if all_known:
-                self._print(self.style.dim(f"  no saved sessions for this workspace ({self.workspace})"))
-            else:
-                self._print(self.style.dim("  no saved sessions yet - they are saved as you go"))
-            return False
-        options = []
-        for item in known:
-            summary = item["summary"] or "no summary"
-            detail = f"{item['saved_at']} · {item['turns']} turns · {summary}"
-            if item.get("show_tool_output") is False:
-                detail += " · output boxes hidden"
-            options.append(Option(item["name"], item["name"], detail))
-        chosen = _menu(
-            self,
-            "Resume a session",
-            options,
-            hint="up/down move · Enter resume · Esc cancel",
-        )
-        if not chosen:
-            return False
-        return self.resume_session(chosen)
-
     # ---- inspection commands ---------------------------------------------
 
-    def _git(self, *args: str) -> str:
-        try:
-            completed = subprocess.run(
-                ["git", *args], cwd=self.workspace,
-                capture_output=True, text=True, timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        return completed.stdout if completed.returncode == 0 else ""
-
-    def _git_ok(self, *args: str) -> bool:
-        """Run git and report success; stdout alone cannot distinguish it."""
-        try:
-            completed = subprocess.run(
-                ["git", *args], cwd=self.workspace,
-                capture_output=True, text=True, timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return completed.returncode == 0
-
-    def show_workspace(self) -> None:
-        root = self.sandbox.root
-        self._print(f"workspace: {root}")
-        try:
-            entries = sorted(os.listdir(root))[:50] if os.path.isdir(root) else []
-        except OSError as exc:
-            self._print(self.style.ember(f"  cannot list workspace: {exc}"))
-            return
-        for entry in entries:
-            try:
-                full = os.path.join(root, entry)
-                self._print(("> " if os.path.isdir(full) else "") + entry)
-            except OSError:
-                self._print(entry)
-        if not entries:
-            self._print("(empty)")
-
-    def show_diff(self) -> None:
-        stat = self._git("diff", "--stat")
-        status = self._git("status", "--short")
-        if not stat and not status:
-            self._print("(no uncommitted changes)")
-            return
-        if status:
-            self._print(status.rstrip())
-        if stat:
-            self._print(stat.rstrip())
-        diff = self._git("diff")
-        if diff:
-            # Same before/after panes as the live edit previews and the
-            # agent's git-diff boxes.
-            rows = self._diff_pane_rows(diff, max_lines=400)
-            if rows is not None:
-                self._print(self._box("git diff", rows))
-                return
-            lines = diff.splitlines()
-            cap = 400  # plain-text fallback: same cap as the boxed panes
-            self._print("\n".join(lines[:cap]))
-            if len(lines) > cap:
-                self._print(f"... ({len(lines) - cap} more lines)")
-
-    def undo_changes(self) -> None:
-        status = self._git("status", "--porcelain")
-        if not status:
-            self._print("(nothing to undo - working tree is clean)")
-            return
-        self._print(f"{len(status.strip().splitlines())} file(s) would be reverted:")
-        self._print(status.rstrip())
-        try:
-            if self.ui is not None:
-                answer = self.ui.ask_line('type "yes" to revert tracked changes').strip()
-            else:
-                answer = input('type "yes" to revert tracked changes: ').strip()
-        except (KeyboardInterrupt, EOFError):
-            self._print("cancelled")
-            return
-        if answer.lower() != "yes":
-            self._print("cancelled")
-            return
-        self._print("reverted" if self._git_ok("checkout", "--", ".") else "revert failed")
-
-    def show_cost(self, compact: bool = False, as_json: bool = False) -> None:
-        t = self.totals
-        tokens_in = t['tokens_in']
-        tokens_out = t['tokens_out']
-        cache_hit = t['cache_hit']
-        context_tokens = self.context.tokens
-        context_chars = self.context.chars
-
-        # Derived metrics.
-        cache_rate = (cache_hit * 100 // tokens_in) if tokens_in > 0 else 0
-        cache_saved = cache_hit // 2  # ~50% discount
-
-        if as_json:
-            payload = {
-                "turns": t['turns'],
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "cache_hit": cache_hit,
-                "cache_rate": cache_rate,
-                "cache_saved": cache_saved,
-                "tool_errors": t['tool_errors'],
-                "context_tokens": context_tokens,
-                "context_chars": context_chars,
-            }
-            if self.turn_history:
-                payload["turn_history"] = self.turn_history[-10:]
-            self._print(json.dumps(payload, indent=2))
-            return
-
-        self._print(f"turns        {t['turns']}")
-        self._print(f"tokens in    {tokens_in}")
-        self._print(f"tokens out   {tokens_out}")
-        # Cache analytics: show hit rate and estimated savings.
-        if tokens_in > 0 and cache_hit > 0:
-            self._print(f"cache hit    {cache_hit} ({cache_rate}% of prompt)")
-            self._print(f"cache saved  {cache_saved} tokens (~50% discount)")
-        else:
-            self._print(f"cache hit    {cache_hit}")
-        self._print(f"tool errors  {t['tool_errors']}")
-        self._print(f"context      ~{context_tokens} tokens ({context_chars} chars)")
-        # Per-turn cache trend (last 5 turns) — skipped in compact mode.
-        if not compact and self.turn_history:
-            recent = self.turn_history[-5:]
-            self._print("")
-            self._print("  turn  in      out     cached  rate")
-            self._print("  " + "─" * 40)
-            for entry in recent:
-                tin = entry['tokens_in']
-                tout = entry['tokens_out']
-                ch = entry['cache_hit']
-                cr = entry['cache_rate']
-                self._print(
-                    f"  {entry['turn']:<6}{tin:<8}{tout:<8}{ch:<8}{cr}%"
-                )
-
-    def set_model(self, name: str, quiet: bool = False) -> None:
-        self.config.setdefault("llm", {})["model"] = name
-        try:
-            self.llm = build_llm(self.config["llm"])
-        except HarnessError as exc:
-            self._print(self.style.ember(f"  could not switch model: {exc}"))
-            return
-        if not quiet:
-            self._print(self.style.dim(f"  model is now {name}"))
-        self.refresh_title()
-        self._warn_if_key_missing()
-        # Wire top info instantly so MODEL shows new name without waiting for next turn
-        if self.layout is not None and getattr(self.layout, "active", False):
-            try:
-                self.layout.draw_chrome()
-            except Exception:
-                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
-
-    def set_reasoning(self, level: str, quiet: bool = False) -> None:
-        """Set the thinking budget for the current model.
-
-        Not every endpoint understands the field; the client sheds it on a
-        400 and the reply simply arrives without the extra thinking.
-        """
-        wanted = level.strip().lower()
-        if wanted in ("off", "none", ""):
-            wanted = None
-        elif wanted not in REASONING_EFFORTS:
-            self._print(
-                self.style.warn(f"  reasoning must be one of {', '.join(REASONING_EFFORTS)} or off")
-            )
-            return
-        llm = self.config.setdefault("llm", {})
-        llm["reasoning_effort"] = wanted
-        try:
-            self.llm = build_llm(llm)
-        except HarnessError as exc:
-            self._print(self.style.ember(f"  could not set reasoning: {exc}"))
-            return
-        if not quiet:
-            self._print(
-                self.style.dim(f"  reasoning is now {wanted}" if wanted else "  reasoning off")
-            )
-        self.refresh_title()
-        if self.layout is not None and getattr(self.layout, "active", False):
-            try:
-                self.layout.draw_chrome()
-            except Exception:
-                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
-
-    def show_reasoning(self) -> None:
-        effort = self.config.get("llm", {}).get("reasoning_effort")
-        current = effort or "off"
-        options = " ".join(
-            f"[{e}]" if e == effort else e for e in REASONING_EFFORTS
-        )
-        self._print(f"  reasoning  {current}   {self.style.dim(options + '  off')}")
-        self._print(
-            self.style.dim(
-                "  higher means more thorough and slower; ignored by models "
-                "that do not reason"
-            )
-        )
-
-    @property
-    def endpoint_name(self) -> str:
-        """Which saved endpoint the current base URL belongs to, if any."""
-        llm = self.config.get("llm", {})
-        return endpoint_name_for_url(llm.get("base_url", "")) or ""
-
-    def use_endpoint(self, name: str, model: str | None = None) -> bool:
-        """Point the agent at a saved endpoint. True on success."""
-        entry = known_endpoints().get(name.lower())
-        if entry is None:
-            self._print(self.style.warn(f"  no endpoint named '{name}'"))
-            self._print(self.style.dim("  add one with /model, or list them: /model"))
-            return False
-        llm = self.config.setdefault("llm", {})
-        llm["base_url"] = entry["base_url"]
-        llm["api_key_env"] = entry.get("api_key_env") or ""
-        # A model name rarely survives a move between endpoints, so take
-        # the first one this endpoint offers unless one was asked for.
-        llm["model"] = model or (entry.get("models") or [""])[0] or llm.get("model", "")
-        try:
-            self.llm = build_llm(llm)
-        except HarnessError as exc:
-            self._print(self.style.ember(f"  could not switch endpoint: {exc}"))
-            return False
-        set_active(endpoint=name.lower(), model=llm.get("model", ""))
-        self._print(self.style.dim(f"  endpoint is now {entry['base_url']}"))
-        self.refresh_title()
-        self._warn_if_key_missing()
-        if self.layout is not None and getattr(self.layout, "active", False):
-            try:
-                self.layout.draw_chrome()
-            except Exception:
-                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
-        return True
-
-    def _warn_if_key_missing(self) -> None:
-        """Say so up front when the key variable is unset.
-
-        Silence here turns into a confusing 401 three steps into a task.
-        """
-        llm = self.config.get("llm", {})
-        key_env = llm.get("api_key_env") or ""
-        if not provider_needs_key(llm.get("base_url", ""), key_env):
-            return
-        if os.environ.get(key_env) or has_stored(key_env):
-            return
-        self._print(self.style.warn(f"  warning: no key for ${key_env}"))
-        self._print(
-            self.style.dim(
-                f"  store one with /model, or edit {settings_path()}"
-            )
-        )
-
-    def _warn_if_any_key_missing(self) -> None:
-        """Warn once per saved endpoint whose key variable is unset.
-
-        Called once at startup so a saved-but-unkeyed endpoint warns
-        even when it is not the active one; the active endpoint is
-        covered by _warn_if_key_missing on every switch.
-        """
-        llm = self.config.get("llm", {})
-        current_url = (llm.get("base_url") or "").rstrip("/")
-        warned: set[str] = set()
-        for name, entry in known_endpoints().items():
-            key_env = entry.get("api_key_env") or ""
-            if not provider_needs_key(entry.get("base_url", ""), key_env):
-                continue
-            if (entry.get("base_url") or "").rstrip("/") == current_url:
-                continue  # the active endpoint warns via the per-switch check
-            if key_env in warned or os.environ.get(key_env) or has_stored(key_env):
-                continue
-            warned.add(key_env)
-            self._print(self.style.warn(f"  warning: no key for ${key_env} ({name})"))
-        if warned:
-            self._print(
-                self.style.dim(
-                    f"  store keys with /model, or edit {settings_path()}"
-                )
-            )
-
-    def show_endpoints(self) -> None:
-        """List what the user has configured, and where the file is."""
-        llm = self.config.get("llm", {})
-        current = (llm.get("base_url") or "").rstrip("/")
-        known = known_endpoints()
-        if not known:
-            self._print(self.style.dim("  no endpoints yet - add one with /model"))
-            # Name the file even here: an empty list is exactly when
-            # somebody is most likely to want to type one in by hand.
-            self._print(self.style.dim(f"  or add one to {settings_path()}"))
-            return
-        self._print(self.style.bold("  endpoints"))
-        for name in sorted(known):
-            entry = known[name]
-            marker = "*" if entry["base_url"] == current else " "
-            key_env = entry.get("api_key_env") or ""
-            if not provider_needs_key(entry["base_url"], key_env):
-                key_state = "no key needed"
-            elif os.environ.get(key_env):
-                key_state = "key in env"
-            elif has_stored(key_env):
-                key_state = f"stored {mask(stored_keys().get(key_env))}"
-            else:
-                key_state = "no key"
-            count = len(entry.get("models") or [])
-            model_bit = f"{count} model" + ("" if count == 1 else "s")
-            tail = " · ".join(p for p in (key_state, model_bit) if p)
-            self._print(
-                f"  {marker} {name:<12} {entry['base_url']:<38}"
-                f" {self.style.dim(tail)}"
-            )
-        self._print(self.style.dim("  * = current. add or switch: /model"))
-        self._print(self.style.dim(f"  or edit by hand: {settings_path()}"))
+    # ---- git/workspace/cost, endpoints, banner follow ---------------------
 
     def banner(self) -> None:
         s = self.style
@@ -2818,43 +1258,6 @@ def _infer_workspace() -> str:
     if any(normalized.lower() == p.lower().rstrip("\\/") for p in protected):
         return os.path.join(PROJECT_ROOT, "workspace")
     return cwd
-
-
-def _is_safe_session_path(path: str, workspace: str) -> bool:
-    """Check if a session file path is inside allowed directories."""
-    try:
-        real = os.path.realpath(os.path.abspath(path))
-        # Allow workspace and its .mantra, sessions dir, temp dir, and home/.mantra
-        allowed = [
-            os.path.realpath(workspace),
-            os.path.realpath(os.path.join(workspace, ".mantra")),
-            os.path.realpath(sessions.sessions_dir()),
-            os.path.realpath(tempfile.gettempdir()),
-            os.path.realpath(os.path.expanduser("~/.mantra")),
-        ]
-        # Also allow current project workspace default
-        try:
-            allowed.append(os.path.realpath(os.path.join(PROJECT_ROOT, "workspace")))
-        except OSError:
-            pass  # PROJECT_ROOT removed under us; the other allowdirs still apply
-        # Case-fold only where the filesystem is case-insensitive; on
-        # POSIX a differently-cased sibling must not slip through the
-        # containment check (realpath does not normalize case).
-        if os.name == "nt":
-            real_cmp = real.lower()
-            for base in allowed:
-                base = base.rstrip(os.sep)
-                base_cmp = base.lower()
-                if real_cmp == base_cmp or real_cmp.startswith(base_cmp + os.sep.lower()):
-                    return True
-        else:
-            for base in allowed:
-                base = base.rstrip(os.sep)
-                if real == base or real.startswith(base + os.sep):
-                    return True
-        return False
-    except OSError:
-        return False
 
 
 def dispatch(session: ConsoleSession, line: str) -> bool:
@@ -2927,6 +1330,8 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         _workflow(session, argument)
     elif command in ("/skills", "/skill"):
         _skills(session, argument)
+    elif command == "/mcp":
+        _mcp(session, argument)
     elif command == "/verbose":
         session.verbose = not session.verbose
         session._print(f"verbose {'on' if session.verbose else 'off'}")
@@ -3007,7 +1412,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"choose from {', '.join(REASONING_EFFORTS)} or off"
             )
     if args.approve:
+        # An explicit flag outranks every stored preference.
         config["approvals"] = args.approve
+    else:
+        # Otherwise the operator's last /approve choice wins over the
+        # config file: it is a preference, not a per-run detail, so a
+        # restarted session keeps the mode the operator actually picked
+        # instead of reverting to whatever the file says.
+        try:
+            from core.agent.settings import ui_prefs
+
+            saved = str(ui_prefs().get("approvals") or "").strip()
+            if saved in MODES:
+                config["approvals"] = saved
+        except Exception:
+            pass  # unreadable preferences: the config default stands
 
     # Color follows the stream: a real terminal gets ANSI, a pipe or
     # redirect gets clean text unless the operator forces color.
@@ -3020,7 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
         color_on = mode == "always" or (mode != "never" and (sys.stdout.isatty() or forced))
     style = Style(enabled=color_on)
     workspace = args.workspace or _infer_workspace()
-    session = ConsoleSession(config, workspace, style)
+    session = ConsoleSession(config, workspace, style, config_path=args.config)
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -3056,6 +1475,7 @@ def _repl_plain(session: ConsoleSession, reader: Any = None) -> None:
             line = (reader("MANTRA > ") if reader is not None else input("MANTRA > ")).strip()
         except (KeyboardInterrupt, EOFError):
             print("bye")
+            _close_mcp(session)
             session.logger.close()
             return
         if not line:
@@ -3064,8 +1484,23 @@ def _repl_plain(session: ConsoleSession, reader: Any = None) -> None:
             if not dispatch(session, line):
                 session.handle(line)
         except SystemExit:
+            _close_mcp(session)
             session.logger.close()
             return
+
+
+def _close_mcp(session: ConsoleSession) -> None:
+    """Shut down every MCP server this session started.
+
+    The children are real processes, so they are terminated rather than
+    left for the operating system to reap at exit.
+    """
+    for client in getattr(session, "mcp_clients", []) or []:
+        try:
+            client.close()
+        except Exception:
+            pass  # a failed shutdown must not mask the exit path
+    session.mcp_clients = []
 
 
 def _run_terminal(session: ConsoleSession) -> int:
@@ -3089,6 +1524,7 @@ def _run_terminal(session: ConsoleSession) -> int:
             session.autosave()
         except Exception:
             pass  # a failed autosave must not mask the operation it follows
+        _close_mcp(session)
         session.logger.close()
     return 0
 
@@ -3126,6 +1562,7 @@ from core.console_commands import (  # noqa: E402,F401
     _fix,
     _goal,
     _memory,
+    _mcp,
     _reasoning,
     _sessions,
     _set_suggestions,

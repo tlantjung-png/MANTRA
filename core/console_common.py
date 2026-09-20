@@ -1,4 +1,4 @@
-# Split out of core/console.py; import it from core.console, never from here.
+# Shared console primitives. Import through core.console, not directly.
 
 """Console primitives shared by the command modules: help text, menus,
 secret/line readers, endpoint naming, and the keyless-host rule."""
@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,27 +26,35 @@ if TYPE_CHECKING:
     from core.console import ConsoleSession
 
 
+# Single definition of the project root: the console facade, the
+# persistence mixin, and the data-file locator must agree on it.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# Commands are listed alphabetically, here and in SLASH_COMMANDS below, so a
+# reader can find one without scanning the whole list.
 HELP_TEXT = """Commands:
-  /model                provider & model — add endpoint, pick a model, replace key
-  /fix                  send the last failure to the agent for a fix
-  /sessions             saved conversations — browse and resume
-  /help                 show help
-  /workspace            show workspace path + files
-  /memory               show memory file
-  /diff                 show uncommitted changes
-  /undo                 discard changes (confirm)
-  /approve              set approval mode (default|auto|yolo|plan)
-  /cost                 show token usage
-  /compact              summarise conversation
+  /approve              set approval mode (yolo is the default: yolo|default|auto|plan)
   /clear                clear conversation (/reset is an alias)
-  /export [path]        save the conversation to .md or .json
-  /goal <text>          set session goal (/goal note, /goal done)
-  /todo                 session checklist — /todo add|done|rm|clear
-   /skills <name>        attach skill — /skills + space, Tab filter
-  /workflow             run workflow (create|show|launch|remove)
-  /verbose              toggle verbose
-  /suggestions on|off   post-task suggestion chips (bare: show state)
+  /compact              summarise conversation
+  /cost                 show token usage
+  /diff                 show uncommitted changes
   /exit                 exit (Ctrl+C)
+  /export [path]        save the conversation to .md or .json
+  /fix                  send the last failure to the agent for a fix
+  /goal <text>          set session goal (/goal note, /goal done)
+  /help                 show help
+  /mcp                  external tool servers — list, /mcp enable|disable <name>
+  /memory               show memory file
+  /model                provider & model — add endpoint, pick a model, replace key
+  /sessions             saved conversations — browse and resume
+  /skills <name>        attach skill — /skills + space, Tab filter
+  /suggestions on|off   post-task next-step line (bare: show state)
+  /todo                 session checklist — /todo add|done|rm|clear
+  /undo                 discard changes (confirm)
+  /verbose              toggle verbose
+  /workflow             run workflow (create|show|launch|remove)
+  /workspace            show workspace path + files
   /                     same as /help
 
 Reference files with @ in any message:
@@ -94,27 +103,29 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
     return True
 
 
+# Alphabetical by command name; HELP_TEXT keeps the same order.
 SLASH_COMMANDS = [
-    ("/model", "provider & model — add endpoint, pick a model, replace key"),
-    ("/fix", "send the last failure to the agent for a fix"),
-    ("/sessions", "saved conversations — browse and resume"),
-    ("/help", "show help"),
-    ("/workspace", "show workspace"),
-    ("/memory", "show memory"),
-    ("/diff", "show changes"),
-    ("/undo", "discard changes"),
     ("/approve", "set approve mode"),
-    ("/cost", "show usage"),
-    ("/compact", "summarise chat"),
     ("/clear", "clear chat"),
-    ("/export", "save conversation to .md or .json"),
-    ("/goal", "set goal"),
-    ("/todo", "session checklist"),
-    ("/workflow", "run workflow"),
-    ("/skills", "attach skill"),
-    ("/verbose", "toggle verbose"),
-    ("/suggestions", "suggestion chips on|off"),
+    ("/compact", "summarise chat"),
+    ("/cost", "show usage"),
+    ("/diff", "show changes"),
     ("/exit", "exit"),
+    ("/export", "save conversation to .md or .json"),
+    ("/fix", "send the last failure to the agent for a fix"),
+    ("/goal", "set goal"),
+    ("/help", "show help"),
+    ("/mcp", "external tool servers — enable|disable <name>"),
+    ("/memory", "show memory"),
+    ("/model", "provider & model — add endpoint, pick a model, replace key"),
+    ("/sessions", "saved conversations — browse and resume"),
+    ("/skills", "attach skill"),
+    ("/suggestions", "next-step suggestions on|off"),
+    ("/todo", "session checklist"),
+    ("/undo", "discard changes"),
+    ("/verbose", "toggle verbose"),
+    ("/workflow", "run workflow"),
+    ("/workspace", "show workspace"),
 ]
 
 _SKIP_DIRS = {
@@ -125,6 +136,27 @@ MAX_INDEX_ENTRIES = 4000
 
 
 # ------------------------------------------------------------------ commands
+
+@contextmanager
+def private_write(path: str, newline: str = "\n"):
+    """Open ``path`` for writing with owner-only permissions from creation.
+
+    The file is created with mode 0o600 instead of the process umask and
+    narrowed afterwards: these files hold conversation content, which can
+    include secrets seen in tool output, and the umask window is both
+    observable and permanent if the process dies inside it. The final
+    chmod still runs so a pre-existing, looser file is narrowed too.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as handle:
+            yield handle
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass  # best effort: the file was already created owner-only
+
 
 def _read_multiline(session: "ConsoleSession") -> str:
     """Read several lines, ended by a lone dot.
@@ -165,6 +197,15 @@ def _read_choice(session: "ConsoleSession", prompt_text: str) -> str:
         return input(prompt_text).strip()
     except (KeyboardInterrupt, EOFError):
         return ""
+
+
+def _short(count: int) -> str:
+    """1234 -> 1.2k. Token counts only ever need two significant figures."""
+    if count < 1000:
+        return str(count)
+    if count < 10_000:
+        return f"{count / 1000:.1f}k"
+    return f"{round(count / 1000)}k"
 
 
 def _menu(

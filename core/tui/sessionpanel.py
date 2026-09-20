@@ -9,7 +9,7 @@ draws them on the same canvas as the diff review.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from core.tui.review import ReviewRow
 

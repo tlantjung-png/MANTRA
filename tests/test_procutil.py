@@ -7,7 +7,6 @@ import subprocess
 import threading
 import time
 
-import pytest
 
 from core import procutil
 

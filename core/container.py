@@ -133,6 +133,11 @@ class DockerSandbox(Sandbox):
                 ["docker", "exec", self._container_id, "sh", "-lc", command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                # Same process-group isolation the host sandbox uses: the
+                # CLI client and anything it spawns die together, while
+                # in-container processes are reaped separately by
+                # _kill_container_children.
+                **_POPEN_GROUP_KWARGS,
             )
         except OSError as exc:
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
@@ -322,8 +327,13 @@ class DockerSandbox(Sandbox):
                     f"write_file failed for {path}: {(completed.stderr or '')[:500]}"
                 )
         finally:
-            if os.path.exists(temp_path):
+            # Best effort: an unlink failure (a virus scanner or another
+            # handle holding the file on Windows) must not replace the
+            # write error that is already propagating.
+            try:
                 os.unlink(temp_path)
+            except OSError:
+                pass
 
     def cleanup(self) -> None:
         if self._container_id is not None:
@@ -407,6 +417,7 @@ class DockerSandbox(Sandbox):
                 ["docker", "exec", self._container_id, *args],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **_POPEN_GROUP_KWARGS,
             )
         except OSError as exc:
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)

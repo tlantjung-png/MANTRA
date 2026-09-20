@@ -12,7 +12,6 @@ import queue
 import unittest
 
 import core.tui.app as app_module
-from core.tui.app import TuiApp
 from core.tui.backend import Key, Paste
 from core.tui.buffer import Renderer
 from core.tui.loop import Presenter

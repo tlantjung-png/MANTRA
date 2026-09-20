@@ -28,6 +28,7 @@ from typing import Any
 from core.types import Sandbox
 from core.types import Tool
 
+from core.tools._htmltext import html_to_text as _shared_html_to_text
 from core.tools.search import _SHELL_META_RE
 from core.tools.search import _SKIP_DIRS
 from core.tools.search import _load_ignore_matcher
@@ -162,7 +163,7 @@ class ExtractDocumentTool(Tool):
     # ------------------------------------------------------------------
 
     def _shell_extract(self, sandbox: Sandbox, path: str, budget: int) -> str:
-        # Very small bounded extraction for sandboxes without a file view.
+        # Tiny bounded extraction for sandboxes with no file view.
         # Only the literal-path case is supported; globs are refused here.
         if any(c in path for c in ("*", "?", "[")):
             return "ERROR: extract_document does not support globs in this sandbox"
@@ -232,57 +233,9 @@ class ExtractDocumentTool(Tool):
 
 
 def _html_to_text(html: str) -> str:
-    from html.parser import HTMLParser
-
-    class _MiniExtractor(HTMLParser):
-        _SKIP = {"script", "style", "noscript", "template", "head", "iframe"}
-        _BREAK = {
-            "p", "div", "br", "li", "tr", "section", "article", "header",
-            "footer", "nav", "table", "ul", "ol", "dl", "blockquote", "pre",
-            "h1", "h2", "h3", "h4", "h5", "h6",
-        }
-
-        def __init__(self) -> None:
-            super().__init__(convert_charrefs=True)
-            self.parts: list[str] = []
-            self._skip_stack: list[str] = []
-
-        def handle_starttag(self, tag: str, attrs: Any) -> None:
-            if tag in self._SKIP:
-                self._skip_stack.append(tag)
-            elif tag in self._BREAK:
-                self.parts.append("\n")
-
-        def handle_startendtag(self, tag: str, attrs: Any) -> None:
-            if tag in self._BREAK:
-                self.parts.append("\n")
-
-        def handle_endtag(self, tag: str) -> None:
-            if tag in self._SKIP:
-                if self._skip_stack and self._skip_stack[-1] == tag:
-                    self._skip_stack.pop()
-            elif tag in self._BREAK:
-                self.parts.append("\n")
-
-        def handle_data(self, data: str) -> None:
-            if not self._skip_stack:
-                self.parts.append(data)
-
-        def text(self) -> str:
-            joined = "".join(self.parts)
-            joined = joined.replace("\r\n", "\n").replace("\r", "\n")
-            joined = re.sub(r"[ \t\f\v]+", " ", joined)
-            joined = re.sub(r" *\n *", "\n", joined)
-            joined = re.sub(r"\n{3,}", "\n\n", joined)
-            return joined.strip()
-
-    ex = _MiniExtractor()
-    try:
-        ex.feed(html)
-        ex.close()
-    except Exception:
-        pass
-    return ex.text()
+    # Thin local alias over the shared reader so both extraction paths
+    # cannot drift apart.
+    return _shared_html_to_text(html)
 
 
 def _pretty_json(text: str) -> str:
@@ -405,7 +358,8 @@ class QueryTreeTool(Tool):
             f"-not -path '*/node_modules/*' -not -path '*/__pycache__/*'"
         )
         if res.exit_code != 0:
-            return "(no matches)"
+            detail = (res.stderr or "").strip()[:500] or "unknown error"
+            return f"ERROR: tree query failed (exit {res.exit_code}): {detail}"
         lines = [line for line in res.stdout.splitlines() if line.strip()]
         if not lines:
             return "(no matches)"
@@ -569,8 +523,16 @@ class QueryTreeTool(Tool):
         if tail[0] == "**":
             return self._match_path(current, "/".join(tail[1:]), workspace_root)
 
-        # Deeper glob like {dir/a/*.py}: enter the literal segment, then match.
-        return self._match_shape(os.path.join(current, tail[0]), "{" + "/".join(tail[1:]) + "}", workspace_root)
+        # Deeper glob like {dir/a/*.py}: validate the literal segment before
+        # descending, matching the per-segment check above, then recurse.
+        nxt = os.path.join(current, tail[0])
+        try:
+            real_nxt = os.path.realpath(nxt)
+        except OSError as exc:
+            return f"ERROR: cannot resolve shape target {tail[0]!r}: {exc}"
+        if not (real_nxt == real_workspace or real_nxt.startswith(real_workspace + os.sep)):
+            return "ERROR: shape target escapes workspace"
+        return self._match_shape(nxt, "{" + "/".join(tail[1:]) + "}", workspace_root)
 
     @staticmethod
     def _list_children(directory: str, glob_pat: str | None = None) -> str:

@@ -22,7 +22,7 @@ from core.tools.search import _SKIP_DIRS
 
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
-_MAX_READ_CHARS = 20000  # legacy cap for non-windowed callers
+_MAX_READ_CHARS = 20000  # legacy cap for callers that read without a window
 _MAX_WRITE_CHARS = 1_000_000
 
 _LINE_WINDOW = 2000
@@ -92,7 +92,6 @@ def _normalize_narrow_space(s: str) -> str:
     return s.replace("\u202f", " ").replace("\u00a0", " ")
 
 def _candidate_spellings(path: str) -> list[str]:
-    cands = []
     # narrow <-> regular, NFD/NFC, curly quotes
     variants = [path]
     # narrow no-break space maps to a regular space
@@ -476,7 +475,7 @@ class ReadFileTool(Tool):
             if truncated_by_bytes:
                 header += f", byte cap {_BYTE_BUDGET//1024}KB hit"
             if clamped:
-                header += f", {sum(1 for l in window if l.endswith(f'truncated at {_PER_LINE_CLAMP} chars]'))} lines clamped at {_PER_LINE_CLAMP}ch"
+                header += f", {sum(1 for line in window if line.endswith(f'truncated at {_PER_LINE_CLAMP} chars]'))} lines clamped at {_PER_LINE_CLAMP}ch"
             if remaining > 0:
                 header += f", {remaining} more lines remain — retry with offset={offset + shown_window}"
             header += ").\n"
@@ -542,6 +541,10 @@ class WriteFileTool(Tool):
     ledger = None  # EditLedger, injected by the registry
 
     def execute(self, sandbox: Sandbox, path: str, content: str) -> str:
+        if path is None:
+            return "ERROR: path is required"
+        if not isinstance(path, str):
+            path = str(path)
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
         blocked = _is_blocked_path_harness(path)
@@ -583,6 +586,10 @@ class EditFileTool(Tool):
     def execute(
         self, sandbox: Sandbox, path: str, old_string: str, new_string: str
     ) -> str:
+        if path is None:
+            return "ERROR: path is required"
+        if not isinstance(path, str):
+            path = str(path)
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
         # Same harness/device blocklist as read_file and write_file; an
@@ -674,6 +681,10 @@ class ListDirTool(Tool):
 
     def execute(self, sandbox: Sandbox, path: str) -> str:
         # Validate to reduce injection risk.
+        if path is None:
+            return "ERROR: path is required"
+        if not isinstance(path, str):
+            path = str(path)
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
         root = getattr(sandbox, "root", None)

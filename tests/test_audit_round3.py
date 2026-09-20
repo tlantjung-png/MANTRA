@@ -25,27 +25,25 @@ _path = os.path.dirname(os.path.abspath(__file__))
 if _path not in sys.path:
     sys.path.insert(0, _path)
 
-from core.agent.loop import AgentLoop
-from core.agent.approvals import classify_command
-from core.agent.events import EventBus
-from core.agent import keys as keys_module
-from core.agent import sessions as sessions_module
-from core.agent import settings as settings_module
-from core.scripted import (
+from core.agent.loop import AgentLoop  # noqa: E402
+from core.agent.approvals import classify_command  # noqa: E402
+from core.agent.events import EventBus  # noqa: E402
+from core.agent import keys as keys_module  # noqa: E402
+from core.agent import sessions as sessions_module  # noqa: E402
+from core.agent import settings as settings_module  # noqa: E402
+from core.scripted import (  # noqa: E402
     LLMResponse,
     ScriptedLLMClient,
-    ToolCall,
     tool_call_response,
 )
-from core.llm import (
+from core.llm import (  # noqa: E402
     OpenAICompatClient,
     is_keyless_base_url,
 )
-from core.sandbox import LocalSandbox
-from core.tools.web import _resolve_and_pin, _resolve_limited
-from core.console import Style, _skills_launch
+from core.sandbox import LocalSandbox  # noqa: E402
+from core.tools.web import _resolve_and_pin, _resolve_limited  # noqa: E402
+from core.console import Style, _skills_launch  # noqa: E402
 
-from _helpers import make_session
 
 
 def _workspace() -> str:
@@ -193,7 +191,8 @@ class RetryAfterErrorTest(unittest.TestCase):
         )
 
     def test_identical_retry_after_error_executes(self):
-        call = lambda: tool_call_response("read_file", {"path": "definitely-missing.txt"})
+        def call():
+            return tool_call_response("read_file", {"path": "definitely-missing.txt"})
         loop = self._loop([call(), call(), call(), LLMResponse(content="done")])
         loop.run({"task_id": "t", "problem_statement": "go"})
         results = [
@@ -210,7 +209,8 @@ class RetryAfterErrorTest(unittest.TestCase):
         self.assertIn("STOP RETRYING", results[2])
 
     def test_repeat_after_success_stays_blocked(self):
-        call = lambda: tool_call_response("list_dir", {"path": "."})
+        def call():
+            return tool_call_response("list_dir", {"path": "."})
         loop = self._loop([call(), call(), LLMResponse(content="done")])
         loop.run({"task_id": "t", "problem_statement": "go"})
         results = [
@@ -416,7 +416,6 @@ class SessionListingCacheTest(unittest.TestCase):
         os.environ["MANTRA_SESSIONS"] = _workspace()
         try:
             sessions_module.save("changing", {"messages": [{"role": "user", "content": "one"}]})
-            before = sessions_module.list_sessions()
             before_keys = set(sessions_module._LISTING_CACHE)
             sessions_module.save("changing", {"messages": [{"role": "user", "content": "two"}]})
             after = sessions_module.list_sessions()

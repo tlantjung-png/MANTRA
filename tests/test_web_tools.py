@@ -7,7 +7,6 @@ suite stays offline and deterministic.
 from __future__ import annotations
 
 import gzip
-import io
 import os
 import socket
 import sys

@@ -12,6 +12,8 @@ from core.agent.context import ContextManager
 from core.agent.events import EventBus
 from core.agent.approvals import _redact_sensitive
 from core.agent.exceptions import AbortError, LLMError, SandboxError, ToolError
+from core.agent.context import DEFAULT_DIGEST_MAX_CHARS
+from core.agent.observations import DEFAULT_MAX_CHARS, reshape_observation
 from core.agent.repairs import canonical_command, repair_arguments, validate_arguments
 from core.types import EvaluationResult, Evaluator
 from core.types import LLMClient
@@ -40,6 +42,10 @@ class RunResult:
     final_message: str | None = None
     metrics: dict[str, float] = field(default_factory=dict)
     elapsed_seconds: float = 0.0
+    # Context-shaping mechanisms in force for this run, so the run log and
+    # the evaluator can attribute a result to a mechanism set rather than
+    # to whatever config happened to be loaded.
+    mechanisms: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentLoop:
@@ -60,6 +66,9 @@ class AgentLoop:
         abort: threading.Event | None = None,
         approver: Any = None,
         on_tool_result: Any = None,
+        observation_max_chars: int = DEFAULT_MAX_CHARS,
+        digest: bool = True,
+        digest_max_chars: int = DEFAULT_DIGEST_MAX_CHARS,
     ) -> None:
         self.llm = llm
         self.sandbox = sandbox
@@ -73,6 +82,13 @@ class AgentLoop:
         self.context = context
         self.abort = abort
         self.approver = approver
+        # Ceiling for one observation as it enters context; 0 disables
+        # reshaping. The raw observation still reaches the UI and /fix.
+        self.observation_max_chars = observation_max_chars
+        # Rolling digest of evicted turns. When off, eviction stays lossy
+        # exactly as it was: turns are dropped and nothing is summarised.
+        self.digest_enabled = bool(digest)
+        self.digest_max_chars = int(digest_max_chars or 0)
         # Receives (tool_name, observation, step) right after each tool
         # executes, so a UI can show what the agent actually saw (command
         # output, file contents) without putting that content into event
@@ -105,7 +121,13 @@ class AgentLoop:
         final_message: str | None = None
         steps = 0
         aborted = False
-        metrics: dict[str, float] = {"tool_errors": 0, "denied": 0}
+        metrics: dict[str, float] = {
+            "tool_errors": 0,
+            "denied": 0,
+            "digest_turns": 0,
+            "digest_failures": 0,
+            "digest_chars": 0,
+        }
         recent_calls: dict[str, int] = {}
         # Keys whose most recent real execution returned an error. A single
         # identical retry after a transient failure is legitimate (a network
@@ -136,9 +158,16 @@ class AgentLoop:
                     break
                 steps += 1
 
+                # Turns the budget evicted since the last step are folded
+                # into the rolling digest before the next request, so
+                # eviction stops being a silent loss. Runs after the first
+                # eviction has had a chance to happen, and costs nothing
+                # when nothing was evicted.
+                self._fold_evicted(context, metrics)
+
                 try:
                     response = self.llm.chat(
-                        context.messages, tools=tool_schemas, on_delta=self.on_delta
+                        context.request_messages(), tools=tool_schemas, on_delta=self.on_delta
                     )
                 except LLMError as exc:
                     message = str(exc)
@@ -350,6 +379,12 @@ class AgentLoop:
             final_message=final_message,
             metrics=dict(metrics),
             elapsed_seconds=elapsed,
+            mechanisms={
+                "observation_reshape": bool(self.observation_max_chars),
+                "observation_max_chars": int(self.observation_max_chars or 0),
+                "eviction_digest": bool(self.digest_enabled),
+                "digest_max_chars": int(self.digest_max_chars or 0),
+            },
         )
         self._emit("run_end", _result_payload(result))
         # The work is done and the result exists; a logger failure (disk
@@ -420,9 +455,9 @@ class AgentLoop:
             # its own increment.
             recent_calls.pop(key, None)
             recent_calls[key] = cnt
-            # Bound registry to prevent unbounded growth
+            # Bound the registry so it cannot grow without limit
             if len(recent_calls) > 500:
-                # Remove oldest 100 entries (dict preserves insertion order)
+                # Drop the oldest 100 entries; dicts keep insertion order
                 oldest_keys = list(recent_calls.keys())[:100]
                 for _k in oldest_keys:
                     recent_calls.pop(_k, None)
@@ -464,14 +499,79 @@ class AgentLoop:
                     if done_key != key:
                         recent_calls.pop(done_key, None)
                         recent_failed.discard(done_key)
+        # The context copy is reshaped; every use above and the UI's
+        # on_tool_result callback below keep the raw observation, so the
+        # operator and /fix see exactly what the tool printed while the
+        # model reads the dense form. Reshaping runs last, after the
+        # ERROR/exit_code checks that key off the raw text.
         context.append(
             {
                 "role": "tool",
                 "tool_call_id": cid,
                 "name": call.name,
-                "content": observation,
+                "content": reshape_observation(
+                    call.name, observation, self.observation_max_chars, metrics
+                ),
             }
         )
+
+    # ── the rolling digest ───────────────────────────────────────
+
+    # Below this much evicted text a summary round trip is not worth it yet,
+    # so the batch stays pending and is folded together with the next one.
+    # The measure is the accumulated batch, never a single eviction: a
+    # per-eviction threshold would mean a run that evicts a little at a time
+    # never folds anything at all.
+    _DIGEST_MIN_CHARS = 200
+    # Ceiling on the text handed to the summariser. A digest is a summary,
+    # so an enormous batch is folded from its head rather than sent whole.
+    _DIGEST_INPUT_CAP = 12_000
+
+    def _fold_evicted(self, context: ContextManager, metrics: dict[str, float]) -> None:
+        """Summarise turns the budget evicted, so eviction stops losing them.
+
+        The context manager detaches evicted turns rather than dropping
+        them; this is the only place that decides whether to pay for a
+        summary. A failure here is recorded and otherwise ignored: the turn
+        continues with the digest it already has, which is exactly the
+        behaviour before the digest existed.
+        """
+        if not self.digest_enabled:
+            return
+        if not context.pending_evicted:
+            return
+        text = _render_evicted(context.pending_evicted)
+        previous = context.digest
+        if previous:
+            # Rolling, not per-batch: the previous digest is folded into the
+            # next summary, so nothing that was ever evicted is lost just
+            # because a later batch was summarised after it.
+            text = (
+                "Previous digest (carry its content forward):\n"
+                + previous
+                + "\n\nNewly evicted turns:\n"
+                + text
+            )
+        if len(text) < self._DIGEST_MIN_CHARS:
+            return  # too small to be worth a round trip yet; accumulate
+        context.take_pending_evicted()
+        text = text[: self._DIGEST_INPUT_CAP]
+        try:
+            response = self.llm.chat(
+                [{"role": "user", "content": _DIGEST_PROMPT + "\n\n" + text}],
+                tools=None,
+                on_delta=None,
+            )
+        except Exception:
+            metrics["digest_failures"] = metrics.get("digest_failures", 0) + 1
+            return
+        summary = (getattr(response, "content", None) or "").strip()
+        if not summary:
+            metrics["digest_failures"] = metrics.get("digest_failures", 0) + 1
+            return
+        context.set_digest(summary, max_chars=self.digest_max_chars)
+        metrics["digest_turns"] = metrics.get("digest_turns", 0) + 1
+        metrics["digest_chars"] = metrics.get("digest_chars", 0) + len(text)
 
     def _dispatch_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]
@@ -659,13 +759,25 @@ class AgentLoop:
                 except ValueError:
                     return None
             return None
-        prompt = _to_int(usage.get("prompt_tokens"))
-        if prompt is None:
-            # Some providers use input_tokens / promptTokens
-            prompt = _to_int(usage.get("input_tokens") or usage.get("promptTokens"))
-        completion = _to_int(usage.get("completion_tokens"))
-        if completion is None:
-            completion = _to_int(usage.get("output_tokens") or usage.get("completionTokens") or usage.get("outputTokens"))
+        def _first_int(*keys: str) -> int | None:
+            """First key with a usable integer value; None when none has one.
+
+            Selecting by presence rather than truthiness keeps a genuine zero
+            from being replaced by an alternate key's value.
+            """
+            for key in keys:
+                value = _to_int(usage.get(key))
+                if value is not None:
+                    return value
+            return None
+
+        prompt = _first_int("prompt_tokens", "input_tokens", "promptTokens")
+        completion = _first_int(
+            "completion_tokens",
+            "output_tokens",
+            "completionTokens",
+            "outputTokens",
+        )
         if prompt is not None:
             metrics["tokens_in"] = metrics.get("tokens_in", 0) + prompt
         if completion is not None:
@@ -722,6 +834,45 @@ def _safe_error_text(exc: Exception) -> str:
     return _redact_sensitive(str(exc))[:500]
 
 
+def _render_evicted(messages: list[dict[str, Any]]) -> str:
+    """Flatten evicted turns to plain text for the summariser."""
+    lines: list[str] = []
+    for message in messages:
+        role = message.get("role", "?")
+        content = message.get("content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        if role == "assistant" and message.get("tool_calls"):
+            names = ", ".join(
+                (call.get("function") or {}).get("name", "?")
+                for call in message["tool_calls"]
+                if isinstance(call, dict)
+            )
+            lines.append(f"assistant: [called {names}]")
+            if content:
+                lines.append(f"assistant: {content}")
+            continue
+        if role == "tool":
+            body = content if len(content) <= 300 else content[:300] + " ..."
+            lines.append(f"result of {message.get('name', 'tool')}: {body}")
+            continue
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+# The summariser is told to carry state forward rather than to narrate: a
+# digest that drops which files were touched, or a report line the session
+# parses, is worse than no digest at all.
+_DIGEST_PROMPT = (
+    "Summarise the conversation turns below so work can continue without them. "
+    "Carry forward, concretely: the goal, every file created or modified and "
+    "why, commands run and their outcome, errors hit and how they were "
+    "resolved, and the exact state left off at. Preserve verbatim any line "
+    "beginning 'TODO DONE:', 'TODO ADD:' or 'GOAL COMPLETE' - the session "
+    "parses those. Be dense; no preamble."
+)
+
+
 def _result_payload(result: RunResult) -> dict[str, Any]:
     return {
         "task_id": result.task_id,
@@ -730,5 +881,8 @@ def _result_payload(result: RunResult) -> dict[str, Any]:
         "steps_used": result.steps_used,
         "elapsed_seconds": round(result.elapsed_seconds, 3),
         "evaluation_detail": result.evaluation_detail,
+        # Which context-shaping mechanisms were in force, so two runs can
+        # be compared without trusting the config they happened to load.
+        "mechanisms": dict(getattr(result, "mechanisms", {}) or {}),
         "metrics": result.metrics,
     }

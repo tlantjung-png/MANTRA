@@ -85,8 +85,8 @@ def _normalize_tool_name(name: str) -> str:
 
 
 TOOL_REGISTRY["webfetch"] = WebFetchTool
-# Backwards-compat alias: the extraction tool was briefly registered as
-# "extract"; its canonical name is ExtractDocumentTool.name = "extract_document".
+# Backwards-compat alias: "extract" was briefly the canonical name;
+# the canonical name is ExtractDocumentTool.name = "extract_document".
 TOOL_REGISTRY["extract"] = ExtractDocumentTool
 
 

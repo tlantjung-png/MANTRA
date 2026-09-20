@@ -28,7 +28,7 @@ _MAX_SSE_EVENT_CHARS = 1_000_000
 
 DeltaCallback = Callable[[str], None]
 
-# Mid-stream drop surfaces as IncompleteRead, not OSError; handle explicitly.
+# A mid-stream drop raises IncompleteRead, not OSError, so catch it explicitly.
 IncompleteRead = http.client.IncompleteRead
 
 # Hosts that accept requests with no credential at all. Single source

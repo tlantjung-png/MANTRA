@@ -122,3 +122,112 @@ def test_newest_unanswered_assistant_not_evicted() -> None:
     for i in range(5):
         ctx.append({"role": "assistant", "content": f"m{i}"})
     assert ctx.messages[-1]["role"] == "assistant"
+
+
+# ── the rolling digest ────────────────────────────────────────────────────
+#
+# Eviction used to be lossy: a dropped turn was gone. The manager now
+# detaches evicted turns into a pending queue and keeps a rolling digest of
+# the ones already folded away, so the loss can be repaired by whoever owns
+# the model client.
+
+def test_evicted_turns_are_retained_not_dropped():
+    ctx = ContextManager(max_messages=8, max_chars=100000)
+    ctx.seed("system", "task")
+    for i in range(20):
+        ctx.append({"role": "assistant", "content": f"turn {i}"})
+        ctx.append({"role": "tool", "name": "read_file", "content": f"result {i}"})
+    pending = ctx.take_pending_evicted()
+    assert pending, "evicted turns were dropped outright"
+    # Small turns are all kept: the queue is bounded by characters, so a
+    # little at a time accumulates until it is worth folding. Nothing was
+    # dropped, so even the first turn is still there to be folded.
+    assert ctx.evicted_without_digest == 0
+    assert any("turn 0" in str(m.get("content")) for m in pending), pending[:3]
+
+
+def test_take_pending_clears_the_queue():
+    ctx = ContextManager(max_messages=8, max_chars=100000)
+    ctx.seed("system", "task")
+    for i in range(20):
+        ctx.append({"role": "assistant", "content": f"turn {i}"})
+    assert ctx.take_pending_evicted()
+    assert ctx.take_pending_evicted() == []
+
+
+def test_digest_rides_between_the_prefix_and_the_history():
+    ctx = ContextManager(max_messages=8, max_chars=100000)
+    ctx.seed("system prompt", "the task")
+    ctx.append({"role": "assistant", "content": "live work"})
+    ctx.set_digest("earlier: fixed the parser")
+    request = ctx.request_messages()
+    assert request[0]["content"] == "system prompt"
+    assert request[1]["content"] == "the task"
+    assert "earlier: fixed the parser" in request[2]["content"]
+    assert request[3]["content"] == "live work"
+
+
+def test_no_digest_means_the_request_is_the_history():
+    ctx = ContextManager()
+    ctx.seed("system", "task")
+    assert ctx.request_messages() == ctx.messages
+    assert ctx.digest is None
+
+
+def test_digest_counts_against_the_budget():
+    ctx = ContextManager(max_messages=50, max_chars=100000)
+    ctx.seed("system", "task")
+    before = ctx.chars
+    ctx.set_digest("x" * 5000)
+    assert ctx.chars > before
+    ctx.clear_digest()
+    assert ctx.chars == before
+
+
+def test_digest_is_capped():
+    ctx = ContextManager()
+    ctx.set_digest("y" * 9000, max_chars=1000)
+    assert len(ctx.digest) <= 1100
+    assert "digest truncated" in ctx.digest
+
+
+def test_an_empty_summary_clears_rather_than_installing_nothing():
+    ctx = ContextManager()
+    ctx.set_digest("real")
+    ctx.set_digest("   ")
+    assert ctx.digest is None
+
+
+def test_replace_body_drops_the_digest():
+    # A compaction pass summarises the live history; the rolling digest of
+    # turns that history no longer holds is superseded, not merged.
+    ctx = ContextManager()
+    ctx.seed("system", "task")
+    ctx.set_digest("stale summary")
+    ctx.replace_body([{"role": "user", "content": "fresh summary"}])
+    assert ctx.digest is None
+    assert ctx.take_pending_evicted() == []
+
+
+def test_pending_queue_is_bounded_by_characters_and_the_loss_is_counted():
+    ctx = ContextManager(max_messages=6, max_chars=100000)
+    ctx.seed("system", "task")
+    for i in range(60):
+        # Big enough that the character ceiling bites well before the run
+        # ends: nothing ever drains the queue in this test.
+        ctx.append({"role": "assistant", "content": f"turn {i} " + "z" * 2000})
+    assert ctx._pending_chars() <= max(4_000, ctx.max_chars // 2) + 2100
+    assert ctx.evicted_without_digest > 0, "the overflow was lost without a count"
+
+
+def test_budget_is_still_enforced_with_a_digest():
+    # The digest is context too: a run that keeps evicting must not be able
+    # to grow without bound because its digest keeps growing.
+    ctx = ContextManager(max_messages=10, max_chars=20000)
+    ctx.seed("system", "task")
+    for i in range(200):
+        ctx.append({"role": "assistant", "content": f"turn {i} " + "z" * 200})
+        if i % 5 == 0:
+            ctx.set_digest("summary " + "s" * 200)
+    assert ctx.chars <= ctx.max_chars + 5000
+    assert len(ctx.messages) <= ctx.max_messages

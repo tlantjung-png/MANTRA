@@ -48,20 +48,20 @@ class ParseDiffTest(unittest.TestCase):
         h = hunks[0]
         self.assertEqual(h.old_start, 10)
         self.assertEqual(h.new_start, 10)
-        kinds = [l.kind for l in h.lines]
+        kinds = [line.kind for line in h.lines]
         self.assertEqual(kinds, ["ctx", "ctx", "add", "ctx", "del", "del", "add", "ctx"])
-        add = [l for l in h.lines if l.kind == "add"]
+        add = [line for line in h.lines if line.kind == "add"]
         self.assertEqual(add[0].text, "print('hello')")
         self.assertIsNone(add[0].old_no)
         self.assertEqual(add[0].new_no, 12)
-        dele = [l for l in h.lines if l.kind == "del"]
+        dele = [line for line in h.lines if line.kind == "del"]
         self.assertIsNone(dele[0].new_no)
         self.assertEqual(dele[0].old_no, 13)
 
     def test_old_and_new_numbers_advance_across_hunks(self):
         files = parse_diff(DIFF)
         h2 = files[0].hunks[1]
-        first_ctx = [l for l in h2.lines if l.kind == "ctx"][0]
+        first_ctx = [line for line in h2.lines if line.kind == "ctx"][0]
         self.assertEqual(first_ctx.old_no, 30)
         self.assertEqual(first_ctx.new_no, 30)
 
@@ -93,9 +93,9 @@ class EdgeMarkerTest(unittest.TestCase):
             "\\ No newline at end of file\n"
         )
         self.assertEqual(len(files), 1)
-        kinds = [l.kind for l in files[0].hunks[0].lines]
+        kinds = [line.kind for line in files[0].hunks[0].lines]
         self.assertEqual(kinds, ["del", "add"])
-        self.assertEqual([l.text for l in files[0].hunks[0].lines], ["one", "two"])
+        self.assertEqual([line.text for line in files[0].hunks[0].lines], ["one", "two"])
 
     def test_binary_files_differ_yields_no_hunks(self):
         files = parse_diff(

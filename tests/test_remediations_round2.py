@@ -22,7 +22,6 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-import threading
 import unittest
 from unittest import mock
 
@@ -423,8 +422,8 @@ class AuditLogTest(unittest.TestCase):
         with open(log_path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
         self.assertEqual(len(lines), 3)
-        self.assertTrue(any("tool=write_file" in l and "risk=mutating" in l for l in lines))
-        self.assertTrue(any("tool=run_command" in l and "risk=destructive" in l for l in lines))
+        self.assertTrue(any("tool=write_file" in line and "risk=mutating" in line for line in lines))
+        self.assertTrue(any("tool=run_command" in line and "risk=destructive" in line for line in lines))
         joined = "\n".join(lines)
         self.assertIn("REDACTED", joined)
         self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz123", joined)

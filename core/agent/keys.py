@@ -25,20 +25,38 @@ def credentials_path() -> Path:
     return Path.home() / ".mantra" / "credentials.json"
 
 
-# Paths whose corrupt document has already been copied aside. Without this,
-# every read of a corrupt file re-parsed it and re-copied the backup — and
-# the file is read on every credential resolution and every redaction.
+# Signatures of corrupt documents already copied aside. Without this, every
+# read of a corrupt file re-parsed it and re-copied the backup, and the file
+# is read on every credential resolution and every redaction.
 _QUARANTINED: set[str] = set()
 
 
 def _quarantine_once(path: Path) -> None:
-    """Copy a corrupt or unreadable store aside once per process (like settings)."""
-    if str(path) in _QUARANTINED:
+    """Copy a corrupt or unreadable store aside once per distinct file state.
+
+    Keyed by size and modification time as well as path: repeated reads of the
+    same bad file copy it only once, while a later, different corruption in the
+    same process is still backed up. The backup name is made unique so one
+    backup cannot overwrite another within the same second.
+    """
+    signature = str(path)
+    try:
+        stat = path.stat()
+        signature = f"{path}|{stat.st_size}|{stat.st_mtime_ns}"
+    except OSError:
+        pass
+    if signature in _QUARANTINED:
         return
-    _QUARANTINED.add(str(path))
+    _QUARANTINED.add(signature)
     try:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = path.with_suffix(path.suffix + f".corrupt-{stamp}")
+        counter = 1
+        while backup.exists():
+            backup = path.with_suffix(path.suffix + f".corrupt-{stamp}-{counter}")
+            counter += 1
+            if counter > 100:
+                return
         shutil.copy2(path, backup)
     except OSError:
         pass

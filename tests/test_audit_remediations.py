@@ -35,7 +35,6 @@ class MidStreamDropTest(unittest.TestCase):
     def test_incomplete_read_before_output_is_retried(self):
         import http.client
 
-        from core.agent.exceptions import LLMError
 
         client = self._client(max_retries=3)
         calls = {"n": 0}
@@ -105,7 +104,6 @@ class MidStreamDropTest(unittest.TestCase):
         """The reader must not swallow read errors into an empty stream."""
         import http.client
 
-        from core.agent.exceptions import LLMError
         from core.llm import parse_sse_stream
 
         class BadResponse:

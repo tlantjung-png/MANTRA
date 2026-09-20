@@ -7,7 +7,6 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 _OVERRIDE_ENV = "MANTRA_SKILLS"
 
@@ -183,7 +182,7 @@ def load_all() -> dict[str, Skill]:
         if not root.is_dir():
             continue
         try:
-            # Sort by name string to avoid pathlib _parts_normcase race on Windows 3.14
+            # Sort by name string; pathlib sorting has a race on Windows 3.14
             entries = sorted((e for e in root.iterdir() if e.is_dir()), key=lambda p: p.name.lower())
         except OSError:  # pragma: no cover - unreadable directory
             continue
@@ -197,7 +196,9 @@ def load_all() -> dict[str, Skill]:
     _cache_all = dict(found)
     _cache_all_ts = now
     _cache_all_roots = current_roots
-    return found
+    import copy as _copy
+
+    return _copy.deepcopy(found)  # Deep copy: callers must not corrupt the cache.
 
 
 def invalidate_cache() -> None:
@@ -303,7 +304,7 @@ def load_bundles() -> dict[str, list[str]]:
     _cache_bundles = dict(bundles)
     _cache_bundles_ts = now
     _cache_bundles_roots = current_roots
-    return bundles
+    return {name: list(skills) for name, skills in bundles.items()}
 
 
 def get_bundle(name: str) -> list[str] | None:
@@ -350,7 +351,7 @@ def routing_table() -> dict[str, dict[str, str]]:
     _cache_routing = dict(table)
     _cache_routing_ts = now
     _cache_routing_roots = current_roots
-    return table
+    return {name: dict(entry) for name, entry in table.items()}
 
 
 _STOPWORDS = frozenset(

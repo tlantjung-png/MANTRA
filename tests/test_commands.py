@@ -26,10 +26,10 @@ _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
 for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-import core.console as console
-from core.console import SLASH_COMMANDS, dispatch
-from core.agent.settings import add_endpoint, settings_path
-from _helpers import make_session
+import core.console as console  # noqa: E402
+from core.console import SLASH_COMMANDS, dispatch  # noqa: E402
+from core.agent.settings import add_endpoint, settings_path  # noqa: E402
+from _helpers import make_session  # noqa: E402
 
 
 class TempSettings:
@@ -80,11 +80,21 @@ class NoBuiltinsTest(unittest.TestCase):
         # advertising two commands for one choice is how they drift.
         self.assertFalse(any(c == "/reasoning" for c, _ in SLASH_COMMANDS))
 
-    def test_model_is_offered_first_and_connect_is_merged_away(self):
-        # /connect merged into /model: one command is advertised.
+    def test_commands_are_offered_alphabetically(self):
+        # The advertised list is alphabetical so a command can be found
+        # without scanning it; /connect merged into /model stays merged.
         names = [c for c, _ in SLASH_COMMANDS]
-        self.assertEqual(names[0], "/model")
+        self.assertEqual(names, sorted(names))
         self.assertNotIn("/connect", names)
+
+    def test_help_lines_are_listed_alphabetically(self):
+        entries = [
+            line.split()[0]
+            for line in console.HELP_TEXT.splitlines()
+            if line.startswith("  /") and line.split()[0] != "/"
+        ]
+        self.assertEqual(entries, sorted(entries))
+        self.assertTrue(entries, "help lists no commands at all")
 
     def test_help_mentions_the_settings_file(self):
         # "You can edit this by hand" is only true if help says where.

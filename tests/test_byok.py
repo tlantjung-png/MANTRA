@@ -30,13 +30,13 @@ _PROJECT_ROOT = os.path.dirname(_TESTS_DIR)
 for _path in (os.path.join(_PROJECT_ROOT, "."), _PROJECT_ROOT, _TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-import core.console as console
-import core.llm as openai_module
-from core.config import REASONING_EFFORTS, merge_defaults
-from core.console import provider_needs_key
-from core.agent.models import fetch_models, is_reasoning_model
-from _helpers import make_session
-from core.agent.keys import (
+import core.console as console  # noqa: E402
+import core.llm as openai_module  # noqa: E402
+from core.config import REASONING_EFFORTS, merge_defaults  # noqa: E402
+from core.console import provider_needs_key  # noqa: E402
+from core.agent.models import fetch_models, is_reasoning_model  # noqa: E402
+from _helpers import make_session  # noqa: E402
+from core.agent.keys import (  # noqa: E402
     credentials_path,
     has_stored,
     mask,
@@ -45,7 +45,7 @@ from core.agent.keys import (
     store as store_key,
     stored_keys,
 )
-from core.agent.settings import (
+from core.agent.settings import (  # noqa: E402
     active,
     add_endpoint,
     endpoint_name_for_url,
@@ -58,7 +58,7 @@ from core.agent.settings import (
     settings_path,
     validate_endpoint,
 )
-from core.registry import build_llm
+from core.registry import build_llm  # noqa: E402
 
 
 class TempStorage:

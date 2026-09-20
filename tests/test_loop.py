@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import threading
 
-import pytest
 
-from core.agent.context import ContextManager
 from core.agent.events import EventBus
 from core.agent.loop import AgentLoop
 from core.agent.exceptions import AbortError

@@ -1,4 +1,9 @@
-"""JSONL logger: append-only, never raises."""
+"""JSONL logger: append-only, never raises, and never redacts.
+
+Callers own redaction: a payload is written as given, so a caller that puts
+secrets in a payload puts them on disk. Records are dropped, and counted,
+when the inter-process lock cannot be taken or a write fails.
+"""
 
 from __future__ import annotations
 

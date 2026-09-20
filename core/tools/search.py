@@ -105,8 +105,12 @@ class SearchCodeTool(Tool):
             quoted = shlex.quote(query)
             skip_flags = " ".join(f"--exclude-dir={d}" for d in sorted(_SKIP_DIRS))
             result = sandbox.exec(f"grep -Frn {skip_flags} -- {quoted} .")
-            if result.exit_code != 0:
+            if result.exit_code == 1:
+                # grep's conventional "no matches" status, not a failure.
                 return "(no matches)"
+            if result.exit_code != 0:
+                detail = (result.stderr or "").strip()[:500] or "unknown error"
+                return f"ERROR: search failed (exit {result.exit_code}): {detail}"
             return "\n".join(_normalize_grep_lines(result.stdout.strip().splitlines()))[:20000] if result.stdout.strip() else "(no matches)"
 
         hits: list[str] = []
@@ -191,7 +195,7 @@ class SearchCodeTool(Tool):
                         out.append(f"{rel}:{lineno + 1}: {line.rstrip()[:300]}")
                         if len(out) >= _MAX_RESULTS:
                             break
-                    # Avoid scanning huge files line-by-line indefinitely
+                    # Stop scanning an enormous file line by line
                     if lineno > 10000:
                         line_cap_hit = True
                         break
@@ -225,7 +229,10 @@ class FindFileTool(Tool):
             result = sandbox.exec(
                 f"find . -name {quoted} -not -path './.git/*'"
             )
-            return "\n".join(_normalize_grep_lines(result.stdout.strip().splitlines()))[:20000] if result.exit_code == 0 and result.stdout.strip() else "(no matches)"
+            if result.exit_code != 0:
+                detail = (result.stderr or "").strip()[:500] or "unknown error"
+                return f"ERROR: find failed (exit {result.exit_code}): {detail}"
+            return "\n".join(_normalize_grep_lines(result.stdout.strip().splitlines()))[:20000] if result.stdout.strip() else "(no matches)"
 
         matches = []
         real_root = os.path.realpath(root)

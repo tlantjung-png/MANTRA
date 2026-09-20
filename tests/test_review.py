@@ -85,7 +85,7 @@ class ReviewAppIntegrationTest(unittest.TestCase):
 
     def test_bridge_opens_and_escape_closes(self):
         from core.tui.app import Key
-        from tests.tui_harness import FakeBackend, _make_app
+        from tests.tui_harness import _make_app
 
         app, session, backend = _make_app([])
         self.assertIsNone(app.review)

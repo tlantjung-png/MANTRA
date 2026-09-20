@@ -418,11 +418,12 @@ class EndToEndConsoleTest(unittest.TestCase):
         pty.wait_composer_ready(timeout=60)
 
         # Open the command popup. The dropdown paints immediately (its
-        # first item is the real /model command), and the prompt row must
-        # still show the typed token.
+        # first item is the real /approve command, the head of the
+        # alphabetical catalogue), and the prompt row must still show the
+        # typed token.
         pty.type_and_wait_echo("/")
         tail = pty.text()[-4000:]
-        self.assertIn("/model", tail, "completion dropdown never rendered")
+        self.assertIn("/approve", tail, "completion dropdown never rendered")
 
         # The composer box painted below the dropdown (the popup's
         # geometry guarantees live in SmallTerminalTest; here we verify

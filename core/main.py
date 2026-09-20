@@ -12,10 +12,31 @@ from core.agent.loop import DEFAULT_SYSTEM_PROMPT, AgentLoop
 from core.agent.events import EventBus
 from core.agent.exceptions import ConfigError
 from core.agent.knowledge import assemble_system_prompt
+from core.agent.observations import DEFAULT_MAX_CHARS
+from core.mcp import build_mcp_tools
 from core.registry import build_evaluator, build_llm, build_logger, build_sandbox, build_tools
 from core.term import force_utf8_output
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _observation_ceiling(config: dict) -> int:
+    """The per-observation character ceiling for this run.
+
+    0 means "do not reshape": the operator turned the mechanism off, and the
+    loop must then append observations exactly as the tools produced them.
+    """
+    section = config.get("observations") or {}
+    if not isinstance(section, dict) or not section.get("reshape", True):
+        return 0
+    value = section.get("max_chars", DEFAULT_MAX_CHARS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return DEFAULT_MAX_CHARS
+    return value
+
+# Same ceiling the configuration loader applies: a task document is
+# operator-supplied but must not be read without a bound.
+_MAX_TASK_BYTES = 1_000_000
 
 
 def _resolve_data_path(*parts: str) -> str:
@@ -80,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", required=True, help="Path to task JSON file (resolved against cwd then project root)")
     args = parser.parse_args(argv)
     # UTF-8 streams keep event output and verdicts encodable even when the
-    # run is piped through a narrow console or redirected to a file.
+    # run is piped or redirected through a narrow encoding.
     force_utf8_output()
 
     try:
@@ -91,7 +112,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         task_path = _resolve_path(args.task)
         with open(task_path, "r", encoding="utf-8") as handle:
-            task = json.load(handle)
+            raw_task = handle.read(_MAX_TASK_BYTES + 1)
+        if len(raw_task) > _MAX_TASK_BYTES:
+            print(
+                f"error: task file too large (limit {_MAX_TASK_BYTES} bytes)",
+                file=sys.stderr,
+            )
+            return 2
+        task = json.loads(raw_task)
     except (OSError, json.JSONDecodeError) as exc:
         print(f"error: cannot read task file: {exc}", file=sys.stderr)
         return 2
@@ -112,6 +140,13 @@ def main(argv: list[str] | None = None) -> int:
         llm = build_llm(config["llm"])
         sandbox = build_sandbox(config["sandbox"])
         tools = build_tools(config["tools"])
+        # External MCP tools join the same list; a server that cannot start
+        # is reported and skipped rather than failing the run outright.
+        mcp_tools, mcp_clients = build_mcp_tools(
+            config.get("mcp"),
+            on_error=lambda message: print(f"[mcp] {message}", file=sys.stderr),
+        )
+        tools.extend(mcp_tools)
         evaluator = build_evaluator(config["evaluator"])
         logger = build_logger(config["logging"])
     except ConfigError as exc:
@@ -120,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     events = EventBus()
     events.subscribe(lambda name, payload: print(f"[{name}] {_brief(payload)}"))
 
-    approval_mode = config.get("approvals", "default")
+    approval_mode = config.get("approvals", "yolo")
     print(f"[approvals] headless policy: {approval_mode} "
           "(plan refuses mutations; default/auto refuse destructive commands "
           "and interpreter one-liners; yolo allows all)")
@@ -137,10 +172,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
         max_steps=config.get("max_steps", 30),
         approver=_HeadlessApprover(approval_mode),
+        observation_max_chars=_observation_ceiling(config),
+        digest=bool((config.get("context") or {}).get("digest", True)),
+        digest_max_chars=int((config.get("context") or {}).get("digest_max_chars", 4000) or 0),
     )
     try:
         result = loop.run(task)
     finally:
+        for client in mcp_clients:
+            try:
+                client.close()
+            except Exception:
+                pass  # shutdown must not mask the run's outcome
         logger.close()  # flush and release the append handle
 
     verdict = "PASS" if result.passed else "FAIL"

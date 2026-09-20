@@ -6,7 +6,7 @@ This system adopts selected ideas from a larger workflow-layer harness that prov
 
 ### Read-Before-Edit Ledger
 
-The source harness requires a recorded fresh read before any file edit and rejects edits whose anchor no longer matches the on-disk content. This is carried over as an in-memory per-session ledger that records a content hash on each read and write, enforces the invariant in the edit tool, rejects edits to truncated content and when only a partial view was seen, and reports a clear message when the file changed since the last read. The ledger uses normalized path keys and is platform-aware for case sensitivity.
+The source harness requires a recorded fresh read before any file edit and rejects edits whose anchor no longer matches the on-disk content. This is carried over as an in-memory per-session ledger that records a content hash on each read and write, enforces the invariant in the edit tool, rejects edits to truncated content, when only a partial view was seen, when the file contains invalid UTF-8, and when the anchor matches more than once, and reports a clear message when the file changed since the last read. The ledger uses normalized path keys and folds case only where the platform's filesystem does.
 
 ### Known-Failure Registry
 
@@ -14,7 +14,7 @@ Every recurring incident class is recorded as an entry with symptom, rule, and d
 
 ### Durable Workspace Memory with Cap
 
-Project state is kept per workspace in a hidden directory and appended after each turn. The memory file is capped to prevent unbounded growth, with oldest lines pruned first and single-line oversize content truncated. The tail is loaded into the system prompt, and locking with verified stale handling protects concurrent appends. Environment facts, instruction files, and repository head are injected alongside the memory.
+Project state is kept per workspace in a hidden directory and appended after each turn. The memory file is capped to prevent unbounded growth, with oldest lines pruned first and single-line oversize content truncated. The tail is loaded into the system prompt, and locking with verified stale handling protects concurrent appends. Environment facts, instruction files, and repository head are injected alongside the memory. Entries carry lifecycle metadata so a duplicate is skipped and a replacement marks the older entry superseded, and reads for prompt injection exclude superseded and stale entries.
 
 ### Session Persistence and Resumption
 
@@ -22,7 +22,7 @@ Automatically saved transcripts allow a session to be resumed after closing the 
 
 ### Approval Policy
 
-A daily-driver agent needs a gate between a requested tool and an executed action. The adopted policy classifies each tool invocation as safe, mutating, or destructive via pattern matching, handling wrapper invocations by their inner command and with corrected pre-tool-use redaction. Four modes differ in which categories are auto-allowed. Positive answers can be remembered for the remainder of the session on a per-tool key basis.
+A daily-driver agent needs a gate between a requested tool and an executed action. The adopted policy classifies each tool invocation as safe, mutating, confirm, or destructive via pattern matching, handling wrapper invocations by their inner command and gating interpreter one-liners behind explicit confirmation, with corrected pre-tool-use redaction. Four modes differ in which categories are auto-allowed. Positive answers can be remembered for the remainder of the session on a per-tool key basis.
 
 ### Turn-Aware Context Management
 
@@ -30,7 +30,7 @@ Conversation history is bounded and turn-aware, preserving the initial system pr
 
 ### Tool-Call Argument Repair
 
-Validate-then-repair handling of model tool inputs was adopted in a compact form: alias resolution, null stripping, JSON-string parsing, numeric coercion, path aliasing, and markdown-link unwrapping, always validating first and re-validating after repair.
+Validate-then-repair handling of model tool inputs was adopted in a compact form: alias resolution, null stripping, JSON-string parsing, bare-string wrapping, numeric coercion, path aliasing, and markdown-link unwrapping, always validating first and re-validating after repair.
 
 ### Bounded Workspace Reading
 
@@ -47,3 +47,7 @@ Host-level orchestration and permission plumbing, multi-agent fan-out, integrity
 ## Current State After Remediation
 
 The adopted features now include hardened path confinement at every file and command boundary including encoded forms, owner-only permissions for staged container files and background logs, bounded streaming and memory handling with both consecutive and total limits, validated configuration limits with unknown-key rejection, and validated container inputs. A later hardening pass added process-group isolation for background tasks with shared tree-kill semantics, uniquely named staging files for atomic writes, a byte-explicit terminal input decoder with bounded bracketed pastes and modifier-aware arrow keys, a locked handoff between prompt submission and turn teardown, single-pass transcript sanitization without forgeable internal markers, display-column caret arithmetic in the prompt box, and credential-shaped variable stripping in the host sandbox child environment. The suite of adopted ideas remains small, test-locked, and free of host-specific dependencies, preserving the original goal of a personal daily driver that is easy to move and easy to reason about.
+
+## Known Gaps
+
+Two deliberate trade-offs remain visible in the current state and are recorded here rather than presented as solved. First, the host sandbox's traversal screen is a heuristic and is not a containment boundary, so unrecognized command shapes run with the full authority of the host account; the container sandbox exists for work that needs real isolation. Second, full command output and background-task log files pass through the same pattern-based redaction as the command header, while structured run-log event payloads exclude raw output and file contents entirely; because redaction recognises known secret shapes rather than every secret, those log files are still treated as sensitive.

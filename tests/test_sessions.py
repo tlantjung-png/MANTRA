@@ -6,7 +6,6 @@ here can see or disturb the operator's real ``~/.mantra/sessions``.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sys
@@ -19,10 +18,10 @@ _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
-import core.agent.sessions as sessions
-from core.console import ConsoleSession, Style
+import core.agent.sessions as sessions  # noqa: E402
+from core.console import ConsoleSession, Style  # noqa: E402
 
-from _helpers import messages as _messages
+from _helpers import messages as _messages  # noqa: E402
 
 
 class StoreTest(unittest.TestCase):

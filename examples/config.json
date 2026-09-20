@@ -32,7 +32,7 @@
     "type": "jsonl",
     "path": "logs/mantra-run.jsonl"
   },
-  "approvals": "auto",
+  "approvals": "yolo",
   "context": {
     "max_messages": 200,
     "max_chars": 240000

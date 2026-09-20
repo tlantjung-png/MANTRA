@@ -85,6 +85,10 @@ def _unwrap_auto_link(value: str) -> str:
 
 def _repair_quoted_escapes_json(text: str) -> str:
     r"""Double single backslashes in JSON string literals so Windows paths survive parsing."""
+    # Only escape-bearing text can need this repair; text without a backslash
+    # is returned untouched, so a valid payload is never rewritten by this pass.
+    if "\\" not in text:
+        return text
     # Use regex to find JSON string values: "...." with escapes
     def _fix_string(m: re.Match[str]) -> str:
         inner = m.group(1)

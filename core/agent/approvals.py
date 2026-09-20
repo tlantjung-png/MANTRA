@@ -14,6 +14,18 @@ NoteCallback = Callable[[str], None]
 
 MUTATING_TOOLS = frozenset({"write_file", "edit_file", "run_command", "git_reset", "kill_shell"})
 
+# Tools whose work happens in another process (an MCP server). Their
+# effect cannot be screened by the local patterns, so they are confirmed
+# rather than classified normally. Names are registered when the adapter
+# is built.
+EXTERNAL_TOOLS: set[str] = set()
+
+
+def register_external_tool(name: str) -> None:
+    """Mark a tool as remote, so it always needs explicit confirmation."""
+    if name:
+        EXTERNAL_TOOLS.add(name)
+
 MODES = ("default", "auto", "yolo", "plan")
 
 # Patterns that can irreversibly destroy work.
@@ -84,12 +96,22 @@ _FORBIDRE = [
     re.compile(r"(>|>>)\s*[^|\r\n]*MEMORY\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md", re.IGNORECASE),
 ]
 
-# Rules file support (commands.rules)
+# Optional user rules file (commands.rules), consulted by the classifier.
 _RULES_PATH = None
 _RULES_CACHE: list[dict[str, Any]] | None = None
 _RULES_MTIME: float = 0.0
+# Serialises cache reloads: a concurrent caller must never observe a
+# half-updated rules set.
+_RULES_LOCK = threading.Lock()
+
 
 def _load_rules() -> list[dict[str, Any]]:
+    """Return the parsed rules, reloading them under a lock when stale."""
+    with _RULES_LOCK:
+        return _load_rules_locked()
+
+
+def _load_rules_locked() -> list[dict[str, Any]]:
     global _RULES_CACHE, _RULES_MTIME, _RULES_PATH
     # Try env override, then MANTRA/rules/commands.rules, then ~/.mantra/rules
     import os
@@ -372,8 +394,12 @@ def _is_interpreter_oneliner(tokens: list[str]) -> bool:
     return any(tok.lower() in _INLINE_CODE_FLAGS for tok in tokens[1:])
 
 
-def _classify_segment(segment: str) -> str:
-    """Classify one command segment; safe only if the whole segment is read-only."""
+def _classify_segment(segment: str, sole_segment: bool = False) -> str:
+    """Classify one command segment; safe only if the whole segment is read-only.
+
+    ``sole_segment`` marks a segment that is the entire command, which lets a
+    lone echo be treated as data (see the echo handling below).
+    """
     segment = segment.strip()
     if not segment:
         return "safe"
@@ -388,6 +414,8 @@ def _classify_segment(segment: str) -> str:
         # so it must never ride through as an ordinary mutating command
         # in auto mode.
         if tok in ("rm", "del", "erase", "rmdir", "rd", "remove-item"):
+            if sole_segment and tokens[0] == "echo" and not re.search(r"(\$\(|\$\{|`)", segment):
+                continue  # a lone echo prints these words; it does not run them
             return "destructive"
         elif tok == "find":
             rest = tokens[idx + 1 :]
@@ -483,17 +511,17 @@ def classify_command(command: str) -> str:
                 return "destructive"
         except Exception:
             pass
-    # Broad scan flags destructive text anywhere in the command; only
-    # echo-quoted data is exempt, and only when echo is the sole segment.
-    # Piping or chaining echo output into another command makes the text
-    # executable (echo "rm -rf /" | bash), so the exemption is revoked
-    # whenever another segment follows.
+    # Broad scan flags destructive text anywhere in the command. Quoted or
+    # plain text after a lone echo is data, not commands, so a sole echo
+    # segment is exempt; an expansion inside it still executes, and piping
+    # or chaining its output into another command makes the text executable
+    # (echo "rm -rf /" | bash), so those cases keep the destructive verdict.
     if _DESTRUCTIVE_RE.search(command):
         segments0 = _split_command(command)
         echo_only = (
             len(segments0) == 1
             and re.match(r"^\s*echo\s+", segments0[0], re.IGNORECASE) is not None
-            and re.search(r"""["'][^"']*rm""", segments0[0], re.IGNORECASE) is not None
+            and re.search(r"(\$\(|\$\{|`)", segments0[0]) is None
         )
         if not echo_only:
             return "destructive"
@@ -503,8 +531,9 @@ def classify_command(command: str) -> str:
         worst = "safe"
         rank = {"safe": 0, "mutating": 1, "confirm": 2, "destructive": 3}
         segments = _split_command(command)
+        sole_segment = len(segments) == 1
         for idx, seg in enumerate(segments):
-            risk = _classify_segment(seg)
+            risk = _classify_segment(seg, sole_segment=sole_segment)
             risk = _apply_token_rules(rules if isinstance(rules, list) else [], seg, risk)
             # A bare shell interpreter fed by a preceding segment (a pipe
             # or chain) executes the incoming text as commands: escalate
@@ -533,6 +562,9 @@ def classify_command(command: str) -> str:
 
 def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
     """Return ``(risk, human detail)`` for one tool call."""
+    if tool in EXTERNAL_TOOLS:
+        # Unknown remote effect: never silent, whatever the mode.
+        return "confirm", f"external tool {tool}"
     if tool not in MUTATING_TOOLS:
         return "safe", tool
 

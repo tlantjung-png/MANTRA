@@ -31,6 +31,10 @@ DEFAULT_FILE = {
     # Console UI preferences (runtime-toggled, persisted across restarts).
     "ui": {
         "suggestions": True,
+        # Approval mode carried across sessions: the operator's /approve
+        # choice outlives the process, so a session never restarts in a
+        # mode nobody picked. yolo is the starting default.
+        "approvals": "yolo",
     },
 }
 
@@ -131,8 +135,14 @@ def _write(data: dict[str, Any]) -> bool:
         os.chmod(file.parent, 0o700)
     except OSError:
         pass
-    if _last_error is not None:
-        _quarantine(file, _last_error)
+    # Re-derive the quarantine decision from the file itself rather than from
+    # process-global read state, so an unrelated failed read cannot cause a
+    # healthy file to be backed up.
+    if file.is_file():
+        try:
+            json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _quarantine(file, "unparseable before write")
     data["version"] = _VERSION  # Force the current schema version on every write.
     content = json.dumps(data, indent=2, sort_keys=True) + "\n"
     # File lock for inter-process safety (best effort).
@@ -415,11 +425,13 @@ def ui_prefs() -> dict[str, Any]:
     return dict(load()["ui"])
 
 
-def set_ui_prefs(suggestions: bool | None = None) -> bool:
+def set_ui_prefs(suggestions: bool | None = None, approvals: str | None = None) -> bool:
     """Record the UI preferences. Arguments left as-is when not given."""
     data = load()
     if suggestions is not None:
         data["ui"]["suggestions"] = bool(suggestions)
+    if approvals is not None:
+        data["ui"]["approvals"] = str(approvals)
     return _write(data)
 
 

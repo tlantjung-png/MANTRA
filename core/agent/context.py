@@ -1,10 +1,26 @@
-"""Bounded history: pins system and task, drops oldest turn first."""
+"""Bounded history: pins system and task, drops oldest turn first.
+
+Eviction is normally lossy: a dropped turn is gone, and with it whatever
+the model learned from it. The manager therefore *detaches* evicted turns
+into a pending queue instead of discarding them, and keeps a rolling digest
+of the turns already folded away. ``request_messages()`` is the list that
+actually reaches the model: the live history plus the digest riding between
+the pinned prefix and the work in flight.
+
+The manager stays free of any model client. It decides *what* was lost and
+holds it; whoever owns the client decides whether to pay for a summary, and
+installs it with ``set_digest``.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 CHARS_PER_TOKEN = 4
+
+# A digest larger than this is truncated rather than allowed to eat the
+# budget it exists to protect.
+DEFAULT_DIGEST_MAX_CHARS = 4_000
 
 
 def estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -25,6 +41,14 @@ class ContextManager:
         self.max_chars = max_chars
         self.messages: list[dict[str, Any]] = []
         self._chars = 0
+        # Rolling summary of turns evicted so far, and the turns evicted
+        # since the last digest was installed.
+        self._digest: str | None = None
+        self.pending_evicted: list[dict[str, Any]] = []
+        # Turns dropped without ever reaching a digest, because nothing
+        # drained the queue. A non-zero count is a signal, not a defect:
+        # a run with no summariser wired simply cannot pay for one.
+        self.evicted_without_digest = 0
 
     def seed(self, system_prompt: str, user_task: str) -> None:
         # Enforce the same single-message cap as append(): a seeded task
@@ -43,8 +67,8 @@ class ContextManager:
         self._truncate()
 
     def append(self, message: dict[str, Any]) -> None:
-        # Truncate single message over budget before append. Reserve space
-        # for system prompt and at least one more turn.
+        # Truncate a single message over budget before append, reserving
+        # space for the system prompt and one more turn.
         size = _message_size(message)
         if size > self.max_chars:
             truncated = dict(message)
@@ -106,7 +130,12 @@ class ContextManager:
         self._truncate()
 
     def replace_body(self, messages: list[dict[str, Any]]) -> None:
-        """Keep system prompt, replace body (for compaction)."""
+        """Keep system prompt, replace body (for compaction).
+
+        The digest is dropped here on purpose: a compaction pass produces a
+        fresh summary of the live history, which supersedes any rolling
+        digest of turns that history no longer contains.
+        """
         system = (
             self.messages[0]
             if self.messages and self.messages[0].get("role") == "system"
@@ -116,8 +145,81 @@ class ContextManager:
         if not system.get("content"):
             system = {"role": "system", "content": "You are a helpful assistant."}
         self.messages = [system] + list(messages)
+        self._digest = None
+        self.pending_evicted = []
         self._recount()
         self._truncate()
+
+    # ── the rolling digest ───────────────────────────────────────
+
+    def request_messages(self) -> list[dict[str, Any]]:
+        """The message list that actually reaches the model.
+
+        The digest rides between the pinned prefix and the live history, so
+        the model reads it as background for the work in flight rather than
+        as an instruction that precedes the task.
+        """
+        if not self._digest:
+            return list(self.messages)
+        head = self.messages[:2]
+        return head + [self._digest_message()] + list(self.messages[2:])
+
+    def _digest_message(self) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                "Earlier in this session, summarised from turns that were "
+                "evicted from the live history:\n" + (self._digest or "")
+            ),
+        }
+
+    def _digest_size(self) -> int:
+        return _message_size(self._digest_message()) if self._digest else 0
+
+    def set_digest(self, text: str, max_chars: int = DEFAULT_DIGEST_MAX_CHARS) -> None:
+        """Install a rolling summary of evicted turns."""
+        summary = (text or "").strip()
+        if not summary:
+            self.clear_digest()
+            return
+        if max_chars and len(summary) > max_chars:
+            summary = summary[:max_chars] + f"\n... [digest truncated at {max_chars} chars]"
+        self._digest = summary
+        self._recount()
+
+    def clear_digest(self) -> None:
+        if self._digest is not None:
+            self._digest = None
+            self._recount()
+
+    @property
+    def digest(self) -> str | None:
+        return self._digest
+
+    def take_pending_evicted(self) -> list[dict[str, Any]]:
+        """Detach the turns evicted since the last call, for summarising."""
+        pending = self.pending_evicted
+        self.pending_evicted = []
+        return pending
+
+    def _retain_evicted(self, removed: list[dict[str, Any]]) -> None:
+        """Hold evicted turns for the digest instead of dropping them."""
+        kept = [m for m in removed if isinstance(m, dict)]
+        if not kept:
+            return
+        self.pending_evicted.extend(kept)
+        # Bounded by characters, not messages: a small eviction is kept so
+        # it can be folded together with the next one, and the ceiling only
+        # bites on a run whose loop never drains the queue at all. The
+        # oldest turns go first, and are counted so the loss is visible
+        # rather than silent.
+        ceiling = max(4_000, self.max_chars // 2)
+        while self.pending_evicted and self._pending_chars() > ceiling:
+            self.pending_evicted.pop(0)
+            self.evicted_without_digest += 1
+
+    def _pending_chars(self) -> int:
+        return sum(_message_size(m) for m in self.pending_evicted)
 
     def resync(self) -> None:
         """Recompute sizes after in-place edits."""
@@ -188,7 +290,8 @@ class ContextManager:
         # The newest assistant turn is exempt while it is still the last
         # message: its tool results are appended in a later call, and
         # evicting it now would orphan them.
-        newest_unanswered = bool(self.messages) and self.messages[-1].get("role") == "assistant"
+        last = self.messages[-1] if self.messages else None
+        newest_unanswered = isinstance(last, dict) and last.get("role") == "assistant"
         for index in range(2, len(self.messages)):
             msg = self.messages[index]
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -196,8 +299,9 @@ class ContextManager:
             if newest_unanswered and index == len(self.messages) - 1:
                 continue
             end = index + 1
-            while end < len(self.messages) and self.messages[end].get("role") == "tool":
+            while end < len(self.messages) and isinstance(self.messages[end], dict) and self.messages[end].get("role") == "tool":
                 end += 1
+            self._retain_evicted(self.messages[index:end])
             del self.messages[index:end]
             self._recount()
             return True
@@ -207,17 +311,20 @@ class ContextManager:
             if newest_unanswered and index == len(self.messages) - 1:
                 continue
             if not isinstance(msg, dict) or msg.get("role") != "tool":
+                self._retain_evicted([self.messages[index]])
                 del self.messages[index]
                 # Sweep all consecutive orphaned tool messages.
                 while index < len(self.messages) and (
                     not isinstance(self.messages[index], dict)
                     or self.messages[index].get("role") == "tool"
                 ):
+                    self._retain_evicted([self.messages[index]])
                     del self.messages[index]
                 self._recount()
                 return True
         # Only tool messages remain: remove oldest.
         if len(self.messages) > 2 and not (newest_unanswered and len(self.messages) == 3):
+            self._retain_evicted([self.messages[2]])
             del self.messages[2]
             self._recount()
             return True
@@ -225,7 +332,9 @@ class ContextManager:
 
     def _recount(self) -> None:
         # Recompute the char total from scratch (O(n); used after any in-place mutation).
-        self._chars = sum(_message_size(m) for m in self.messages)
+        # The digest counts even though it is not a stored message: it is
+        # sent with every request, so the budget must see it.
+        self._chars = sum(_message_size(m) for m in self.messages) + self._digest_size()
 
 
 def _message_size(message: Any) -> int:

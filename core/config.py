@@ -14,7 +14,7 @@ from core.agent.exceptions import ConfigError
 REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 DEFAULTS = {
-    "system_prompt": None,  # loop default if unset
+    "system_prompt": None,  # falls back to the loop default
     "max_steps": 30,
     # Message limits (not tokens) live under "context".
     "llm": {
@@ -25,6 +25,9 @@ DEFAULTS = {
         "reasoning_effort": None,
     },
     "sandbox": {"provider": "local"},
+    # External MCP servers bridged into the tool list. Empty by default:
+    # nothing is launched unless the operator names a server here.
+    "mcp": {"servers": {}},
     "tools": [
         "read_file",
         "write_file",
@@ -43,9 +46,23 @@ DEFAULTS = {
     ],
     "evaluator": {"type": "command", "test_cmd": "python -m pytest tests/ -q"},
     "logging": {"type": "jsonl", "path": "logs/mantra-run.jsonl"},
-    # Default approval is the strictest interactive mode.
-    "approvals": "default",  # default | auto | yolo | plan
-    "context": {"max_messages": 200, "max_chars": 240000},
+    # Default approval is yolo: every tool call is allowed without a prompt.
+    # Only use this default in a disposable or otherwise trusted workspace;
+    # set "default", "auto", or "plan" to be prompted or to restrict writes.
+    "approvals": "yolo",  # yolo | default | auto | plan
+    "context": {
+        "max_messages": 200,
+        "max_chars": 240000,
+        # Rolling digest of turns the budget evicts, so eviction stops
+        # being a silent loss. Off keeps the old lossy behaviour.
+        "digest": True,
+        "digest_max_chars": 4000,
+    },
+    # Observation reshaping: tool output is densified before it enters the
+    # model's context. The operator still sees the raw output and /fix still
+    # captures it; only the model's copy is reshaped. max_chars is the
+    # ceiling for one observation (0 disables reshaping entirely).
+    "observations": {"reshape": True, "max_chars": 12000},
     "auto_compact_tokens": 60000,  # compact when history exceeds; 0 disables
     "verbose": False,  # echo truncated tool output live
     # Post-task suggestion chips ("run the tests", "commit", ...) shown
@@ -99,6 +116,62 @@ def load_config(path: str) -> dict:
     return merge_defaults(data)
 
 
+def _validate_mcp(section: object) -> None:
+    """Validate the MCP section: a mapping of named stdio servers.
+
+    A malformed server definition would otherwise fail at launch time as
+    a bare OSError from a child process, so it is rejected here with the
+    offending key named.
+    """
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError(f"config mcp must be an object, got {type(section).__name__}")
+    servers = section.get("servers")
+    if servers is None:
+        return
+    if not isinstance(servers, dict):
+        raise ConfigError("config mcp.servers must be an object mapping names to servers")
+    for name, spec in servers.items():
+        if not isinstance(spec, dict):
+            raise ConfigError(f"config mcp.servers.{name} must be an object")
+        unknown = [k for k in spec if k not in _MCP_SERVER_KEYS]
+        if unknown:
+            raise ConfigError(
+                f"unknown config keys in mcp.servers.{name}: {sorted(unknown)} "
+                f"(known: {sorted(_MCP_SERVER_KEYS)})"
+            )
+        command = spec.get("command")
+        if isinstance(command, str):
+            if not command.strip():
+                raise ConfigError(f"config mcp.servers.{name}.command must not be empty")
+        elif isinstance(command, list):
+            if not command or any(
+                not isinstance(part, str) or not part.strip() for part in command
+            ):
+                raise ConfigError(
+                    f"config mcp.servers.{name}.command must be a non-empty list of strings"
+                )
+        else:
+            raise ConfigError(
+                f"config mcp.servers.{name}.command must be a string or a list of strings"
+            )
+        enabled = spec.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"config mcp.servers.{name}.enabled must be true or false")
+        cwd = spec.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ConfigError(f"config mcp.servers.{name}.cwd must be a string")
+        env = spec.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise ConfigError(f"config mcp.servers.{name}.env must be an object")
+        timeout = spec.get("timeout")
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+        ):
+            raise ConfigError(f"config mcp.servers.{name}.timeout must be a number")
+
+
 def _deep_merge(base: dict, incoming: dict) -> dict:
     out = dict(base)
     for key, value in incoming.items():
@@ -112,9 +185,14 @@ def _deep_merge(base: dict, incoming: dict) -> dict:
 # Sections whose keys are validated here (the rest are forwarded to the
 # registry, which already rejects unknown constructor keys).
 _SECTION_KEYS = {
-    "context": {"max_messages", "max_chars"},
+    "context": {"max_messages", "max_chars", "digest", "digest_max_chars"},
+    "observations": {"reshape", "max_chars"},
     "skills": {"auto", "auto_bundle"},
+    "mcp": {"servers"},
 }
+
+# Keys accepted inside one MCP server definition.
+_MCP_SERVER_KEYS = {"command", "cwd", "env", "enabled", "timeout"}
 
 # The key inside each component section that names the concrete class. When
 # an operator switches component type (e.g. evaluator "command" -> "none"
@@ -181,6 +259,22 @@ def merge_defaults(data: dict) -> dict:
                     f"unknown config keys in '{section}': {sorted(unknown)} "
                     f"(known: {sorted(allowed)})"
                 )
+    # A bad observation ceiling must not reach the loop as a surprise: a
+    # non-integer would compare against a string length and never trigger.
+    obs = data.get("observations")
+    if isinstance(obs, dict):
+        for key, label in (("reshape", "true or false"), ("max_chars", "an integer")):
+            if key in obs:
+                value = obs[key]
+                ok = (
+                    isinstance(value, bool)
+                    if key == "reshape"
+                    else isinstance(value, int) and not isinstance(value, bool)
+                )
+                if not ok:
+                    raise ConfigError(f"config observations.{key} must be {label}")
+                if key == "max_chars" and value < 0:
+                    raise ConfigError("config observations.max_chars must not be negative")
     # Deep copy prevents mutation of shared DEFAULTS.
     merged = copy.deepcopy(DEFAULTS)
     for key, value in (data or {}).items():
@@ -247,11 +341,12 @@ def merge_defaults(data: dict) -> dict:
     prompt = merged.get("system_prompt")
     if prompt is not None and not isinstance(prompt, str):
         raise ConfigError(f"config system_prompt must be a string or null, got {prompt!r}")
-    mode = merged.get("approvals", "default")
+    mode = merged.get("approvals", "yolo")
     if mode not in ("default", "auto", "yolo", "plan"):
         raise ConfigError(
-            f"config approvals must be one of default/auto/yolo/plan, got '{mode}'"
+            f"config approvals must be one of yolo/default/auto/plan, got '{mode}'"
         )
+    _validate_mcp(merged.get("mcp"))
     effort = merged.get("llm", {}).get("reasoning_effort")
     if effort is not None and effort not in REASONING_EFFORTS:
         raise ConfigError(
@@ -268,6 +363,16 @@ def merge_defaults(data: dict) -> dict:
         mc = ctx.get("max_chars")
         if mc is not None and (not isinstance(mc, int) or isinstance(mc, bool) or mc < 2000):
             raise ConfigError(f"config context.max_chars must be an integer >=2000, got {mc!r}")
+        dg = ctx.get("digest")
+        if dg is not None and not isinstance(dg, bool):
+            raise ConfigError(f"config context.digest must be true or false, got {dg!r}")
+        dc = ctx.get("digest_max_chars")
+        if dc is not None and (
+            not isinstance(dc, int) or isinstance(dc, bool) or dc < 0
+        ):
+            raise ConfigError(
+                f"config context.digest_max_chars must be a non-negative integer, got {dc!r}"
+            )
     return merged
 
 

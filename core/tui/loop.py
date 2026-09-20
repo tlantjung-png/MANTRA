@@ -43,7 +43,14 @@ class Presenter:
             # Drain the input queue fully: held keys and bursts are
             # applied before any frame is composed.
             while event is not None:
-                self.app.handle_event(event)
+                try:
+                    self.app.handle_event(event)
+                except Exception as exc:
+                    # Deliberately broad, and the same bargain the frame
+                    # path makes: one malformed event must not take the
+                    # whole interface down. The failure is surfaced the
+                    # way a turn error is, so it is never silent.
+                    self._report_event_failure(exc)
                 try:
                     event = self.app.next_event(0)
                 except queue.Empty:
@@ -66,3 +73,15 @@ class Presenter:
                     continue
                 self._last_draw = now
                 self.app.dirty = False
+
+    def _report_event_failure(self, exc: BaseException) -> None:
+        """Surface an event-handler failure without ending the session."""
+        try:
+            report = getattr(self.app, "toast_message", None)
+            if callable(report):
+                report(f"input error: {exc}", seconds=4.0)
+            else:
+                self.app.mark_dirty()
+        except Exception:
+            # The reporting path itself must never raise into the loop.
+            pass

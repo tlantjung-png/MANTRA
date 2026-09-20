@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import subprocess
 import tempfile
 import threading
@@ -142,7 +141,7 @@ def _finish_task(
                 f.write(f"\n[{note}]\n")
             f.write(f"\nexit_code: {exit_code}\n")
     except Exception as exc:
-        # D14: a failed log write must be visible, not swallowed.
+        # Surface a failed log write instead of swallowing it.
         log_error = f"log write failed: {exc}"
     with _TASKS_LOCK:
         if task_id in _TASKS:
@@ -154,14 +153,14 @@ def _finish_task(
                 "done": True,
                 "end_time": time.monotonic(),
                 "duration": duration,
-                # D13: the task is done; release the Popen handle and pid
-                # so finished entries cannot pin process handles.
+                # Task done: release the Popen handle and pid so finished
+                # entries cannot pin process handles.
                 "process": None,
                 "pid": None,
                 "log_error": log_error or _TASKS[task_id].get("log_error"),
             })
-    # D21: completed workspace task logs are pruned here (keeping the most
-    # recent), so list_dir stops exposing finished task logs.
+    # Prune finished workspace task logs, keeping the most recent, so
+    # list_dir stops exposing them.
     _prune_done_logs(log_path)
 
 
@@ -198,6 +197,41 @@ def _prune_done_logs(log_path: str) -> None:
                 pass
     except OSError:
         pass
+
+
+def _map_exit_status(result: ExecResult, command: str) -> tuple[int, str]:
+    """Display exit code and its note for one finished command.
+
+    Signal deaths map to 128+n, a timed-out run reads 143, a screen refusal
+    or cap kill keeps -1, and the grep/Select-String "no matches" status 1 is
+    annotated as benign. Kept separate from formatting so the honest-exit
+    rules can be tested on their own.
+    """
+    exit_code = result.exit_code
+    if exit_code == -1 and result.timed_out:
+        exit_code = 143
+    elif exit_code == -1:
+        exit_code = -1
+    elif exit_code is not None and exit_code < 0:
+        exit_code = 128 - exit_code
+    elif exit_code is None:
+        exit_code = 128
+    display_code = exit_code
+    exit_note = ""
+    if display_code == 137:
+        exit_note = " (SIGKILL, 128+9)"
+    elif display_code == 143:
+        exit_note = " (SIGTERM, 128+15)"
+    elif display_code == -1:
+        exit_note = " (blocked/refused — not a signal death)"
+    elif display_code == 128 and (os.name != "nt" or (result.exit_code is not None and result.exit_code < 0)):
+        exit_note = " (signal death, 128)"
+    elif display_code == 1 and re.search(r"(^|\s|;)grep(\.exe)?\b", command, re.IGNORECASE):
+        exit_note = " (grep: no matches — not an error)"
+    elif display_code == 1 and re.search(r"Select-String", command, re.IGNORECASE):
+        exit_note = " (Select-String: no matches — not an error)"
+    return display_code, exit_note
+
 
 class RunCommandTool(Tool):
     name = "run_command"
@@ -392,10 +426,10 @@ class RunCommandTool(Tool):
                             if written + line_bytes > _LOG_BYTE_CEILING:
                                 # A single line may itself cross the ceiling;
                                 # keep the head of it, then stop.
-                                lf.write(line[:_LOG_BYTE_CEILING - written] + "\n")
+                                lf.write(_redact_sensitive(line[:_LOG_BYTE_CEILING - written]) + "\n")
                                 written = _LOG_BYTE_CEILING
                             else:
-                                lf.write(line)
+                                lf.write(_redact_sensitive(line))
                                 written += line_bytes
                             lf.flush()
                             if written >= _LOG_BYTE_CEILING:
@@ -406,8 +440,8 @@ class RunCommandTool(Tool):
                                         _TASKS[task_id]["truncated"] = True
                                 break
                 except Exception as exc:
-                    # D14: a failed log append must be visible to
-                    # shell_output, not swallowed silently.
+                    # Surface a failed log append so shell_output can
+                    # report it.
                     with _TASKS_LOCK:
                         if task_id in _TASKS:
                             _TASKS[task_id]["log_error"] = f"output pump failed: {exc}"
@@ -518,35 +552,7 @@ class RunCommandTool(Tool):
         # exiting 1 means "no matches", not an error. Timed-out runs read
         # 143; screen refusals and cap kills surface as -1, not a signal
         # death.
-        exit_code = result.exit_code
-        if exit_code == -1 and result.timed_out:
-            # Timed-out kills are reported 143-style (treated as SIGTERM).
-            exit_code = 143
-        elif exit_code == -1:
-            # Screen refusal / invalid timeout / cap kill: keep raw -1.
-            exit_code = -1
-        # Handle Python negative signal codes (e.g., -9 -> 137)
-        elif exit_code is not None and exit_code < 0:
-            exit_code = 128 - exit_code  # -9 -> 137
-        elif exit_code is None:
-            exit_code = 128
-        # Update result for display
-        display_code = exit_code
-        exit_note = ""
-        if display_code == 137:
-            exit_note = " (SIGKILL, 128+9)"
-        elif display_code == 143:
-            exit_note = " (SIGTERM, 128+15)"
-        elif display_code == -1:
-            exit_note = " (blocked/refused — not a signal death)"
-        elif display_code == 128 and (os.name != "nt" or (result.exit_code is not None and result.exit_code < 0)):
-            exit_note = " (signal death, 128)"
-        elif display_code == 1 and re.search(r"(^|\s|;)grep(\.exe)?\b", command, re.IGNORECASE):
-            exit_note = " (grep: no matches — not an error)"
-        elif display_code == 1 and re.search(r"Select-String", command, re.IGNORECASE):
-            exit_note = " (Select-String: no matches — not an error)"
-        # Use honest code for parts
-        result_exit = display_code
+        result_exit, exit_note = _map_exit_status(result, command)
 
         parts = [f"exit_code: {result_exit}{exit_note}"]
         if result.timed_out:
@@ -579,9 +585,9 @@ class RunCommandTool(Tool):
                 _register_full_log(full_log_path)
                 with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
                     f.write(f"$ {_redact_sensitive(command)}\n")
-                    f.write(stdout)
+                    f.write(_redact_sensitive(stdout))
                     if stderr:
-                        f.write("\n[stderr]\n" + stderr)
+                        f.write("\n[stderr]\n" + _redact_sensitive(stderr))
                 # Keep head and tail; the omitted count is per stream and
                 # reflects what was actually cut.
                 if len(stdout) > MAX_TOTAL:
@@ -662,8 +668,8 @@ class ShellOutputTool(Tool):
 
         log_path = task.get("log_path")
         if not log_path or not os.path.exists(log_path):
-            # D14: a task whose log write failed explains itself instead
-            # of looking like the log merely vanished.
+            # Explain a failed log write instead of looking like the
+            # log merely vanished.
             log_err = task.get("log_error")
             if log_err:
                 return f"ERROR: log not found for {task_id} ({log_err})"
