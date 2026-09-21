@@ -819,8 +819,18 @@ class Backend:
                 col = max(0, int(m.group(2)) - 1)
                 row = max(0, int(m.group(3)) - 1)
                 pressed = m.group(4) == "M"
-                if button in (_WHEEL_UP, _WHEEL_DOWN):
-                    return len(m.group(0)) + 2, Mouse("wheel", button, col, row), last_buttons
+                # Wheel codes carry the modifier bits (shift +4, alt +8,
+                # ctrl +16), and the spec adds 66/67 for horizontal tilt.
+                # Classify with the modifiers stripped: an unstripped
+                # shift+wheel (68) fell through to the press path below
+                # and became a click wherever the cursor rested.
+                base = button & ~0x1C
+                if base in (_WHEEL_UP, _WHEEL_DOWN):
+                    return len(m.group(0)) + 2, Mouse("wheel", base, col, row), last_buttons
+                if base in (66, 67):
+                    # Horizontal tilt: the transcript has no horizontal
+                    # axis, so swallow the notch rather than misread it.
+                    return len(m.group(0)) + 2, None, last_buttons
                 if button & 32:  # motion bit: drag with a button held
                     return len(m.group(0)) + 2, Mouse("drag", 0, col, row), last_buttons
                 kind = "press" if pressed else "release"

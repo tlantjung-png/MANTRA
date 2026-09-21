@@ -70,6 +70,23 @@ class BackendParseTest(unittest.TestCase):
         self.assertEqual([ev.button for ev in decoded], [64, 65, 64])
         self.assertEqual((decoded[0].x, decoded[0].y), (10, 4))
 
+    def test_sgr_wheel_with_modifiers_still_decodes_as_a_wheel(self):
+        # A wheel notch with shift/alt/ctrl held carries the modifier bits
+        # (64+4, 65+8, 65+16...). Those codes must still classify as a
+        # wheel: falling through to the press path turned the notch into
+        # a click wherever the cursor rested - which over the prompt box
+        # moved the caret instead of scrolling the conversation.
+        events = self._parse("\x1b[<68;11;5M\x1b[<73;11;5M\x1b[<81;11;5M")
+        decoded = [events.get_nowait() for _ in range(events.qsize())]
+        self.assertEqual([ev.kind for ev in decoded], ["wheel", "wheel", "wheel"])
+        self.assertEqual([ev.button for ev in decoded], [64, 65, 65])
+
+    def test_sgr_tilt_wheel_is_consumed_without_a_click(self):
+        # Horizontal tilt (66/67) has no vertical action; the notch must
+        # be swallowed whole rather than decoded as a press.
+        events = self._parse("\x1b[<66;11;5M\x1b[<67;11;5M")
+        self.assertEqual(events.qsize(), 0)
+
     def test_decomposed_wheel_flush_never_types_into_the_prompt(self):
         # Regression: when ConPTY decomposes an SGR wheel report into key
         # records that arrive too gappily to reassemble, the buffer is
