@@ -126,6 +126,7 @@ class LLMClient(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Send the conversation and tool schemas, return a normalized response.
 

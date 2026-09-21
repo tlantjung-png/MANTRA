@@ -20,8 +20,7 @@
     "run_command",
     "search_code",
     "find_file",
-    "git_diff",
-    "git_reset"
+    "git_diff"
   ],
   "evaluator": {
     "type": "command",

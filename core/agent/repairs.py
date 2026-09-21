@@ -195,7 +195,6 @@ def repair_arguments(tool_name: str, arguments: dict[str, Any], schema: dict[str
             "search_code": {"query"},
             "find_file": {"pattern"},
             "extract_document": {"path", "max_chars"},
-            "query_tree": {"pattern", "root"},
             "web_fetch": {"url", "max_chars"},
             "git_diff": set(),
             "git_reset": set(),

@@ -83,7 +83,8 @@ class AgentLoop:
         self.abort = abort
         self.approver = approver
         # Ceiling for one observation as it enters context; 0 disables
-        # reshaping. The raw observation still reaches the UI and /fix.
+        # reshaping. The raw observation still reaches the UI and the
+        # post-task suggestion engine.
         self.observation_max_chars = observation_max_chars
         # Rolling digest of evicted turns. When off, eviction stays lossy
         # exactly as it was: turns are dropped and nothing is summarised.
@@ -98,6 +99,13 @@ class AgentLoop:
     @property
     def aborted(self) -> bool:
         return bool(self.abort and self.abort.is_set())
+
+    def _on_rate_limit_wait(self, seconds: float, waited: float) -> None:
+        """Announce a rate-limit wait, so a paused turn explains itself."""
+        self._emit(
+            "llm_rate_limited",
+            {"seconds": round(seconds, 1), "waited": round(waited, 1)},
+        )
 
     def run(self, task: dict[str, Any]) -> RunResult:
         task_id = str(task.get("task_id", "unnamed"))
@@ -167,7 +175,11 @@ class AgentLoop:
 
                 try:
                     response = self.llm.chat(
-                        context.request_messages(), tools=tool_schemas, on_delta=self.on_delta
+                        context.request_messages(),
+                        tools=tool_schemas,
+                        on_delta=self.on_delta,
+                        should_abort=lambda: self.aborted,
+                        on_wait=self._on_rate_limit_wait,
                     )
                 except LLMError as exc:
                     message = str(exc)
@@ -561,6 +573,8 @@ class AgentLoop:
                 [{"role": "user", "content": _DIGEST_PROMPT + "\n\n" + text}],
                 tools=None,
                 on_delta=None,
+                should_abort=lambda: self.aborted,
+                on_wait=self._on_rate_limit_wait,
             )
         except Exception:
             metrics["digest_failures"] = metrics.get("digest_failures", 0) + 1

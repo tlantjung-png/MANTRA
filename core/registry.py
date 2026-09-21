@@ -27,7 +27,7 @@ from core.tools.files import (
     WriteFileTool,
 )
 from core.tools.search import FindFileTool, SearchCodeTool
-from core.tools.extract import ExtractDocumentTool, QueryTreeTool
+from core.tools.extract import ExtractDocumentTool
 from core.tools.web import WebFetchTool
 from core.types import Evaluator
 from core.types import LLMClient
@@ -67,7 +67,6 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         SearchCodeTool,
         FindFileTool,
         ExtractDocumentTool,
-        QueryTreeTool,
         GitDiffTool,
         GitResetTool,
         WebFetchTool,

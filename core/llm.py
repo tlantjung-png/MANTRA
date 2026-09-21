@@ -27,6 +27,19 @@ _MAX_TOOL_ARGS_BYTES = 2_000_000
 _MAX_SSE_EVENT_CHARS = 1_000_000
 
 DeltaCallback = Callable[[str], None]
+WaitCallback = Callable[[float, float], None]
+
+# A rate limit is a queue, not a failure: the client waits it out instead
+# of spending its retries inside the limited window (which only deepens
+# the limit). Each wait honours the server's Retry-After when it sends
+# one, otherwise backs off exponentially up to the cap; the total time
+# spent waiting is bounded so a permanent limit still ends the turn.
+_RATE_LIMIT_BACKOFF_CAP = 30.0
+_RATE_LIMIT_BACKOFF_FIRST = 2.0
+_RETRY_AFTER_MAX = 300.0
+# Abort checks slice the wait: a Ctrl+C lands within this long no matter
+# how patiently the client is waiting.
+_ABORT_SLICE = 0.2
 
 # A mid-stream drop raises IncompleteRead, not OSError, so catch it explicitly.
 IncompleteRead = http.client.IncompleteRead
@@ -276,6 +289,58 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
     return LLMResponse(content=content or None, tool_calls=tool_calls, usage=usage)
 
 
+def parse_retry_after(value: str | None) -> float | None:
+    """Seconds to wait from a Retry-After header value.
+
+    Accepts both forms the header allows: delay-seconds ("30") and an
+    HTTP-date. A date already in the past means "retry now". Returns
+    None when the value is missing or unparseable, so the caller falls
+    back to its own backoff.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        pass
+    else:
+        return max(0.0, min(seconds, _RETRY_AFTER_MAX))
+    import datetime as _dt
+    from email.utils import parsedate_to_datetime
+
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=_dt.timezone.utc)
+    delta = (when - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+    return max(0.0, min(delta, _RETRY_AFTER_MAX))
+
+
+def sleep_abortable(seconds: float, should_abort: Callable[[], bool] | None) -> None:
+    """Sleep in small slices, raising LLMError when the run is aborted.
+
+    A long rate-limit wait must not make the console unresponsive to
+    Ctrl+C: the abort flag is checked between slices, so an abort lands
+    within _ABORT_SLICE seconds of being set. The remaining time is
+    counted down rather than re-read from the clock, so the wait always
+    terminates even when the sleep itself is stubbed out.
+    """
+    remaining = max(0.0, seconds)
+    while remaining > 0:
+        if should_abort is not None and should_abort():
+            raise LLMError("aborted while waiting for the rate limit to clear")
+        slice_s = min(_ABORT_SLICE, remaining)
+        time.sleep(slice_s)
+        remaining -= slice_s
+
+
 class OpenAICompatClient(LLMClient):
     """OpenAI-compatible chat-completions client with streaming, retries, and a Responses-API fallback."""
 
@@ -288,6 +353,7 @@ class OpenAICompatClient(LLMClient):
         max_tokens: int = 4096,
         timeout: float = 120.0,
         max_retries: int = 3,
+        rate_limit_wait: float = 600.0,
         stream: bool = True,
         include_usage: bool = True,
         reasoning_effort: str | None = None,
@@ -305,6 +371,10 @@ class OpenAICompatClient(LLMClient):
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.max_retries = max_retries
+        # Total seconds a single chat() may spend waiting out rate limits
+        # before giving up. Bounded so a permanent limit ends the turn
+        # with a clear message instead of hanging the session.
+        self.rate_limit_wait = max(0.0, float(rate_limit_wait))
         self.stream = stream
         self.include_usage = include_usage
         self.reasoning_effort = reasoning_effort
@@ -333,6 +403,8 @@ class OpenAICompatClient(LLMClient):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_delta: DeltaCallback | None = None,
+        should_abort: Callable[[], bool] | None = None,
+        on_wait: WaitCallback | None = None,
     ) -> LLMResponse:
         try:
             has_key = bool(resolve_key(self.api_key_env))
@@ -458,6 +530,17 @@ class OpenAICompatClient(LLMClient):
                         f"{self.base_url}: {detail or 'no detail given'}"
                     ) from exc
                 last_error = f"HTTP {exc.code}: {detail}"
+                if exc.code == 429:
+                    # A rate limit is a queue, not a failure: wait it out
+                    # here instead of spending the remaining retries inside
+                    # the limited window, where every attempt both fails
+                    # and deepens the limit.
+                    response = self._wait_out_rate_limit(
+                        exc, detail, body, use_stream, stream_cb, should_abort, on_wait
+                    )
+                    if response.usage:
+                        self.last_usage = response.usage
+                    return response
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
             except (urllib.error.URLError, TimeoutError, OSError, IncompleteRead) as exc:
@@ -477,6 +560,67 @@ class OpenAICompatClient(LLMClient):
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
         raise LLMError(f"LLM request failed after {self.max_retries} attempts: {last_error}")
+
+    def _wait_out_rate_limit(
+        self,
+        first: urllib.error.HTTPError,
+        first_detail: str,
+        body: bytes,
+        use_stream: bool,
+        stream_cb: DeltaCallback | None,
+        should_abort: Callable[[], bool] | None,
+        on_wait: WaitCallback | None,
+    ) -> LLMResponse:
+        """Wait until the server's rate limit clears, then return the response.
+
+        Each wait honours the server's Retry-After when it sends one and
+        otherwise backs off exponentially up to the cap. The total wait is
+        bounded by ``rate_limit_wait`` so a permanent limit still ends the
+        turn with a clear message. The wait is abortable, so Ctrl+C during
+        a long pause ends the run instead of ignoring the operator.
+        """
+        exc = first
+        detail = first_detail
+        waited = 0.0
+        waits = 0
+        while True:
+            headers = getattr(exc, "headers", None)
+            retry_after = parse_retry_after(
+                headers.get("Retry-After") if headers is not None else None
+            )
+            if retry_after:
+                delay = retry_after
+            else:
+                delay = min(
+                    _RATE_LIMIT_BACKOFF_FIRST * (2 ** min(waits, 5)),
+                    _RATE_LIMIT_BACKOFF_CAP,
+                )
+            if waited + delay > self.rate_limit_wait:
+                raise LLMError(
+                    f"rate limited for more than {int(self.rate_limit_wait)}s at "
+                    f"{self.base_url}: {detail or 'HTTP 429'} - raise "
+                    "rate_limit_wait in the llm config to wait longer"
+                ) from exc
+            if on_wait is not None:
+                on_wait(delay, waited + delay)
+            sleep_abortable(delay, should_abort)
+            waited += delay
+            waits += 1
+            try:
+                if use_stream:
+                    response = self._request_stream(body, stream_cb)
+                else:
+                    response = self._request(body)
+            except urllib.error.HTTPError as retry_exc:
+                if retry_exc.code != 429:
+                    raise
+                exc = retry_exc
+                try:
+                    detail = (retry_exc.read() or b"").decode(errors="replace")[:300]
+                except OSError:
+                    pass
+                continue
+            return response
 
     @staticmethod
     def _blamed(detail: str, field: str) -> bool:

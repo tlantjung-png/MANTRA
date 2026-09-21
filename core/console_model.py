@@ -60,7 +60,7 @@ def _effort_options(current: str | None) -> list[Option]:
             hints.append("send no effort field")
         elif level == "high":
             hints.append("most thorough, slowest")
-        options.append(Option(value=level, hint=" · ".join(hints)))
+        options.append(Option(value=level, hint=", ".join(hints)))
     return options
 
 
@@ -93,7 +93,7 @@ def _apply_model(session: "ConsoleSession", model: str, effort: str | None = Non
     effort_now = session.config["llm"].get("reasoning_effort") or "off"
     session._print(
         session.style.dim(
-            f"  model is now {model} · reasoning {effort_now}"
+            f"  model is now {model}, reasoning {effort_now}"
         )
     )
     # Remember the pairing so the next /model menu opens on it.
@@ -245,13 +245,13 @@ def _choose_model(session: "ConsoleSession") -> bool:
     for m, provider in sorted(all_by_model.items(), key=lambda x: x[0].lower()):
         hint = provider
         if m == current:
-            hint = (hint + " · current").strip(" ·") if hint else "current"
+            hint = (hint + ", current").strip(" ,") if hint else "current"
         if _c.is_reasoning_model(m):
-            hint = (hint + " · thinks").strip(" ·") if hint else "thinks"
+            hint = (hint + ", thinks").strip(" ,") if hint else "thinks"
         options.append(Option(value=m, hint=hint))
     # Always offer typing a name
     options.append(Option(value=TYPE_A_MODEL, hint="not listed above"))
-    title = "models — all providers" if len(known_endpoints()) > 1 else f"models at {base_url}" if base_url else "models"
+    title = "models - all providers" if len(known_endpoints()) > 1 else f"models at {base_url}" if base_url else "models"
 
     def _on_delete_model(model: str) -> None:
         provider = all_by_model.get(model)
@@ -334,7 +334,7 @@ def _connect_choose_endpoint(session: "ConsoleSession") -> str | None:
                 session._print(session.style.dim(f"  removed '{name}'"))
                 session._print(session.style.warn(f"  warning: could not remove stored key {key_env}"))
             elif key_env and still_used:
-                session._print(session.style.dim(f"  removed '{name}' (kept key {key_env} — still used by another endpoint)"))
+                session._print(session.style.dim(f"  removed '{name}' (kept key {key_env} - still used by another endpoint)"))
             else:
                 session._print(session.style.dim(f"  removed '{name}'"))
 
@@ -420,7 +420,7 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
         url = _c._read_choice(session, "  endpoint url (e.g. https://api.openai.com/v1)> ").strip()
         if not url:
             session._print(s.dim("  tip: paste a full URL, or try /model list to see saved ones"))
-            session._print(s.dim("  examples: /model https://api.openai.com/v1  ·  /model https://api.meta.ai/v1"))
+            session._print(s.dim("  examples: /model https://api.openai.com/v1 ; /model https://api.meta.ai/v1"))
             return False
     if "://" not in url:
         # Tolerate a host typed without a scheme rather than failing.
@@ -447,7 +447,7 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
         # Always prompt for key in interactive add (visible), show existing
         existing = os.environ.get(key_env) or stored_keys().get(key_env, "")
         if existing:
-            session._print(s.dim(f"  current key {mask(existing)} ({key_env}) — press enter to keep, or paste new"))
+            session._print(s.dim(f"  current key {mask(existing)} ({key_env}) - press enter to keep, or paste new"))
         key = _c._read_choice(session, f"  api key for {name}> ").strip()
         if key:
             if not _c._store_key(session, key_env, key):
@@ -494,7 +494,7 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
     endpoint flow behind it.
     """
     # Subcommands first — before treating args as url
-    if args and args[0].lower() in ("remove", "forget", "delete", "rm"):
+    if args and args[0].lower() == "remove":
         if len(args) >= 2:
             _c._connect_remove(session, args[1])
         else:
@@ -506,7 +506,7 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
                 if choice:
                     _c._connect_remove(session, choice)
         return True
-    if args and args[0].lower() in ("key", "keys"):
+    if args and args[0].lower() == "key":
         if len(args) >= 3:
             # /model key <name> <key> — direct replace no prompt.
             # The endpoint may carry a custom api_key_env; deriving the
@@ -530,7 +530,7 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
         # Scripted form: /model <url> <key>
         return _connect_new(session, args[0], args[1])
     if len(args) == 1:
-        if args[0].lower() in ("list", "show"):
+        if args[0].lower() == "list":
             session.show_endpoints()
             return True
         # A saved endpoint's own name means "switch to it". Saved names
@@ -582,18 +582,18 @@ SHOW_FIRST_MODELS = "show the first few models"
 def _model_help(session: "ConsoleSession") -> None:
     """The merged provider-and-model help for /model."""
     s = session.style
-    session._print(s.bold("  /model — provider & model, one place"))
+    session._print(s.bold("  /model - provider & model, one place"))
     session._print(s.dim("  usage:"))
-    session._print("    /model                          — menu: add a provider, pick a model")
-    session._print("    /model <name>                   — switch to a model directly")
-    session._print("    /model <name> <effort>          — switch and set reasoning")
-    session._print("    /model <url> [key] [model]      — add a provider, then pick a model")
-    session._print("    /model <endpoint-name>          — switch provider")
-    session._print("    /model list                     — show saved providers")
-    session._print("    /model remove <name>            — delete a provider")
-    session._print("    /model key [name]               — replace a stored key")
+    session._print("    /model                          - menu: add a provider, pick a model")
+    session._print("    /model <name>                   - switch to a model directly")
+    session._print("    /model <name> <effort>          - switch and set reasoning")
+    session._print("    /model <url> [key] [model]      - add a provider, then pick a model")
+    session._print("    /model <endpoint-name>          - switch provider")
+    session._print("    /model list                     - show saved providers")
+    session._print("    /model remove <name>            - delete a provider")
+    session._print("    /model key [name]               - replace a stored key")
     session._print(s.dim("  effort: off | minimal | low | medium | high | xhigh"))
-    session._print(s.dim("  examples: /model gpt-4o   ·   /model gpt-5 high   ·   /model https://api.openai.com/v1"))
+    session._print(s.dim("  examples: /model gpt-4o ; /model gpt-5 high ; /model https://api.openai.com/v1"))
 
 
 def _model_master(session: "ConsoleSession") -> bool:
@@ -610,7 +610,7 @@ def _model_master(session: "ConsoleSession") -> bool:
             options.append(Option(value=SWITCH_ENDPOINT_ENTRY, hint=""))
         options.append(Option(value=REPLACE_KEY_ENTRY, hint=""))
         options.append(Option(value=REMOVE_ENDPOINT_ENTRY, hint=""))
-    choice = _c._menu(session, f"model & endpoint — {current} · {model}", options, allow_filter=False)
+    choice = _c._menu(session, f"model & endpoint - {current}, {model}", options, allow_filter=False)
     if not choice:
         llm = session.config.get("llm", {})
         session._print(f"model      {llm.get('model', '?')}")
@@ -666,7 +666,7 @@ def _model_command(session: "ConsoleSession", parts: list[str]) -> bool:
     # Endpoint management and the <url> [key] [model] add-form reuse the
     # internal _c._connect flow; only a URL (or a management subcommand)
     # belongs there.
-    if first in ("list", "show", "remove", "forget", "delete", "rm", "key", "keys") or "://" in first:
+    if first in ("list", "remove", "key") or "://" in first:
         return _c._connect(session, parts)
     saved = known_endpoints().get(first)
     if saved:

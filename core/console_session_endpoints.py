@@ -81,20 +81,6 @@ class EndpointsMixin:
             except Exception:
                 pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
 
-    def show_reasoning(self: "ConsoleSession") -> None:
-        effort = self.config.get("llm", {}).get("reasoning_effort")
-        current = effort or "off"
-        options = " ".join(
-            f"[{e}]" if e == effort else e for e in REASONING_EFFORTS
-        )
-        self._print(f"  reasoning  {current}   {self.style.dim(options + '  off')}")
-        self._print(
-            self.style.dim(
-                "  higher means more thorough and slower; ignored by models "
-                "that do not reason"
-            )
-        )
-
     @property
     def endpoint_name(self: "ConsoleSession") -> str:
         """Which saved endpoint the current base URL belongs to, if any."""

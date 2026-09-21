@@ -110,7 +110,7 @@ def test_write_resets_repeat_blockers(tmp_path) -> None:
 
 def test_abort_mid_run(tmp_path) -> None:
     class _AbortingClient(_ScriptedBase):
-        def chat(self, messages, tools=None, on_delta=None):
+        def chat(self, messages, tools=None, on_delta=None, **kwargs):
             raise AbortError("interrupted by operator")
 
     loop, sandbox = _loop(_AbortingClient([]), tmp_path)
@@ -128,7 +128,7 @@ def test_abort_between_tools_fills_remaining_results(tmp_path) -> None:
             super().__init__([])
             self.asked = False
 
-        def chat(self, messages, tools=None, on_delta=None):
+        def chat(self, messages, tools=None, on_delta=None, **kwargs):
             from core.types import LLMResponse, ToolCall
 
             if not self.asked:
@@ -184,7 +184,7 @@ def test_usage_metrics_absorbed(tmp_path) -> None:
     from core.types import LLMResponse
 
     class _UsageClient(_ScriptedBase):
-        def chat(self, messages, tools=None, on_delta=None):
+        def chat(self, messages, tools=None, on_delta=None, **kwargs):
             return LLMResponse(content="ok", usage={"prompt_tokens": 10, "completion_tokens": 5})
 
     loop, sandbox = _loop(_UsageClient(), tmp_path)
@@ -235,7 +235,7 @@ class _ScriptedBase:
     def received_messages(self):
         return self._inner.received_messages
 
-    def chat(self, messages, tools=None, on_delta=None):
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
         return self._inner.chat(messages, tools=tools, on_delta=on_delta)
 
 
@@ -246,7 +246,7 @@ def _script_client(*responses):
 class _NeverFinal(_ScriptedBase):
     """Always asks for a tool; never returns a final answer."""
 
-    def chat(self, messages, tools=None, on_delta=None):
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
         from core.types import LLMResponse, ToolCall
 
         self._inner.received_messages.append(list(messages))

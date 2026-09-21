@@ -53,7 +53,7 @@ class ReshapeContractTest(unittest.TestCase):
         # collapsing a blank-line run here would put the model's view of the
         # file out of step with the file itself.
         source = "\n".join(["def f():", "", "", "    return 1", "    return 1", "    return 1"])
-        for tool in ("read_file", "search_code", "find_file", "git_diff", "list_dir", "query_tree"):
+        for tool in ("read_file", "search_code", "find_file", "git_diff", "list_dir"):
             self.assertEqual(
                 reshape(tool, source, max_chars=10**6), source,
                 f"{tool} output was rewritten",
@@ -292,7 +292,7 @@ class _DigestAwareLLM:
         self.digest_calls = 0
         self.received: list[list[dict]] = []
 
-    def chat(self, messages, tools=None, on_delta=None):
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
         import copy
 
         self.received.append(copy.deepcopy(messages))
@@ -371,7 +371,7 @@ class EvictionDigestTest(unittest.TestCase):
         from core.agent.exceptions import LLMError
 
         class _FailingDigest(_DigestAwareLLM):
-            def chat(self, messages, tools=None, on_delta=None):
+            def chat(self, messages, tools=None, on_delta=None, **kwargs):
                 first = messages[0] if messages else {}
                 if len(messages) == 1 and "Summarise the conversation turns below" in str(
                     first.get("content")

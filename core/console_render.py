@@ -61,6 +61,19 @@ def _sanitize_output(text: str) -> str:
     return _ANSI_SANITIZE_RE.sub("", text)
 
 
+def operator_line(style: "Style", text: str, stamp: str = "") -> str:
+    """One operator line, rendered identically live and on replay.
+
+    The live submit passes the send time for the chip; a resumed session
+    has no per-message timestamp, so the replay passes none rather than
+    fabricating one. The accent colour with no "you" word is the shared
+    marker - the label the live surface deliberately does not show.
+    """
+    body = _sanitize_output(text)
+    chip = f"\033[2m\033[{theme.CHIP_BG}m{stamp}\033[0m " if stamp else ""
+    return chip + style._wrap(theme.BLOOD, body)
+
+
 def _safe_stdout(text: str) -> None:
     """Write model-generated text that must not crash on a narrow console.
 

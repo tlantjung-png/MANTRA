@@ -35,25 +35,18 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # reader can find one without scanning the whole list.
 HELP_TEXT = """Commands:
   /approve              set approval mode (yolo is the default: yolo|default|auto|plan)
-  /clear                clear conversation (/reset is an alias)
+  /clear                clear conversation
   /compact              summarise conversation
   /cost                 show token usage
   /diff                 show uncommitted changes
   /exit                 exit (Ctrl+C)
-  /export [path]        save the conversation to .md or .json
-  /fix                  send the last failure to the agent for a fix
-  /goal <text>          set session goal (/goal note, /goal done)
   /help                 show help
-  /mcp                  external tool servers — list, /mcp enable|disable <name>
-  /memory               show memory file
-  /model                provider & model — add endpoint, pick a model, replace key
-  /sessions             saved conversations — browse and resume
-  /skills <name>        attach skill — /skills + space, Tab filter
+  /mcp                  external tool servers: list, /mcp tools <server>
+  /model                provider & model: add endpoint, pick a model, replace key
+  /sessions             saved conversations: browse and resume
+  /skills <name>        attach skill; /skills + space, Tab filter
   /suggestions on|off   post-task next-step line (bare: show state)
-  /todo                 session checklist — /todo add|done|rm|clear
   /undo                 discard changes (confirm)
-  /verbose              toggle verbose
-  /workflow             run workflow (create|show|launch|remove)
   /workspace            show workspace path + files
   /                     same as /help
 
@@ -111,20 +104,13 @@ SLASH_COMMANDS = [
     ("/cost", "show usage"),
     ("/diff", "show changes"),
     ("/exit", "exit"),
-    ("/export", "save conversation to .md or .json"),
-    ("/fix", "send the last failure to the agent for a fix"),
-    ("/goal", "set goal"),
     ("/help", "show help"),
-    ("/mcp", "external tool servers — enable|disable <name>"),
-    ("/memory", "show memory"),
-    ("/model", "provider & model — add endpoint, pick a model, replace key"),
-    ("/sessions", "saved conversations — browse and resume"),
+    ("/mcp", "external tool servers: list, tools"),
+    ("/model", "provider & model: add endpoint, pick a model, replace key"),
+    ("/sessions", "saved conversations: browse and resume"),
     ("/skills", "attach skill"),
     ("/suggestions", "next-step suggestions on|off"),
-    ("/todo", "session checklist"),
     ("/undo", "discard changes"),
-    ("/verbose", "toggle verbose"),
-    ("/workflow", "run workflow"),
     ("/workspace", "show workspace"),
 ]
 

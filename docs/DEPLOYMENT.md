@@ -40,7 +40,7 @@ The console also maintains per-turn totals and displays them in the status area,
 
 ### Backup
 
-Persistent state to preserve includes the workspace directory, the user-wide settings document, the restricted credentials store, the session transcript directory, and the workflow definitions file. Each of these is a regular file or directory in the user home or workspace. Backup is performed via standard file copy while the system is idle. No additional services require backup. Stored credentials are plaintext protected only by file permissions, so backups of the home directory inherit that exposure.
+Persistent state to preserve includes the workspace directory, the user-wide settings document, the restricted credentials store, and the session transcript directory. Each of these is a regular file or directory in the user home or workspace. Backup is performed via standard file copy while the system is idle. No additional services require backup. Stored credentials are plaintext protected only by file permissions, so backups of the home directory inherit that exposure.
 
 ### Recovery
 

@@ -18,7 +18,7 @@ Project state is kept per workspace in a hidden directory and appended after eac
 
 ### Session Persistence and Resumption
 
-Automatically saved transcripts allow a session to be resumed after closing the window. Each transcript records version, name, timestamp, workspace, model, summary, totals, goals, and the full message list with per-message size caps. Transcripts are written atomically with restricted permissions, listed newest first, with corrupted files skipped, and unsafe names include a hash suffix with legacy fallback for older transcripts.
+Automatically saved transcripts allow a session to be resumed after closing the window. Each transcript records version, name, timestamp, workspace, model, summary, totals, and the full message list with per-message size caps. Transcripts are written atomically with restricted permissions, listed newest first, with corrupted files skipped, and unsafe names include a hash suffix with legacy fallback for older transcripts.
 
 ### Approval Policy
 

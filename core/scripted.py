@@ -18,7 +18,9 @@ class ScriptedLLMClient(LLMClient):
         self.script = list(script)
         self.received_messages: list[list[dict]] = []
 
-    def chat(self, messages, tools=None, on_delta=None) -> LLMResponse:
+    def chat(self, messages, tools=None, on_delta=None, **kwargs) -> LLMResponse:
+        # **kwargs absorbs the live client's should_abort/on_wait hooks: a
+        # scripted run has no network to wait on.
         self.received_messages.append(copy.deepcopy(messages))
         if not self.script:
             raise LLMError("scripted LLM exhausted before the run finished")
@@ -74,7 +76,7 @@ def streaming_client(content: str) -> ScriptedLLMClient:
     """
     response = LLMResponse(content=content)
 
-    def chat(self, messages, tools=None, on_delta=None):
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
         # Delegate to the real chat so the script queue is popped and
         # received_messages stays in sync with the streamed response.
         result = ScriptedLLMClient.chat(self, messages, tools=tools)

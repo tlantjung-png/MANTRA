@@ -27,23 +27,26 @@ if TYPE_CHECKING:
     from core.console import ConsoleSession
 
 def _skills(session: "ConsoleSession", argument: str) -> None:
-    """/skills — EASY: type "/skills " + Tab shows all, type to filter by name/type.
+    """/skills: one verb per action, plus a bare skill name as shorthand.
 
     Usage:
-      /skills              — list all
-      /skills <name>       — attach skill in 1 step (e.g. /skills tdd)
-      /skill is alias for /skills
+      /skills              list all
+      /skills <name>       attach in 1 step (e.g. /skills tdd)
+      /skills use <name>   the explicit attach form; a bare name that
+                          collides with a verb needs it
+      /skills show <name>  display a skill without attaching
+      /skills find <text>  search by name or description
+      /skills clear        detach everything
+      /skills all          attach every installed skill
+      /skills bundles      list bundles
+      /skills launch <b>   run a bundle's ordered steps
+      /skills auto on|off  routing without being asked
     """
     parts = argument.split() if argument else []
-    raw_head = parts[0] if parts else ""
-    head = raw_head.lower() if parts else ""
+    head = parts[0].lower() if parts else ""
     rest = " ".join(parts[1:]).strip()
-    # Friendly aliases so manual is forgiving. "run" is the use path: a
-    # bare skill name is a one-shot run, not a bundle launch.
-    alias = {"attach": "use", "detach": "clear", "ls": "list", "info": "show", "cat": "show", "rm": "clear", "search": "find", "route": "find", "run": "use", "apply": "use", "on": "use"}
-    head = alias.get(head, head)
 
-    if head in ("help", "?", "-h", "--help", "manual", "h"):
+    if head == "help":
         _skills_help(session)
     elif head == "":
         _skills_dashboard(session)
@@ -52,12 +55,13 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
     elif head == "show":
         _skills_show(session, rest)
     elif head == "use":
-        # Support "use all" / "use --all" for one-step bulk attach
-        if rest.lower() in ("all", "--all", "autoload", "autoloadall", "allskills", "autoloadallskill"):
+        # "use all" is the bulk attach; the bare "all" head is the same
+        # action under its own name.
+        if rest.lower() in ("all", "--all"):
             _skills_use_all(session)
         else:
             _skills_use(session, rest)
-    elif head in ("bundles", "bundle"):
+    elif head == "bundles":
         _skills_bundles(session)
     elif head == "launch":
         _c._skills_launch(session, rest)
@@ -65,18 +69,17 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
         _skills_find(session, rest)
     elif head == "auto":
         _skills_auto(session, rest)
-    elif head in ("all", "autoload", "autoloadall", "allskills", "autoloadallskill"):
-        # Direct one-step: /skills all → attach all
+    elif head == "all":
         _skills_use_all(session)
-    elif head in ("clear", "off", "drop"):
+    elif head == "clear":
         if session.active_skills:
             session._print(session.style.dim("  skills detached: " + ", ".join(session.active_skills)))
             session.active_skills = []
         else:
             session._print(session.style.dim("  no skills attached"))
     else:
-        # EASY: /skills <name> — attach in 1 step, no "use" needed
-        # e.g. /skills tdd  →  same as /skills use tdd
+        # A bare skill name attaches in 1 step; the explicit "use" form
+        # covers names that collide with a verb above.
         if skills.get(argument):
             _skills_use(session, argument)
             return
@@ -101,11 +104,17 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
 
 def _skills_help(session: "ConsoleSession") -> None:
     s = session.style
-    session._print(s.bold("  /skills — EASY"))
+    session._print(s.bold("  /skills"))
     session._print(s.dim("  Skills are reusable procedures that ride along with a turn."))
     session._print("")
-    session._print("    /skills              — list all")
-    session._print("    /skills <name>       — attach in 1 step  (e.g. /skills tdd)")
+    session._print("    /skills              - list all")
+    session._print("    /skills <name>       - attach in 1 step  (e.g. /skills tdd)")
+    session._print("    /skills use <name>   - explicit attach (for names that collide with a verb)")
+    session._print("    /skills show <name>  - display without attaching")
+    session._print("    /skills find <text>  - search by name or description")
+    session._print("    /skills clear        - detach everything")
+    session._print("    /skills bundles      - list bundles; /skills launch <bundle> runs one")
+    session._print("    /skills auto on|off  - routing without being asked")
     session._print("")
     session._print(s.dim("  type /skills + space, Tab shows all, type to filter by name/type"))
 
@@ -133,7 +142,7 @@ def _skills_list(session: "ConsoleSession") -> None:
         mark = "*" if skill.name.lower() in session.active_skills else " "
         session._print(f" {mark} {skill.name:<18} {session.style.dim(function)}")
     session._print("")
-    session._print(session.style.dim("  EASY: /skills <name> to attach  ·  type /skills + space, Tab to filter"))
+    session._print(session.style.dim("  /skills <name> to attach; type /skills + space, Tab to filter"))
 
 
 def _skills_show(session: "ConsoleSession", name: str) -> None:
@@ -156,7 +165,7 @@ def _skills_show(session: "ConsoleSession", name: str) -> None:
     if found.resources:
         meta.append("bundles " + ", ".join(found.resources))
     if meta:
-        session._print(session.style.dim("  " + " · ".join(meta)))
+        session._print(session.style.dim("  " + ", ".join(meta)))
     body = found.body.strip()
     if not body:
         session._print(session.style.dim("  (empty)"))
@@ -264,7 +273,7 @@ def _skills_use_all(session: "ConsoleSession") -> None:
         _warn_untrusted_skill(session, skills.get(k))
         session.active_skills.append(k)
     session._print(session.style.dim(f"  attached all {len(new)} skills: " + ", ".join(new)))
-    session._print(session.style.dim("  bundle auto is kept — /skills auto bundle on|off to change"))
+    session._print(session.style.dim("  bundle auto is kept - /skills auto bundle on|off to change"))
     session._print(session.style.dim("  /skills clear to detach all"))
 
 
@@ -330,7 +339,7 @@ def _skills_launch(
             session.active_skills = [skill.name.lower()]
             session._print("")
             session._print(
-                session.style.dim(f"  step {position} of {count}: {skill.name} — {skill.description}")
+                session.style.dim(f"  step {position} of {count}: {skill.name} - {skill.description}")
             )
             try:
                 if position == 1 and initial_text.strip():
@@ -380,7 +389,7 @@ def _skills_auto(session: "ConsoleSession", argument: str) -> None:
             session.style.dim("  off - skills are used only when you name them with /skills use")
         )
         session._print("")
-        session._print(session.style.dim("  /skills auto on|off · /skills auto bundle on|off"))
+        session._print(session.style.dim("  /skills auto on|off, /skills auto bundle on|off"))
         return
 
     if head == "bundle":
@@ -412,7 +421,7 @@ def _skills_auto(session: "ConsoleSession", argument: str) -> None:
 
 def _skills_find(session: "ConsoleSession", query: str) -> None:
     if not query:
-        session._print(session.style.dim("  usage: /skills <name>  — Tab shows all, type to filter"))
+        session._print(session.style.dim("  usage: /skills <name> - Tab shows all, type to filter"))
         return
     hits = skills.find(query)
     if not hits:
@@ -427,4 +436,4 @@ def _skills_find(session: "ConsoleSession", query: str) -> None:
             function = function[:57].rstrip() + "..."
         session._print(f"  {found.name:<18} {session.style.dim(function)}")
     session._print("")
-    session._print(session.style.dim("  EASY: /skills <name> to attach"))
+    session._print(session.style.dim("  /skills <name> to attach"))

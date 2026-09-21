@@ -1,6 +1,6 @@
 """Stale inter-process lock handling shared by the file-based stores.
 
-Settings, sessions, workflows, workspace memory, and the JSONL logger
+Settings, sessions, workspace memory, and the JSONL logger
 all arbitrate writers with an exclusive-create lock file and must all
 answer the same question the same way: when is an abandoned lock safe
 to remove? One definition here; each store keeps its own wait/stale

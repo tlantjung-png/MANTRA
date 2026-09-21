@@ -18,7 +18,7 @@ from typing import Any
 
 from core.types import Sandbox
 from core.types import Tool
-from core.tools.search import _SKIP_DIRS
+from core.tools.search import iter_workspace_files
 
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
@@ -370,23 +370,18 @@ class ReadFileTool(Tool):
             # Not found — did-you-mean
             if root is not None:
                 try:
-                    # substring match + levenshtein 2. Walk cost is bounded:
-                    # heavy directories (caches, dependencies) are skipped,
-                    # matching the search tool's behavior, and the walk is
-                    # capped so a miss on a huge repo cannot stall the turn.
+                    # substring match + levenshtein 2. The shared walk keeps
+                    # the suggestion inside the same confinement rules as
+                    # every other workspace scan (skip-dirs, ignore files,
+                    # symlink escapes) so a hint can never name a file the
+                    # read tools would refuse.
                     base = os.path.basename(path)
                     base_lower = base.lower()
                     candidates = []
-                    visited = 0
-                    for dirpath, dirnames, filenames in os.walk(root):
-                        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-                        visited += len(filenames)
-                        if visited > 20_000:
-                            break
-                        for fn in filenames:
-                            if base_lower in fn.lower() or _levenshtein(base_lower, fn.lower(), 2) <= 2:
-                                rel = os.path.relpath(os.path.join(dirpath, fn), root)
-                                candidates.append(rel)
+                    for rel, full in iter_workspace_files(root, max_scan=20_000):
+                        fn = os.path.basename(full)
+                        if base_lower in fn.lower() or _levenshtein(base_lower, fn.lower(), 2) <= 2:
+                            candidates.append(rel)
                         if len(candidates) >= 5:
                             break
                     if candidates:
@@ -569,8 +564,9 @@ class EditFileTool(Tool):
     name = "edit_file"
     description = (
         "Replace the first exact occurrence of old_string with new_string "
-        "in an existing file. The file must have been read this session; "
-        "the edit is rejected if the file changed since that read."
+        "in an existing file. Cheaper than write_file for large files, which "
+        "must be re-sent in full; the file must have been read this session, "
+        "and the edit is rejected if the file changed since that read."
     )
     parameters: dict[str, Any] = {
         "type": "object",

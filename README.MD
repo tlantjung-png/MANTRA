@@ -35,18 +35,14 @@ The console maintains a compact command surface, listed in full by the help comm
 
 - model: add or switch endpoints and models, manage stored credentials
 - sessions: browse, save, and resume conversations
-- fix: send the most recent failure back for diagnosis and a suggested fix
-- workspace and memory: show the workspace location, its files, and the durable memory file
+- workspace: show the workspace location and its files
 - diff and undo: show uncommitted changes or open the full-screen review, and discard changes after confirmation
 - approve: set the approval mode: yolo (the default), default, auto, or plan; the choice persists across sessions
 - cost: show token usage and cache metrics
 - compact: summarize a long conversation to free context
-- goal and todo: set a standing objective and manage a session checklist
-- workflow: create, show, launch, or remove ordered prompt sequences
-- skills: discover and attach skill procedures
-- verbose: toggle per-tool detail output
+- skills: discover and attach skill procedures, and launch bundles
+- mcp: inspect the configured external tool servers
 - suggestions: toggle the follow-up next-step line shown after each reply
-- export: write the conversation to a Markdown or JSON file under an allowed directory
 - clear: clear the conversation; files are kept
 - exit: leave the console; autosaves first
 
@@ -87,11 +83,10 @@ Run the offline suite, which needs no network or credentials. It covers the agen
 
 ## Workspace Reading Tools
 
-Beyond the file and command tools, the agent has three bounded helpers for reading the workspace without streaming raw bytes into the conversation:
+Beyond the file and command tools, the agent has two bounded helpers for reading the workspace without streaming raw bytes into the conversation:
 
-- search_code and find_file: literal substring search across workspace text files, and filename substring search. The walk honors ignore files, never descends into ignored or symlinked-out directories, skips files above five hundred kilobytes and non-text extensions, and notes when result or scan ceilings are reached.
+- search_code and find_file: literal substring search across workspace text files, and filename substring search. One shared bounded walk honors ignore files, never descends into ignored or symlinked-out directories, skips files above five hundred kilobytes and non-text extensions, and notes when result or scan ceilings are reached.
 - extract_document: reads a single structured file and returns a bounded plain-text representation for common formats such as markup, JSON, XML, CSV, markdown, and ini-like configuration. Formats it cannot render are reported as a note instead of being silently parsed; malformed structured files fall back to a short raw snippet.
-- query_tree: a small tree-pattern query for file-tree structure: literal paths, simple globs, and a tiny brace-style shape syntax. A navigation aid, not a code-query engine.
 
 ## Documentation Map
 

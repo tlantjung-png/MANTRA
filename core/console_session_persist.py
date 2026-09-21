@@ -19,7 +19,7 @@ import time
 
 import core.agent.sessions as sessions
 from core.console_common import PROJECT_ROOT, private_write
-from core.console_render import _sanitize_output, render_markdown
+from core.console_render import _sanitize_output, operator_line, render_markdown
 from core.tools.ledger import _CASE_INSENSITIVE as _CASE_INSENSITIVE_FS
 from core.tui.overlays import Option
 
@@ -207,8 +207,6 @@ class PersistenceMixin:
                 "model": self.model_name(),
                 "summary": sessions._summarise(self.context.messages),
                 "totals": self.totals,
-                "goal": self.goal,
-                "goal_notes": self.goal_notes,
                 "todos": self.todos,
                 "messages": self.context.messages,
                 "show_tool_output": self._show_tool_output,
@@ -257,14 +255,8 @@ class PersistenceMixin:
         self.message_count = sum(
             1 for m in messages if isinstance(m, dict) and m.get("role") == "user"
         )
-        # The goal travels with the conversation: resuming a session to
-        # finish something and finding the objective gone defeats the
-        # point of resuming it.
-        self.goal = str(data.get("goal") or "")
-        notes = data.get("goal_notes")
-        self.goal_notes = [str(n) for n in notes] if isinstance(notes, list) else []
-        # The todo checklist travels with the conversation too: resuming
-        # a session to finish a multi-part task and finding its list
+        # The todo checklist travels with the conversation: resuming a
+        # session to finish a multi-part task and finding its list
         # wiped would scatter the remaining work.
         saved_todos = data.get("todos")
         self.todos = []
@@ -322,16 +314,22 @@ class PersistenceMixin:
             if role == "user":
                 text = content if isinstance(content, str) else str(content or "")
                 if text.strip():
-                    self._print(f"{self.style.ash('you')} {_sanitize_output(text)}")
+                    # The live echo: accent text, no "you" label, and no
+                    # stamp (a replay has no send time to show).
+                    self._print(operator_line(self.style, text))
                 else:
-                    self._print(f"{self.style.ash('you')} (empty)")
+                    self._print(operator_line(self.style, "(empty)"))
             elif role == "assistant":
                 # Assistant may have null content + tool_calls — render body as markdown.
                 # Model-controlled text is sanitized exactly like the live
                 # reply paths: saved output must not drive the terminal.
                 if isinstance(content, str) and content.strip():
-                    self._print(f"{self.style.brand('ENCHANTER')}")
-                    self._print(render_markdown(_sanitize_output(content), self.style))
+                    # Header inline before the rendered reply, exactly
+                    # where the live stream puts it.
+                    self._print(
+                        f"{self.style.brand('ENCHANTER')} "
+                        + render_markdown(_sanitize_output(content), self.style)
+                    )
                 elif msg.get("tool_calls"):
                     calls = ", ".join((c.get("function") or {}).get("name", "?") for c in msg.get("tool_calls") or [])
                     self._print(f"{self.style.brand('ENCHANTER')} [called {calls}]")

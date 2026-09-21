@@ -615,7 +615,7 @@ class AppIntegrationTest(unittest.TestCase):
         from core.scripted import LLMResponse, ScriptedLLMClient
 
         class _Slow(ScriptedLLMClient):
-            def chat(self, messages, tools=None, on_delta=None):
+            def chat(self, messages, tools=None, on_delta=None, **kwargs):
                 response = LLMResponse(content="one two three four five six seven eight")
                 if on_delta:
                     for word in response.content.split(" "):
@@ -660,7 +660,7 @@ class AppIntegrationTest(unittest.TestCase):
         from core.scripted import LLMResponse, ScriptedLLMClient
 
         class _Thinking(ScriptedLLMClient):
-            def chat(self, messages, tools=None, on_delta=None):
+            def chat(self, messages, tools=None, on_delta=None, **kwargs):
                 time.sleep(0.6)  # model "thinks" before the first token
                 response = LLMResponse(content="hello there world")
                 if on_delta:

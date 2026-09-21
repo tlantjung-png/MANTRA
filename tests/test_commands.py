@@ -4,8 +4,9 @@ Four rules this file exists to hold in place:
 
 * every command with children opens a menu, rather than asking the
   operator to remember and type a name or a number;
-* ``/reasoning`` is folded into ``/model``, because effort is a property
-  of the model and not a separate setting to keep in step;
+* one name per action: ``/reasoning``/``/effort``, ``/skill``, ``/reset``,
+  ``/export``, ``/fix``, ``/verbose``, ``/workflow`` and ``/memory`` are
+  gone rather than kept as aliases of something that already exists;
 * ``/provider`` is gone - there are no built-in endpoints, and
   setup happens through ``/model`` (which absorbed ``/connect``);
 * what the user adds lives in one hand-editable file.
@@ -75,10 +76,15 @@ class NoBuiltinsTest(unittest.TestCase):
     def test_provider_is_not_in_the_help_text(self):
         self.assertNotIn("/provider", console.HELP_TEXT)
 
-    def test_reasoning_is_not_offered_as_its_own_command(self):
-        # It still works as an alias, but it must not be advertised:
-        # advertising two commands for one choice is how they drift.
+    def test_reasoning_is_gone_entirely(self):
+        # Effort is a property of the model: /model is the one door, and
+        # the old aliases are unknown commands rather than shadow doors.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            dispatch(_session(tempfile.mkdtemp(prefix="mantra-cmd-")), "/reasoning high")
+        self.assertIn("unknown command", buf.getvalue())
         self.assertFalse(any(c == "/reasoning" for c, _ in SLASH_COMMANDS))
+        self.assertNotIn("/reasoning", console.HELP_TEXT)
 
     def test_commands_are_offered_alphabetically(self):
         # The advertised list is alphabetical so a command can be found
@@ -128,17 +134,6 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
     def test_bare_model_opens_a_menu(self):
         with mock.patch.object(console, "fetch_models", return_value=["gpt-4o"]):
             menu, _ = self._run("/model")
-        menu.assert_called_once()
-
-    def test_bare_reasoning_opens_the_model_menu(self):
-        with mock.patch.object(console, "fetch_models", return_value=["o3-mini"]):
-            menu, _ = self._run("/reasoning")
-        menu.assert_called_once()
-        self.assertIn("model", menu.call_args[0][1].lower())
-
-    def test_effort_alias_opens_the_model_menu(self):
-        with mock.patch.object(console, "fetch_models", return_value=["o3-mini"]):
-            menu, _ = self._run("/effort")
         menu.assert_called_once()
 
     def test_bare_model_opens_the_master_menu(self):
@@ -218,8 +213,8 @@ class MenuCommandsTest(TempSettings, unittest.TestCase):
         self.assertEqual(llm["reasoning_effort"], "low")
 
 
-class ReasoningMergeTest(TempSettings, unittest.TestCase):
-    """Reasoning is chosen with the model, not after it."""
+class ReasoningIsAModelPropertyTest(TempSettings, unittest.TestCase):
+    """Reasoning is chosen with the model; there is no second command."""
 
     def setUp(self):
         TempSettings.setUp(self)
@@ -229,18 +224,6 @@ class ReasoningMergeTest(TempSettings, unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.workspace, True)
         self.session = _session(self.workspace)
 
-    def test_reasoning_without_an_argument_routes_to_the_model_menu(self):
-        with mock.patch.object(console, "fetch_models", return_value=["o3-mini"]), \
-             mock.patch.object(console, "_choose_model", return_value=True) as pick:
-            with redirect_stdout(io.StringIO()):
-                dispatch(self.session, "/reasoning")
-        pick.assert_called_once_with(self.session)
-
-    def test_reasoning_with_an_argument_still_sets_it_directly(self):
-        with redirect_stdout(io.StringIO()):
-            dispatch(self.session, "/reasoning high")
-        self.assertEqual(self.session.config["llm"]["reasoning_effort"], "high")
-
     def test_a_plain_model_clears_the_effort_set_for_another(self):
         # Otherwise the next request carries a field chosen for a model
         # that no longer has anything to do with it.
@@ -248,16 +231,6 @@ class ReasoningMergeTest(TempSettings, unittest.TestCase):
             dispatch(self.session, "/model o3-mini high")
             dispatch(self.session, "/model gpt-4o")
         self.assertIsNone(self.session.config["llm"]["reasoning_effort"])
-
-    def test_reasoning_shows_itself_when_the_menu_cannot_open(self):
-        # A piped run has no terminal; it must fall back to printing
-        # rather than to silence.
-        with mock.patch.object(console, "fetch_models", return_value=[]), \
-             mock.patch.object(console, "_menu", return_value=None):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                dispatch(self.session, "/reasoning")
-        self.assertIn("reasoning", buf.getvalue())
 
 
 class HandEditableConfigTest(TempSettings, unittest.TestCase):
@@ -318,12 +291,64 @@ class HandEditableConfigTest(TempSettings, unittest.TestCase):
         self.assertEqual(self.session.config["llm"]["model"], "m1")
 
 
-class RedundantCommandCleanupTest(unittest.TestCase):
-    """Merged and removed commands stay merged and removed.
+class NoArgumentCommandsTest(unittest.TestCase):
+    """/workspace /compact /undo /diff take no arguments.
 
-    /clear and /reset were two bodies for one action; /paste was
-    superseded by the multiline composer (Shift+Enter, bracketed paste);
-    /skill is a hidden alias of /skills like /quit is of /exit.
+    A stray argument used to vanish without a word, so ``/diff --stat``
+    looked like it had done something. The commands now say so and run
+    nothing.
+    """
+
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="mantra-noarg-")
+        self.addCleanup(__import__("shutil").rmtree, self.workspace, True)
+        self.session = _session(self.workspace)
+
+    def _run(self, line):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            dispatch(self.session, line)
+        return buf.getvalue()
+
+    def test_workspace_with_an_argument_says_so_and_runs_nothing(self):
+        with mock.patch.object(self.session, "show_workspace") as shown:
+            out = self._run("/workspace src")
+        shown.assert_not_called()
+        self.assertIn("no arguments", out)
+
+    def test_compact_with_an_argument_says_so_and_runs_nothing(self):
+        with mock.patch.object(self.session, "compact", return_value=True) as compact:
+            out = self._run("/compact now")
+        compact.assert_not_called()
+        self.assertIn("no arguments", out)
+
+    def test_undo_with_an_argument_says_so_and_runs_nothing(self):
+        with mock.patch.object(self.session, "undo_changes") as undo:
+            out = self._run("/undo everything")
+        undo.assert_not_called()
+        self.assertIn("no arguments", out)
+
+    def test_diff_with_an_argument_says_so_and_runs_nothing(self):
+        with mock.patch.object(console, "_diff") as diff:
+            out = self._run("/diff --stat")
+        diff.assert_not_called()
+        self.assertIn("no arguments", out)
+
+    def test_bare_forms_still_run(self):
+        with mock.patch.object(self.session, "show_workspace") as shown:
+            self._run("/workspace")
+        shown.assert_called_once()
+
+
+class RedundantCommandCleanupTest(unittest.TestCase):
+    """Removed commands stay removed.
+
+    /paste was superseded by the multiline composer (Shift+Enter,
+    bracketed paste). /reset and /skill were hidden aliases, then fully
+    removed: one name per action. /export, /fix, /verbose, /workflow and
+    /memory each duplicated something the harness already does -
+    autosave, typing the request, Ctrl+O, skill bundles, and opening the
+    file - so they are unknown commands now, not aliases.
     """
 
     def setUp(self):
@@ -331,24 +356,24 @@ class RedundantCommandCleanupTest(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.workspace, True)
         self.session = _session(self.workspace)
 
-    def test_reset_still_works_as_a_hidden_alias(self):
-        self.session.context.seed("sys", "task")
-        self.session.context.append({"role": "user", "content": "hi"})
-        self.session.goal = "remember this"
-        self.assertEqual(len(self.session.context.messages), 3)
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            dispatch(self.session, "/reset")
-        # Same semantics as /clear: system prompt only, goal gone.
-        self.assertEqual(len(self.session.context.messages), 1)
-        self.assertEqual(self.session.context.messages[0]["role"], "system")
-        self.assertEqual(self.session.goal, "")
-        self.assertIn("cleared", buf.getvalue())
-
-    def test_reset_is_not_advertised(self):
-        self.assertFalse(any(c == "/reset" for c, _ in SLASH_COMMANDS))
-        # No help line of its own (an alias mention inside /clear is fine).
-        self.assertFalse(any(line.strip().startswith("/reset") for line in console.HELP_TEXT.splitlines()))
+    def test_removed_commands_are_unknown(self):
+        # No help line may *start with* a removed command; a substring
+        # check would false-positive on /skill inside /skills.
+        help_starts = {
+            line.strip().split()[0]
+            for line in console.HELP_TEXT.splitlines()
+            if line.strip().startswith("/")
+        }
+        for cmd in (
+            "/export", "/fix", "/verbose", "/workflow", "/memory",
+            "/reasoning", "/effort", "/skill", "/reset",
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                dispatch(self.session, cmd)
+            self.assertIn("unknown command", buf.getvalue(), cmd)
+            self.assertFalse(any(c == cmd for c, _ in SLASH_COMMANDS), cmd)
+            self.assertNotIn(cmd, help_starts, cmd)
 
     def test_paste_is_gone(self):
         buf = io.StringIO()
@@ -357,13 +382,6 @@ class RedundantCommandCleanupTest(unittest.TestCase):
         self.assertIn("unknown command", buf.getvalue())
         self.assertFalse(any(c == "/paste" for c, _ in SLASH_COMMANDS))
         self.assertNotIn("/paste", console.HELP_TEXT)
-
-    def test_skill_alias_is_hidden_but_works(self):
-        with mock.patch.object(console, "_skills") as skills:
-            with redirect_stdout(io.StringIO()):
-                dispatch(self.session, "/skill tdd")
-        skills.assert_called_once_with(self.session, "tdd")
-        self.assertFalse(any(c == "/skill" for c, _ in SLASH_COMMANDS))
 
     def test_dashboard_steps_and_tools_are_gone(self):
         for cmd in ("/dashboard", "/dash", "/steps", "/tools"):

@@ -206,6 +206,109 @@ class AutosaveTest(SessionTestBase):
         self.assertEqual(sessions.latest()["summary"], "question 0")
 
 
+class ClearKeepsTheSavedSessionTest(SessionTestBase):
+    """/clear starts a new conversation without destroying the saved one.
+
+    Autosave reuses ``session_name`` for the life of a session. Clearing
+    the conversation while keeping the name made the next autosave
+    overwrite the old transcript, so the pre-clear conversation vanished
+    from disk and could no longer be resumed from /sessions.
+    """
+
+    def test_clear_releases_the_name_so_a_new_file_is_forked(self):
+        session = self._session()
+        session.context.messages = _messages()
+        session.autosave()
+        old_name = session.session_name
+        old_path = sessions._path(old_name)
+
+        from core.console import dispatch
+
+        with mock.patch.object(session, "_print"):
+            dispatch(session, "/clear")
+        self.assertEqual(session.session_name, "")
+
+        session.context.messages = _messages()
+        session.autosave()
+        self.assertNotEqual(session.session_name, old_name)
+        self.assertTrue(old_path.exists())
+        with open(old_path, encoding="utf-8") as handle:
+            self.assertIn("question 0", handle.read())
+
+    def test_the_cleared_conversation_is_itself_resumable(self):
+        session = self._session()
+        session.context.messages = _messages()
+        session.autosave()
+        with mock.patch.object(session, "_print"):
+            from core.console import dispatch
+
+            dispatch(session, "/clear")
+        session.context.messages = _messages()
+        session.autosave()
+        self.assertTrue(session.resume_session(session.session_name))
+
+
+class ResumeReplayFidelityTest(SessionTestBase):
+    """A resumed session replays the conversation as it looked live.
+
+    The live operator line is the send-time chip plus the text in the
+    accent colour, with no "you" word; the replay must render the same
+    line, minus a timestamp it does not have, rather than inventing a
+    label the live surface never showed.
+    """
+
+    def test_operator_lines_replay_without_the_you_label(self):
+        session = self._session()
+        session.context.messages = _messages()
+        session.autosave()
+        name = session.session_name
+
+        printed: list[str] = []
+        with mock.patch.object(session, "_print", side_effect=printed.append):
+            session.resume_session(name)
+        joined = "\n".join(str(p) for p in printed)
+        self.assertIn("question 0", joined)
+        self.assertNotIn("you", joined.lower().replace("your", ""))
+
+    def test_the_replayed_operator_line_is_the_live_formatter(self):
+        # One formatter, used by the live echo and the replay: the accent
+        # colour is the shared marker, and no stamp is fabricated.
+        from core.console_render import Style, operator_line
+
+        session = self._session()
+        line = operator_line(Style(enabled=True), "question 0")
+        self.assertIn("question 0", line)
+        self.assertNotIn("you", line.lower())
+        self.assertIn("38;5;204", line)
+
+    def test_the_live_echo_uses_the_same_line_with_a_stamp(self):
+        from core.console_render import Style, operator_line
+
+        session = self._session()
+        stamped = operator_line(Style(enabled=True), "question 0", stamp="18:13")
+        self.assertIn("18:13", stamped)
+        self.assertIn("question 0", stamped)
+        self.assertIn("38;5;204", stamped)
+
+    def test_the_replayed_assistant_reply_leads_with_the_header_inline(self):
+        # Live streams "ENCHANTER " immediately before the rendered
+        # reply; the replay must not drop the header onto its own line.
+        session = self._session()
+        session.context.messages = _messages()
+        session.autosave()
+        name = session.session_name
+
+        printed: list[str] = []
+        with mock.patch.object(session, "_print", side_effect=printed.append):
+            session.resume_session(name)
+        reply_lines = [str(p) for p in printed if "ENCHANTER" in str(p)]
+        self.assertTrue(reply_lines, "no assistant line replayed")
+        self.assertTrue(
+            any("answer 0" in line for line in reply_lines),
+            reply_lines,
+        )
+
+
 class ResumeTest(SessionTestBase):
     def test_resuming_restores_the_messages(self):
         session = self._session()

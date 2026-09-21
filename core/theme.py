@@ -21,6 +21,10 @@ ASH_ITAL  = "3;38;5;250"  # italics when the terminal honours SGR 3
 BLOOD      = "38;5;204"
 BLOOD_BOLD = "1;38;5;204"
 
+# The send-time chip behind the operator's own line: one shade darker
+# than the transcript background, dim text on top.
+CHIP_BG = "48;5;236"
+
 # --- semantic hues (distinct, professional) ---------------------------
 SAGE  = "38;5;114"        # code, additions, success — moss green
 EMBER = "38;5;203"        # errors, deletions — bright red

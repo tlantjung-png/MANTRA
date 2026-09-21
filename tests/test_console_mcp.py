@@ -1,4 +1,10 @@
-"""Tests for /mcp: inspect, enable, and disable configured servers."""
+"""Tests for /mcp: read-only inspection of the configured external tool
+servers.
+
+Runtime enable/disable was removed: starting a server rewrites the
+operator's config file, so that happens in the file, not from a chat
+command mid-session.
+"""
 
 from __future__ import annotations
 
@@ -20,18 +26,6 @@ from core.config import load_config  # noqa: E402
 from core.console import Style, _mcp, dispatch  # noqa: E402
 
 from _helpers import messages as _messages  # noqa: E402,F401 - keeps the house import shape
-
-
-class _FakeClient:
-    """Stand-in for a live stdio connection, so disable can be tested
-    without spawning a child process."""
-
-    def __init__(self, name: str):
-        self.name = name
-        self.closed = False
-
-    def close(self) -> None:
-        self.closed = True
 
 
 class _IsolatedSessionTest(unittest.TestCase):
@@ -128,113 +122,15 @@ class StatusTest(_IsolatedSessionTest):
             _mcp(self.session, "frobnicate")
         self.assertTrue(any("usage: /mcp" in str(line) for line in printed))
 
-
-class EnableTest(_IsolatedSessionTest):
-
-    def test_unknown_server_is_refused(self):
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "enable gamma")
-        self.assertTrue(any("no MCP server named 'gamma'" in str(line) for line in printed))
-
-    def test_failing_start_reports_and_stays_enabled(self):
-        self.session.config["mcp"]["servers"]["alpha"]["command"] = [
-            "definitely-not-a-real-binary-xyz"
-        ]
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "enable alpha")
-        joined = "\n".join(str(line) for line in printed)
-        self.assertIn("failed to start", joined)
-        self.assertIn("stays enabled", joined)
-        self.assertEqual(self.session.mcp_clients, [])
-
-    def test_successful_start_registers_tools_and_persists(self):
-        # A real child speaks the protocol: the harness's own MCP server
-        # answers initialize and tools/list, so enable exercises the
-        # full path against the same surface the console exposes.
-        self.session.config["mcp"]["servers"]["alpha"]["command"] = [
-            sys.executable, "-m", "core.mcp",
-            "--config", self.config_path,
-            "--workspace", self.tmp,
-        ]
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "enable alpha")
-        joined = "\n".join(str(line) for line in printed)
-        self.assertIn("connected", joined)
-        self.assertEqual(len(self.session.mcp_clients), 1)
-        self.assertTrue(
-            any(getattr(tool, "server_name", "") == "alpha" for tool in self.session.tools)
-        )
-        on_disk = json.load(open(self.config_path, encoding="utf-8"))
-        self.assertIs(on_disk["mcp"]["servers"]["alpha"]["enabled"], True)
-        # Everything else in the file survives the rewrite untouched.
-        self.assertEqual(on_disk["llm"]["provider"], "scripted")
-        self.assertIn("beta", on_disk["mcp"]["servers"])
-
-    def test_enable_twice_is_a_no_op(self):
-        class _Stub:
-            name = "alpha"
-
-            def close(self):
-                pass
-
-        self.session.mcp_clients.append(_Stub())
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "enable alpha")
-        joined = "\n".join(str(line) for line in printed)
-        self.assertIn("already running", joined)
-        self.assertEqual(len(self.session.mcp_clients), 1)
-
-
-class DisableTest(_IsolatedSessionTest):
-
-    def test_disable_stops_client_removes_tools_and_persists(self):
-        client = _FakeClient("alpha")
-        self.session.mcp_clients.append(client)
-        tool = type("T", (), {"name": "mcp__alpha__x", "server_name": "alpha"})()
-        keep = type("K", (), {"name": "read_file", "server_name": ""})()
-        self.session.tools.extend([tool, keep])
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "disable alpha")
-        self.assertTrue(client.closed)
-        self.assertEqual(self.session.mcp_clients, [])
-        self.assertNotIn(tool, self.session.tools)
-        self.assertIn(keep, self.session.tools)
-        self.assertIs(self.session.config["mcp"]["servers"]["alpha"]["enabled"], False)
-        on_disk = json.load(open(self.config_path, encoding="utf-8"))
-        self.assertIs(on_disk["mcp"]["servers"]["alpha"]["enabled"], False)
-
-    def test_disable_only_touches_the_named_server(self):
-        client = _FakeClient("alpha")
-        self.session.mcp_clients.append(client)
-        with mock.patch.object(self.session, "_print"):
-            _mcp(self.session, "disable beta")
-        self.assertFalse(client.closed)
-        self.assertEqual(len(self.session.mcp_clients), 1)
-        on_disk = json.load(open(self.config_path, encoding="utf-8"))
-        # alpha never carried an explicit flag; the rewrite must not add one.
-        self.assertIs(on_disk["mcp"]["servers"]["alpha"].get("enabled", True), True)
-
-    def test_disable_of_unknown_name_is_refused(self):
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "disable gamma")
-        self.assertTrue(any("no MCP server named 'gamma'" in str(line) for line in printed))
-
-    def test_disable_without_config_path_stays_in_memory(self):
-        self.session.config_path = None
-        client = _FakeClient("alpha")
-        self.session.mcp_clients.append(client)
-        printed: list[str] = []
-        with mock.patch.object(self.session, "_print", side_effect=printed.append):
-            _mcp(self.session, "disable alpha")
-        self.assertTrue(client.closed)
-        # The in-memory spec still flips even when nothing was saved.
-        self.assertIs(self.session.config["mcp"]["servers"]["alpha"]["enabled"], False)
+    def test_runtime_enable_and_disable_are_gone(self):
+        # Starting a server rewrites the config file; that is the
+        # operator's file to edit, not a chat command's to rewrite.
+        for sub in ("enable alpha", "disable alpha"):
+            printed: list[str] = []
+            with mock.patch.object(self.session, "_print", side_effect=printed.append):
+                _mcp(self.session, sub)
+            self.assertTrue(any("usage: /mcp" in str(line) for line in printed), sub)
+            self.assertEqual(self.session.mcp_clients, [])
 
 
 class ToolsTest(_IsolatedSessionTest):

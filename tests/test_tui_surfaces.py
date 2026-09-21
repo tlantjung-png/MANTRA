@@ -634,6 +634,26 @@ class WheelRoutingTest(_SurfaceTest):
         app.composer.consume_key("a")
         self.assertIsNone(app.composer._view_first, "typing did not re-anchor the view")
 
+    def test_input_debug_traces_every_event(self):
+        # MANTRA_INPUT_DEBUG turns on a ground-truth trace: an
+        # unreproducible "the wheel did X" report becomes a file that
+        # says exactly what the backend handed the app.
+        import core.tui.app as app_module
+
+        app, session, backend = _make_app([])
+        trace = os.path.join(self.tmp if hasattr(self, "tmp") else tempfile.mkdtemp(), "trace.log")
+        original = app_module._INPUT_DEBUG_PATH
+        app_module._INPUT_DEBUG_PATH = trace
+        try:
+            app.handle_event(Mouse("wheel", 64, 5, 5, frozenset()))
+            app.handle_event(Key("a"))
+        finally:
+            app_module._INPUT_DEBUG_PATH = original
+        with open(trace, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("wheel", text)
+        self.assertIn("'a'", text)
+
     def test_scrollbar_drag_moves_view_and_keeps_grab_point(self):
         # Pressing the thumb starts a drag; moving the pointer updates
         # the transcript offset through the exact inverse of the render

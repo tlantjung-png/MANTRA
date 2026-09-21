@@ -29,7 +29,6 @@ from core.agent.exceptions import AbortError, ConfigError, HarnessError
 from core.agent.keys import has_stored, mask, store as store_key, stored_keys  # noqa: F401
 from core.agent.models import fetch_models, is_reasoning_model  # noqa: F401 - seam patches target console.fetch_models
 import core.agent.skills as skills
-import core.agent.workflows as workflows  # noqa: F401
 from core.agent.settings import (
     active as get_active,
     add_endpoint,  # noqa: F401
@@ -118,12 +117,12 @@ from core.console_common import (  # noqa: F401
 # Completer (no seam patching; plain import).
 from core.console_completer import ConsoleCompleter  # noqa: F401
 
-# Session state split across focused mixins: mentions, goals/todos,
+# Session state split across focused mixins: mentions, todos,
 # usage/compaction, persistence, workspace inspection, endpoints. The
 # class below composes them; every method stays reachable as before.
 from core.console_boxes import BoxRenderingMixin  # noqa: F401
 from core.console_session_mentions import MentionsMixin  # noqa: F401
-from core.console_session_goals import GoalsTodosMixin  # noqa: F401
+from core.console_session_todos import TodosMixin  # noqa: F401
 from core.console_session_usage import UsageMixin  # noqa: F401
 from core.console_session_workspace import WorkspaceMixin  # noqa: F401
 from core.console_session_persist import PersistenceMixin  # noqa: F401
@@ -170,7 +169,7 @@ SYSTEM_PROMPT_CAP = 20_000
 # ------------------------------------------------------------------- session
 class ConsoleSession(
     MentionsMixin,
-    GoalsTodosMixin,
+    TodosMixin,
     UsageMixin,
     WorkspaceMixin,
     BoxRenderingMixin,
@@ -286,20 +285,11 @@ class ConsoleSession(
         # session up continues it instead of forking it.
         self.session_name = ""
         self._autosave_warned = False
-        # The standing objective, if the operator set one. Injected into
-        # every turn's system prompt, so an agent working across many
-        # turns keeps aiming at the same thing instead of drifting to
-        # whatever the last message asked for.
-        self.goal = ""
-        # Free-form notes the operator attached to the goal with
-        # /goal note <text>: constraints found along the way, decisions
-        # made. Shown with the goal so they are not re-litigated.
-        self.goal_notes: list[str] = []
-        # The session todo checklist (/todo). Discrete items the operator
-        # wants done, each kept open or done. Injected into every turn's
-        # system prompt like the goal, so an agent working over many
-        # turns can see what remains rather than losing the thread of a
-        # multi-part request.
+        # The session todo checklist. Discrete items the agent adds and
+        # checks off from inside the conversation (TODO ADD / TODO DONE
+        # lines in its reply). Injected into every turn's system prompt,
+        # so an agent working over many turns can see what remains
+        # rather than losing the thread of a multi-part request.
         self.todos: list[dict] = []  # [{"text": str, "done": bool}]
         # Reports the agent emitted on the turn in flight, already applied
         # inline as its reply streamed. The end-of-turn pass skips them so
@@ -315,7 +305,6 @@ class ConsoleSession(
         # turn inherits a procedure nobody asked for, and would stop the
         # router ever looking again.
         self.auto_attached: list[str] = []
-        self.last_error: str | None = None  # most recent failure, for /fix
         # True while a bundle is running its steps. A bundle step is a
         # turn like any other, but it is one the router must keep its
         # hands off: the step already knows which skill it wants.
@@ -431,36 +420,6 @@ class ConsoleSession(
         state = "on" if self._show_tool_output else "off"
         self._print(self.style.dim(f"  (tool output boxes {state} — ctrl+o to toggle)"))
 
-    def _capture_last_error(self, tool: str, observation: str) -> None:
-        """Keep the most recent failed tool/command result for /fix."""
-        text = observation.strip()
-        if text.startswith("ERROR"):
-            self.last_error = f"[{tool}] {text[:2000]}"
-            return
-        # run_command / shell_output observations begin with an exit_code
-        # line; a nonzero code is a failure worth fixing (grep's "no
-        # matches" and similar notes are explicitly not errors).
-        m = re.match(r"exit_code:\s*(\d+)([^\n]*)", text)
-        if m:
-            code = int(m.group(1))
-            if code != 0 and "not an error" not in m.group(2):
-                self.last_error = f"[{tool}] {text[:2000]}"
-
-    def _fix_prompt(self, hint: str = "") -> str | None:
-        """The agent prompt for the most recent failure, or None."""
-        if not self.last_error:
-            return None
-        prompt = (
-            "A tool or command failed in this workspace. Here is the failure:\n"
-            f"---\n{self.last_error}\n---\n"
-            "Diagnose the root cause and suggest a fix. Do NOT run any "
-            "command yourself - propose the exact command for the operator "
-            "to approve and run."
-        )
-        if hint:
-            prompt += f"\nAdditional hint from the operator: {hint}"
-        return prompt
-
     def _attention(self) -> None:
         """A soft terminal bell so a failed turn or a denial is noticed."""
         try:
@@ -478,10 +437,6 @@ class ConsoleSession(
         output, diffs and file contents the agent sees, not just the tool
         name. Ctrl+O (typed mid-run) hides or restores these boxes.
         """
-        # Remember the most recent failure for /fix, before the display
-        # filter: read_file errors matter as much as command failures.
-        if isinstance(observation, str) and observation.strip():
-            self._capture_last_error(tool, observation)
         # Turn-scoped evidence for the TUI's post-task suggestion engine:
         # it names the tools that ran and the artifacts they touched, so
         # the next-step rows follow the work that actually happened.
@@ -688,6 +643,15 @@ class ConsoleSession(
                 self._print(msg)
         elif name == "tool_denied":
             self._print(f"  {self.style._wrap(theme.EMBER, 'DENIED')} {self.style.dim(payload.get('tool','').upper())}")
+        elif name == "llm_rate_limited":
+            # The request is paused, not failed: say so, with how long
+            # this wait is and how long the turn has waited in total.
+            seconds = payload.get("seconds")
+            waited = payload.get("waited")
+            self._note(
+                f"rate limited - waiting {seconds}s"
+                + (f" (waited {waited}s so far)" if waited else "")
+            )
         elif name == "run_error":
             self._print(f"  {self.style._wrap(theme.EMBER, '!! ' + str(payload.get('error')))}")
         elif name == "tool_result":
@@ -833,12 +797,12 @@ class ConsoleSession(
     # ---- message handling ------------------------------------------------
 
     def _effective_system_prompt(self, request_text: str = "") -> str:
-        """The base prompt plus whatever the session is aiming at.
+        """The base prompt plus whatever the session is working through.
 
-        Rebuilt per turn rather than frozen at startup, because the goal
-        is set and cleared while the session is running. Appended rather
+        Rebuilt per turn rather than frozen at startup, because the
+        checklist changes while the session is running. Appended rather
         than spliced into the base so the standing instructions stay
-        intact when the goal changes. Re-applies total cap after additions.
+        intact. Re-applies total cap after additions.
         """
         prompt = self.system_prompt
         for name in self.active_skills:
@@ -858,47 +822,24 @@ class ConsoleSession(
         rel = relevant_memory(self.memory_path, request_text)
         if rel:
             prompt += "\n\n## Memory relevant to this request\n" + rel
-        if not self.goal and not self.todos:
+        if not self.todos:
             # Re-apply cap even when only skills were added
             if len(prompt) > SYSTEM_PROMPT_CAP:
                 prompt = _truncate_codepoint(prompt, SYSTEM_PROMPT_CAP) + "\n... [truncated — system prompt exceeded cap]"
             return prompt
         lines: list[str] = []
-        if self.goal:
-            lines += [
-                "",
-                "## Standing goal",
-                "The operator set this goal for the session. It outlives any",
-                "single message: work toward it on every turn, and treat the",
-                "current request as a step within it rather than a replacement.",
-                "",
-                f"Goal: {self.goal}",
-            ]
-            if self.goal_notes:
-                lines.append("")
-                lines.append("Notes recorded while working toward it:")
-                for note in self.goal_notes:
-                    lines.append(f"- {note}")
-            lines.append("")
-            lines.append(
-                "When the goal is fully met, say so plainly in your final "
-                "message and start it with GOAL COMPLETE so the operator can "
-                "clear it without checking by hand. Do not claim it is "
-                "complete until it actually is."
-            )
-        if self.todos:
-            lines += self._todos_prompt_lines()
+        lines += self._todos_prompt_lines()
         injected_block = "\n" + "\n".join(lines)
         base_len = len(prompt)
         prompt = prompt + injected_block
         if len(prompt) > SYSTEM_PROMPT_CAP:
             # Truncate on a code-point boundary so no multibyte char is
             # split mid-sequence.
-            prompt = _truncate_codepoint(prompt, SYSTEM_PROMPT_CAP) + "\n... [truncated — prompt exceeded cap after goal/todo injection]"
-            # The injected goal/todo block is the tail, so a cap hit can
+            prompt = _truncate_codepoint(prompt, SYSTEM_PROMPT_CAP) + "\n... [truncated — prompt exceeded cap after checklist injection]"
+            # The injected checklist block is the tail, so a cap hit can
             # drop it entirely; say so rather than losing it silently.
             if base_len >= SYSTEM_PROMPT_CAP:
-                self._note("goal/todo block dropped - system prompt over the total cap")
+                self._note("checklist block dropped - system prompt over the total cap")
         return prompt
 
     def _todos_prompt_lines(self) -> list[str]:
@@ -910,7 +851,7 @@ class ConsoleSession(
         """
         open_count = sum(1 for t in self.todos if not t["done"])
         state = "all done" if not open_count else f"{open_count} open"
-        lines = ["", "## Session todo list", f"The operator keeps a checklist of {state} item{'s' if open_count != 1 else ''} for this session:"]
+        lines = ["", "## Session todo list", f"The session keeps a checklist of {state} item{'s' if open_count != 1 else ''}:"]
         for item in self.todos:
             mark = " " if not item["done"] else "x"
             lines.append(f"- [{mark}] {item['text']}")
@@ -924,8 +865,7 @@ class ConsoleSession(
             "steps you are about to do anyway, and not busywork.",
             "When you finish an item, report it on its own line as",
             "TODO DONE: <the item's exact text> so it is checked off.",
-            "Never claim an item is done until it actually is, and never",
-            "remove or edit items - the operator owns the list.",
+            "Never claim an item is done until it actually is.",
         ]
         return lines
 
@@ -983,10 +923,9 @@ class ConsoleSession(
 
     def handle(self, text: str) -> RunResult | None:
         """Run one turn: expand mentions, route a skill, execute the agent
-        loop, and report the result (usage, memory, changes, todo/goal
+        loop, and report the result (usage, memory, changes, todo
         checks). Must run on the main thread outside the TUI; inside the
         TUI it runs on the app's worker thread instead."""
-        self.last_error = None  # a fresh turn starts clean for /fix
         self.last_reply = ""  # the finished turn's assistant reply (suggestion engine input)
         # Turn-scoped read-before-edit: a fresh turn must not inherit
         # what the previous turn had already read or edited.
@@ -1163,7 +1102,7 @@ class ConsoleSession(
         return result
 
     def _finish_turn_report(self, task: dict, result: "RunResult") -> None:
-        """Record usage and memory, report changes and goal/todo checks, save.
+        """Record usage and memory, report changes and todo checks, save.
 
         Runs only after the reply is fully on screen, so a session saved
         mid-turn can never be missing the assistant's last answer.
@@ -1171,7 +1110,6 @@ class ConsoleSession(
         self._record_usage(result)
         self._record_memory(task, result)
         self._report_changes()
-        self._check_goal_completion(result)
         self._check_todo_completion(result)
         # Attention: a failed turn or a denied approval is the
         # one thing that must not pass silently.
@@ -1273,7 +1211,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         return False
     parts = stripped.split(None, 1)
     # Strip trailing punctuation from the command token only - a period
-    # at the end of "/goal fix the bug." belongs to the argument.
+    # at the end of "/compact now." belongs to the argument.
     command = parts[0].lower().rstrip(".,;:!?)'\"`").strip("'\"`")
     # Also handle quoted commands like "/help" or '/help'
     command = command.rstrip(".,;:!?")
@@ -1295,46 +1233,29 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     if command in ("/help", "/"):
         session._print(HELP_TEXT)
     elif command == "/workspace":
-        session.show_workspace()
-    elif command == "/memory":
-        _memory(session)
+        _no_arg(session, "/workspace", argument, session.show_workspace)
     elif command == "/diff":
-        _diff(session)
-    elif command == "/fix":
-        _fix(session, argument)
+        _no_arg(session, "/diff", argument, lambda: _diff(session))
     elif command == "/undo":
-        session.undo_changes()
+        _no_arg(session, "/undo", argument, session.undo_changes)
     elif command == "/model":
         # One command for providers and models; /connect is gone so a
         # single name is advertised and nothing else drifts in.
         _model_command(session, argument.split())
-    elif command in ("/reasoning", "/effort"):
-        _reasoning(session, argument)
     elif command == "/approve":
         _approve(session, argument)
     elif command == "/cost":
-        _cost(session, argument)
+        _cost(session)
     elif command == "/compact":
-        _compact(session)
-    elif command in ("/clear", "/reset"):
+        _no_arg(session, "/compact", argument, lambda: _compact(session))
+    elif command == "/clear":
         _clear(session)
     elif command == "/sessions":
         _sessions(session, argument)
-    elif command == "/export":
-        _export(session, argument)
-    elif command == "/goal":
-        _goal(session, argument)
-    elif command == "/todo":
-        _todo(session, argument)
-    elif command == "/workflow":
-        _workflow(session, argument)
-    elif command in ("/skills", "/skill"):
+    elif command == "/skills":
         _skills(session, argument)
     elif command == "/mcp":
         _mcp(session, argument)
-    elif command == "/verbose":
-        session.verbose = not session.verbose
-        session._print(f"verbose {'on' if session.verbose else 'off'}")
     elif command == "/suggestions":
         _set_suggestions(session, argument)
     else:
@@ -1558,20 +1479,10 @@ from core.console_commands import (  # noqa: E402,F401
     _compact,
     _cost,
     _diff,
-    _export,
-    _fix,
-    _goal,
-    _memory,
     _mcp,
-    _reasoning,
+    _no_arg,
     _sessions,
     _set_suggestions,
-    _todo,
-    _workflow,
-    _workflow_create,
-    _workflow_launch,
-    _workflow_remove,
-    _workflow_show,
 )
 from core.console_model import (  # noqa: E402,F401
     ADD_ENDPOINT,

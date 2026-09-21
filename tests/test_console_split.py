@@ -53,10 +53,8 @@ class FacadeTest(_IsolatedSessionTest):
         for name in (
             # mentions
             "expand_mentions", "_resolve_mention", "_render_file", "_render_listing",
-            # goals and todos
-            "set_goal", "show_goal", "clear_goal", "add_goal_note",
-            "_check_goal_completion", "add_todo", "show_todos", "mark_todo_done",
-            "rm_todo", "clear_todos", "_check_todo_completion",
+            # todos (in-conversation reports only)
+            "_check_todo_completion",
             "_handle_stream_todo_report", "_apply_todo_report",
             # usage and compaction
             "_record_usage", "_usage_line", "_record_memory", "_report_changes",
@@ -68,7 +66,7 @@ class FacadeTest(_IsolatedSessionTest):
             "_git", "_git_ok", "show_workspace", "show_diff", "undo_changes",
             "show_cost",
             # endpoints
-            "set_model", "set_reasoning", "show_reasoning", "use_endpoint",
+            "set_model", "set_reasoning", "use_endpoint",
             "_warn_if_key_missing", "_warn_if_any_key_missing", "show_endpoints",
         ):
             self.assertTrue(hasattr(ConsoleSession, name), f"missing: {name}")
@@ -88,10 +86,13 @@ class FacadeTest(_IsolatedSessionTest):
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
         ]
-        self.session.set_goal("ship it")
-        self.assertEqual(self.session.goal, "ship it")
-        self.session.add_todo("one")
-        self.session.mark_todo_done("1")
+        # The todo mixin's live path is the agent's report: apply one
+        # and watch the checklist change.
+        self.session.todos = [{"text": "one", "done": False}]
+        self.session._check_todo_completion(
+            type("R", (), {"final_message": "TODO DONE: one"})()
+        )
+        self.assertEqual(self.session.todos[0]["done"], True)
         result = self.session.expand_mentions("no mentions here")
         self.assertEqual(result[0], "no mentions here")
         self.session.totals["tokens_in"] = 10

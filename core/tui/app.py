@@ -10,14 +10,17 @@ live the whole time.
 
 from __future__ import annotations
 
+import os
 import queue
 import re
+import tempfile
 import threading
 import time
 from typing import Any
 
 from core import theme
 from core.agent import sessions
+from core.console_render import operator_line
 from core.term import ansi_strip as strip_ansi, visible_len
 from core.tui.backend import Backend, Key, Mouse, Paste, Resize
 from core.tui.buffer import Renderer
@@ -104,6 +107,15 @@ SUGGESTION_LINGER = 45.0  # seconds the row stays before self-dismissing
 
 _WHEEL_UP = 64
 _WHEEL_DOWN = 65
+
+# Opt-in input-event trace: set MANTRA_INPUT_DEBUG=1 and every event the
+# backend hands the app is appended here, exactly as decoded. The tool
+# for "the wheel did X" reports that cannot be reproduced locally.
+_INPUT_DEBUG_PATH = (
+    os.path.join(tempfile.gettempdir(), "mantra-input-debug.log")
+    if os.environ.get("MANTRA_INPUT_DEBUG")
+    else None
+)
 # Ceiling for the completion dropdown's adaptive window: a dropdown is a
 # shortcut, not a file browser, so "it fits" is not reason enough to show
 # a hundred rows on a very tall terminal.
@@ -667,10 +679,11 @@ class TuiApp:
         # colour (the same hue as the wordmark and spinner, so "what I
         # typed" reads as one visual family). No "you" label: the chip
         # already marks the line as the operator's, and the bare word
-        # reads as chatter in a wall of tool output.
+        # reads as chatter in a wall of tool output. The same formatter
+        # renders the line when a session is resumed, so a loaded history
+        # looks like the conversation it saves.
         self.feed_output(
-            f"\033[2m\033[48;5;236m{stamp}\033[0m"
-            f" \033[38;5;204m{display_text}\033[0m\n"
+            operator_line(self.session.style, display_text, stamp=stamp) + "\n"
         )
         self.transcript.flush_partial()
         # Typing a prompt supersedes the suggestion row.
@@ -848,6 +861,16 @@ class TuiApp:
     # ── input routing ─────────────────────────────────────────
 
     def handle_event(self, event) -> None:
+        if _INPUT_DEBUG_PATH is not None:
+            # Opt-in ground truth for input-routing bugs: every event the
+            # backend hands the app, exactly as decoded, so a report like
+            # "the wheel scrolled the prompt box" can be told apart from
+            # "the wheel never arrived as a wheel event".
+            try:
+                with open(_INPUT_DEBUG_PATH, "a", encoding="utf-8") as handle:
+                    handle.write(f"{time.time():.3f} {event!r}\n")
+            except OSError:
+                pass  # a full disk must not take the interface down
         if isinstance(event, Resize):
             self._pending_resize = (event.cols, event.rows, time.monotonic())
             return
@@ -1695,9 +1718,6 @@ class TuiApp:
             f"{label('APPROVAL:')} {st._wrap(appr_color, approval)}",
             f"{label('CACHE:')} {st._wrap(theme.SAGE, rate)}",
         ]
-        if getattr(s, "last_error", None):
-            # A recent failure waits: /fix sends it to the agent.
-            parts.append(st._wrap(theme.EMBER, "[!] FIX"))
         return (" " + st._wrap(theme.HAIR, "·") + " ").join(parts)
 
     # ── full-screen diff review ─────────────────────────────

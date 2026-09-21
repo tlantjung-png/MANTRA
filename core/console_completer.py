@@ -1,7 +1,7 @@
 # Split out of core/console.py; import it from core.console, never from here.
 
 """Completion for the console: slash commands, @paths, models,
-skills, and workflows."""
+and skills."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import threading
 import time
 
 import core.agent.skills as skills
-import core.agent.workflows as workflows
 from core.agent.models import is_reasoning_model
 from core.agent.settings import endpoints as known_endpoints
 from core.console_common import (
@@ -140,16 +139,8 @@ class ConsoleCompleter:
         stripped = buffer.lstrip()
         if stripped.startswith("/model "):
             return self._complete_model(cursor, token)
-        if stripped.startswith("/skills") or stripped.startswith("/skill "):
+        if stripped.startswith("/skills"):
             c = self._complete_skills(buffer, start, cursor, token)
-            if c:
-                return c
-        if stripped.strip() in ("/skills", "/skill"):
-            c = self._complete_skills(buffer, start, cursor, token)
-            if c:
-                return c
-        if stripped.startswith("/workflow"):
-            c = self._complete_workflow(buffer, start, cursor, token)
             if c:
                 return c
         return None
@@ -242,30 +233,3 @@ class ConsoleCompleter:
             labels.append(f"{n}  {desc}" if desc else n)
         return Completion(items=ordered, start=start, end=cursor, labels=labels)
 
-    def _complete_workflow(self, buffer: str, start: int, cursor: int, token: str):
-        prefix = buffer[:start]
-        parts = prefix.strip().split()
-        if not parts or parts[0] != "/workflow":
-            return None
-        subcommands = ["list", "show", "create", "launch", "run", "start", "remove", "delete", "rm"]
-        workflow_names = [w["name"] for w in workflows.list_workflows()]
-        if len(parts) == 1:
-            candidates = subcommands + workflow_names
-            lowered = token.lower()
-            matches = [c for c in candidates if c.lower().startswith(lowered)]
-            if not matches and lowered:
-                matches = [c for c in candidates if lowered in c.lower()]
-            if not matches:
-                return None
-            return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-        elif len(parts) == 2:
-            sub = parts[1].lower()
-            if sub in ("show", "launch", "run", "start", "remove", "delete", "rm"):
-                lowered = token.lower()
-                matches = [n for n in workflow_names if n.lower().startswith(lowered)]
-                if not matches and lowered:
-                    matches = [n for n in workflow_names if lowered in n.lower()]
-                if not matches:
-                    return None
-                return Completion(items=matches[:50], start=start, end=cursor, labels=matches[:50])
-        return None

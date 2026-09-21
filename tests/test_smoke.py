@@ -230,7 +230,7 @@ class _MidToolCallFlaky(ScriptedLLMClient):
         super().__init__(script)
         self.fail_times = fail_times
 
-    def chat(self, messages, tools=None, on_delta=None):
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
         if self.fail_times > 0:
             self.fail_times -= 1
             raise LLMError(

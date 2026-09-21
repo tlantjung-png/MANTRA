@@ -62,6 +62,79 @@ def _load_ignore_matcher(root: str):
     return _ignored
 
 
+def iter_workspace_files(
+    root: str,
+    *,
+    max_scan: int = 3000,
+    skip_ext: frozenset[str] | set[str] = (),
+    max_file_bytes: int | None = None,
+    stats: dict | None = None,
+):
+    """Yield ``(rel, full)`` for workspace files under the shared confinement rules.
+
+    One implementation of the rules every workspace-scanning tool needs:
+    skip-dirs pruning, ignore-file matching, symlink-escape filtering, and
+    the scan ceiling. Filters apply before the ceiling is counted, so a
+    skipped file never consumes the budget - the same accounting the
+    search and find tools have always used. ``stats``, when given,
+    receives ``scanned`` (files yielded) and ``truncated`` (a further file
+    existed past the ceiling); it is filled even if the caller stops
+    early.
+    """
+    real_root = os.path.realpath(root)
+    ignored = _load_ignore_matcher(root)
+    scanned = 0
+    truncated = False
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            if ignored is not None:
+                rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+                prefix = "" if rel_dir == "." else rel_dir + "/"
+                dirnames[:] = [d for d in dirnames if not ignored(prefix + d, True)]
+            # A symlinked directory that resolves outside the workspace is
+            # never descended into.
+            kept = []
+            for d in dirnames:
+                full_dir = os.path.join(dirpath, d)
+                try:
+                    if os.path.islink(full_dir):
+                        real = os.path.realpath(full_dir)
+                        if not (real == real_root or real.startswith(real_root + os.sep)):
+                            continue
+                except OSError:
+                    continue
+                kept.append(d)
+            dirnames[:] = kept
+            for filename in filenames:
+                if skip_ext and os.path.splitext(filename)[1].lower() in skip_ext:
+                    continue
+                full = os.path.join(dirpath, filename)
+                try:
+                    if os.path.islink(full):
+                        real = os.path.realpath(full)
+                        if not (real == real_root or real.startswith(real_root + os.sep)):
+                            continue
+                    if max_file_bytes is not None and os.path.getsize(full) > max_file_bytes:
+                        continue
+                except OSError:
+                    continue
+                scanned += 1
+                if scanned > max_scan:
+                    truncated = True
+                    break
+                rel = os.path.relpath(full, root)
+                if ignored is not None and ignored(rel.replace(os.sep, "/"), False):
+                    continue
+                yield rel, full
+            if scanned > max_scan:
+                break
+    finally:
+        if stats is not None:
+            stats["scanned"] = scanned
+            stats["truncated"] = truncated
+
+
 def _normalize_grep_lines(lines: list[str]) -> list[str]:
     """Normalize shell-grep output into the tool's canonical path:line: text shape."""
     out: list[str] = []
@@ -115,57 +188,19 @@ class SearchCodeTool(Tool):
 
         hits: list[str] = []
         real_root = os.path.realpath(root)
-        ignored = _load_ignore_matcher(root)
-        scanned = 0
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            # Prevent descending into symlinked dirs that escape workspace
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-            # Honor gitignored directories so their contents are never
-            # scanned: files below are unreachable once the dir is pruned.
-            if ignored is not None:
-                rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
-                prefix = "" if rel_dir == "." else rel_dir + "/"
-                dirnames[:] = [d for d in dirnames if not ignored(prefix + d, True)]
-            # Filter symlinked dirs that point outside
-            filtered = []
-            for d in dirnames:
-                full_dir = os.path.join(dirpath, d)
-                try:
-                    if os.path.islink(full_dir):
-                        real = os.path.realpath(full_dir)
-                        if not (real == real_root or real.startswith(real_root + os.sep)):
-                            continue
-                except OSError:
-                    continue
-                filtered.append(d)
-            dirnames[:] = filtered
-            for filename in filenames:
-                if os.path.splitext(filename)[1].lower() in _SKIP_EXT:
-                    continue
-                full = os.path.join(dirpath, filename)
-                try:
-                    if os.path.islink(full):
-                        real = os.path.realpath(full)
-                        if not (real == real_root or real.startswith(real_root + os.sep)):
-                            continue
-                    if os.path.getsize(full) > _MAX_FILE_BYTES:
-                        continue
-                except OSError:
-                    continue
-                scanned += 1
-                if scanned > 3000:
-                    break
-                rel = os.path.relpath(full, root)
-                if ignored is not None and ignored(rel.replace(os.sep, "/"), False):
-                    continue
-                hits.extend(self._scan_file(full, rel, query, real_root))
-                if len(hits) >= _MAX_RESULTS:
-                    break
-            if len(hits) >= _MAX_RESULTS or scanned > 3000:
+        stats: dict = {}
+        for rel, full in iter_workspace_files(
+            root, skip_ext=_SKIP_EXT, max_file_bytes=_MAX_FILE_BYTES, stats=stats
+        ):
+            hits.extend(self._scan_file(full, rel, query, real_root))
+            if len(hits) >= _MAX_RESULTS:
                 break
         truncated_note = ""
-        if scanned > 3000:
-            truncated_note = f"\n... [truncated — scanned {scanned} files, ceiling reached; narrow the query or directory]"
+        if stats.get("truncated"):
+            truncated_note = (
+                f"\n... [truncated — scanned {stats.get('scanned')} files, "
+                "ceiling reached; narrow the query or directory]"
+            )
         if not hits:
             return "(no matches)" + truncated_note
         result = "\n".join(hits)
@@ -235,48 +270,13 @@ class FindFileTool(Tool):
             return "\n".join(_normalize_grep_lines(result.stdout.strip().splitlines()))[:20000] if result.stdout.strip() else "(no matches)"
 
         matches = []
-        real_root = os.path.realpath(root)
-        ignored = _load_ignore_matcher(root)
-        scanned = 0
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-            if ignored is not None:
-                rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
-                prefix = "" if rel_dir == "." else rel_dir + "/"
-                dirnames[:] = [d for d in dirnames if not ignored(prefix + d, True)]
-            filtered = []
-            for d in dirnames:
-                full_dir = os.path.join(dirpath, d)
-                try:
-                    if os.path.islink(full_dir):
-                        real = os.path.realpath(full_dir)
-                        if not (real == real_root or real.startswith(real_root + os.sep)):
-                            continue
-                except OSError:
-                    continue
-                filtered.append(d)
-            dirnames[:] = filtered
-            for filename in filenames:
-                full = os.path.join(dirpath, filename)
-                try:
-                    if os.path.islink(full):
-                        real = os.path.realpath(full)
-                        if not (real == real_root or real.startswith(real_root + os.sep)):
-                            continue
-                except OSError:
-                    continue
-                scanned += 1
-                if scanned > 3000:
-                    break
-                if ignored is not None and ignored(os.path.relpath(full, root).replace(os.sep, "/"), False):
-                    continue
-                if pattern in filename:
-                    matches.append(os.path.relpath(full, root))
-                    if len(matches) >= _MAX_RESULTS:
-                        return "\n".join(matches) + f"\n... [hit ceiling {_MAX_RESULTS} reached]"
-            if scanned > 3000:
-                break
+        stats: dict = {}
+        for rel, full in iter_workspace_files(root, stats=stats):
+            if pattern in os.path.basename(full):
+                matches.append(rel)
+                if len(matches) >= _MAX_RESULTS:
+                    return "\n".join(matches) + f"\n... [hit ceiling {_MAX_RESULTS} reached]"
         truncated = ""
-        if scanned > 3000:
-            truncated = f"\n... [truncated — scanned {scanned} files, ceiling reached]"
+        if stats.get("truncated"):
+            truncated = f"\n... [truncated — scanned {stats.get('scanned')} files, ceiling reached]"
         return ("\n".join(matches) or "(no matches)") + truncated

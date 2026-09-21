@@ -159,3 +159,165 @@ def test_keyless_hosts_tuple_shared() -> None:
 
 def test_keyless_schemeless_base_url() -> None:
     assert is_keyless_base_url("localhost:8000/v1") is True
+
+
+# ---------------------------------------------------------------- rate limits
+
+import urllib.error  # noqa: E402
+
+
+def _rate_limited_client(**kwargs):
+    from core.llm import OpenAICompatClient
+
+    params = dict(
+        model="test-model",
+        base_url="http://llm.invalid/v1",
+        api_key_env="MANTRA_TEST_429_KEY",
+        stream=False,
+        max_retries=1,
+        rate_limit_wait=60.0,
+    )
+    params.update(kwargs)
+    return OpenAICompatClient(**params)
+
+
+def _too_many_requests(retry_after: str | None = None, detail: str = "slow down") -> urllib.error.HTTPError:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return urllib.error.HTTPError(
+        "http://llm.invalid/v1/chat/completions", 429, "Too Many Requests", headers, None
+    )
+
+
+def _run_chat(client, side_effect, **chat_kwargs):
+    from unittest import mock
+
+    from core.types import LLMResponse
+
+    ok = LLMResponse(content="recovered")
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def flaky(body):
+        calls["n"] += 1
+        effect = side_effect(calls["n"]) if callable(side_effect) else side_effect
+        if isinstance(effect, BaseException):
+            raise effect
+        return ok
+
+    with mock.patch.dict("os.environ", {"MANTRA_TEST_429_KEY": "test-key"}):
+        with mock.patch.object(client, "_request", side_effect=flaky):
+            with mock.patch("core.llm.time.sleep", side_effect=sleeps.append):
+                result = client.chat(
+                    [{"role": "user", "content": "hi"}], **chat_kwargs
+                )
+    return result, calls, sleeps
+
+
+def test_429_waits_out_the_limit_instead_of_failing() -> None:
+    # The old behaviour spent all three retries inside the limited window
+    # and then failed the turn; a rate limit is a queue, not a failure.
+    client = _rate_limited_client(max_retries=1)
+    waits: list[tuple[float, float]] = []
+
+    def side(n):
+        return _too_many_requests(retry_after="1") if n < 3 else None
+
+    result, calls, sleeps = _run_chat(
+        client, side, on_wait=lambda seconds, waited: waits.append((seconds, waited))
+    )
+    assert result.content == "recovered"
+    assert calls["n"] == 3  # far past max_retries=1
+    assert waits == [(1.0, 1.0), (1.0, 2.0)]  # the server's Retry-After, honoured
+    assert sum(sleeps) == 2.0
+
+
+def test_429_without_retry_after_backs_off_exponentially() -> None:
+    client = _rate_limited_client()
+    waits: list[tuple[float, float]] = []
+
+    def side(n):
+        return _too_many_requests() if n < 4 else None
+
+    result, calls, _ = _run_chat(
+        client, side, on_wait=lambda seconds, waited: waits.append((seconds, waited))
+    )
+    assert result.content == "recovered"
+    assert [w[0] for w in waits] == [2.0, 4.0, 8.0]
+    assert [w[1] for w in waits] == [2.0, 6.0, 14.0]
+
+
+def test_429_backoff_is_capped() -> None:
+    client = _rate_limited_client(rate_limit_wait=10_000.0)
+    waits: list[float] = []
+
+    def side(n):
+        return _too_many_requests() if n < 8 else None
+
+    _run_chat(client, side, on_wait=lambda seconds, waited: waits.append(seconds))
+    assert waits == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+def test_429_gives_up_after_the_wait_budget() -> None:
+    client = _rate_limited_client(rate_limit_wait=3.0)
+    with pytest.raises(LLMError) as excinfo:
+        _run_chat(client, _too_many_requests(retry_after="5"))
+    assert "rate limited for more than 3s" in str(excinfo.value)
+
+
+def test_429_wait_is_abortable() -> None:
+    # Ctrl+C during a long wait ends the run; the operator is never held
+    # hostage by a patient retry loop.
+    client = _rate_limited_client(rate_limit_wait=600.0)
+    abort = {"stop": False}
+
+    def should_abort():
+        return abort["stop"]
+
+    def side(n):
+        if n == 1:
+            return _too_many_requests(retry_after="30")
+        abort["stop"] = True  # the operator hits Ctrl+C during the wait
+        return _too_many_requests(retry_after="30")
+
+    with pytest.raises(LLMError) as excinfo:
+        _run_chat(client, side, should_abort=should_abort)
+    assert "aborted while waiting for the rate limit" in str(excinfo.value)
+
+
+def test_429_wait_reports_progress() -> None:
+    client = _rate_limited_client()
+    waits: list[tuple[float, float]] = []
+
+    def side(n):
+        return _too_many_requests(retry_after="2") if n < 2 else None
+
+    _run_chat(client, side, on_wait=lambda seconds, waited: waits.append((seconds, waited)))
+    assert waits == [(2.0, 2.0)]
+
+
+def test_non_429_http_errors_still_fail_after_max_retries() -> None:
+    # The patient path is for rate limits only: a 500 keeps the bounded
+    # retry contract it always had.
+    client = _rate_limited_client(max_retries=2)
+    with pytest.raises(LLMError) as excinfo:
+        _run_chat(
+            client,
+            urllib.error.HTTPError(
+                "http://llm.invalid/v1/chat/completions", 500, "Server Error", {}, None
+            ),
+        )
+    assert "failed after 2 attempts" in str(excinfo.value)
+
+
+def test_retry_after_parsing() -> None:
+    from core.llm import parse_retry_after
+
+    assert parse_retry_after("30") == 30.0
+    assert parse_retry_after(" 12 ") == 12.0
+    assert parse_retry_after("") is None
+    assert parse_retry_after(None) is None
+    assert parse_retry_after("soon") is None
+    # An absurd ask is capped so one hostile header cannot hang a turn.
+    assert parse_retry_after("99999") == 300.0
+    # An HTTP-date in the past means retry now.
+    assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0

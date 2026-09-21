@@ -103,7 +103,7 @@ class WorkspaceMixin:
             return
         self._print("reverted" if self._git_ok("checkout", "--", ".") else "revert failed")
 
-    def show_cost(self: "ConsoleSession", compact: bool = False, as_json: bool = False) -> None:
+    def show_cost(self: "ConsoleSession") -> None:
         t = self.totals
         tokens_in = t['tokens_in']
         tokens_out = t['tokens_out']
@@ -115,27 +115,6 @@ class WorkspaceMixin:
         cache_rate = (cache_hit * 100 // tokens_in) if tokens_in > 0 else 0
         cache_saved = cache_hit // 2  # ~50% discount
         obs_saved = int(t.get("observation_saved", 0) or 0)
-
-        if as_json:
-            payload = {
-                "turns": t['turns'],
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "cache_hit": cache_hit,
-                "cache_rate": cache_rate,
-                "cache_saved": cache_saved,
-                "tool_errors": t['tool_errors'],
-                "context_tokens": context_tokens,
-                "context_chars": context_chars,
-                "observation_chars_saved": obs_saved,
-                "digest_turns": int(t.get("digest_turns", 0) or 0),
-                "digest_chars": int(t.get("digest_chars", 0) or 0),
-                "digest_failures": int(t.get("digest_failures", 0) or 0),
-            }
-            if self.turn_history:
-                payload["turn_history"] = self.turn_history[-10:]
-            self._print(json.dumps(payload, indent=2))
-            return
 
         self._print(f"turns        {t['turns']}")
         self._print(f"tokens in    {tokens_in}")
@@ -165,8 +144,8 @@ class WorkspaceMixin:
         if digest_failures > 0:
             self._print(f"digest fail {digest_failures} summariser call(s) failed")
         self._print(f"context      ~{context_tokens} tokens ({context_chars} chars)")
-        # Per-turn cache trend (last 5 turns) — skipped in compact mode.
-        if not compact and self.turn_history:
+        # Per-turn cache trend (last 5 turns).
+        if self.turn_history:
             recent = self.turn_history[-5:]
             self._print("")
             self._print("  turn  in      out     cached  rate")
