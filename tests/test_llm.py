@@ -10,17 +10,6 @@ from core.agent.exceptions import LLMError
 from core.llm import KEYLESS_HOSTS, is_keyless_base_url, parse_sse_stream
 
 
-def _sse(*chunks: str, done: bool = True) -> list[str]:
-    lines = []
-    for c in chunks:
-        lines.append(f"data: {json.dumps(c)}")
-        lines.append("")
-    if done:
-        lines.append("data: [DONE]")
-        lines.append("")
-    return lines
-
-
 def _sse_content(*pieces: str, done: bool = True) -> list[str]:
     lines = []
     for p in pieces:

@@ -714,5 +714,28 @@ class RootDiscoveryTest(unittest.TestCase):
         self.assertEqual([str(r) for r in skills.roots()], [custom])
 
 
+def test_every_shipped_skill_has_a_data_files_destination() -> None:
+    """A collapsed skills glob used to ship one SKILL.md in every wheel.
+
+    data-files installs by basename, so each skill needs its own destination
+    key. A newly added skill must not silently disappear from installed builds.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "pyproject.toml"), "r", encoding="utf-8") as handle:
+        manifest = handle.read()
+    assert "skills/*/SKILL.md" not in manifest
+    assert '"skills" = ["skills/INDEX.md"]' in manifest
+    directory = os.path.join(root, "skills")
+    names = [
+        name
+        for name in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, name, "SKILL.md"))
+    ]
+    assert names, "no shipped skills found"
+    for name in names:
+        expected = f'"skills/{name}" = ["skills/{name}/SKILL.md"]'
+        assert expected in manifest, f"missing wheel destination for skill {name!r}"
+
+
 if __name__ == "__main__":
     unittest.main()

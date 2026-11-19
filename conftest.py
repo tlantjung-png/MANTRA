@@ -11,6 +11,19 @@ import os
 import shutil
 import tempfile
 
+import pytest
+
+from core.sandbox import LocalSandbox
+
+
+@pytest.fixture()
+def sandbox(tmp_path) -> LocalSandbox:
+    """One bounded local sandbox per test, shared by the tool test modules."""
+    box = LocalSandbox(workspace_root=str(tmp_path))
+    box.setup({})
+    yield box
+    box.cleanup()
+
 # Module-level store outlives any single test; cleanup happens in
 # pytest_unconfigure.
 _store: str | None = None

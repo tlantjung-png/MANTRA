@@ -10,14 +10,6 @@ from core.agent.exceptions import SandboxError
 from core.sandbox import LocalSandbox, _filtered_env
 
 
-@pytest.fixture()
-def sandbox(tmp_path) -> LocalSandbox:
-    box = LocalSandbox(workspace_root=str(tmp_path))
-    box.setup({})
-    yield box
-    box.cleanup()
-
-
 def test_workspace_root_used(sandbox, tmp_path) -> None:
     assert os.path.realpath(sandbox.root) == os.path.realpath(str(tmp_path))
 

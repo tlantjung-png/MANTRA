@@ -20,7 +20,6 @@ from core.types import Sandbox
 from core.types import Tool
 
 from core.tools._htmltext import html_to_text as _shared_html_to_text
-from core.tools.search import _SHELL_META_RE
 
 _MAX_TEXT_BYTES = 500_000
 _MAX_TEXT_CHARS = 80_000
@@ -65,10 +64,6 @@ EXTRACTABLE_MIME_HINTS = {
 
 def _looks_extractable(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in EXTRACTABLE_MIME_HINTS
-
-
-def _has_glob(text: str) -> bool:
-    return "*" in text or "?" in text or ("[" in text and "]" in text)
 
 
 class ExtractDocumentTool(Tool):

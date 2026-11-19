@@ -15,10 +15,6 @@ from __future__ import annotations
 # Patchable seams: _menu, _read_multiline, _choose_model, _model_command.
 from core import console as _c
 
-import json
-import os
-import re
-
 from core.agent.approvals import MODES
 from core.mcp.client import MCPError
 from core.tui.overlays import Option

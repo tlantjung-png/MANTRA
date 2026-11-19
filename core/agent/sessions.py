@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from core.locking import break_stale_lock as _break_stale_lock_shared
+from core.locking import acquire_lock, release_lock
 
 _VERSION = 1
 _OVERRIDE_ENV = "MANTRA_SESSIONS"
@@ -156,27 +156,8 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
     # The lock is held across the whole build-and-write so no other
     # writer can slip a save in between read and replace.
     lock_path = target.with_suffix(target.suffix + ".lock")
-    if lock_path.exists():
-        _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-    acquired = False
-    lock_fd = None
-    start = time.monotonic()
-    while time.monotonic() - start < _LOCK_WAIT:
-        try:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            acquired = True
-            break
-        except FileExistsError:
-            time.sleep(0.02)
-            try:
-                if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE_SECONDS:
-                    _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-            except OSError:
-                pass
-        except OSError:
-            # Lock creation failed for a non-conflict reason: skip the save.
-            break
-    if not acquired:
+    lock_fd = acquire_lock(lock_path, _LOCK_WAIT, _LOCK_STALE_SECONDS)
+    if lock_fd is None:
         return None
     import tempfile
 
@@ -226,15 +207,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
                 os.unlink(tmp_name)
             except OSError:
                 pass
-        if acquired and lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        release_lock(lock_path, lock_fd)
 
 
 def _legacy_path(name: str) -> Path:

@@ -15,6 +15,7 @@ from core.agent.exceptions import AbortError, LLMError, SandboxError, ToolError
 from core.agent.context import DEFAULT_DIGEST_MAX_CHARS
 from core.agent.observations import DEFAULT_MAX_CHARS, reshape_observation
 from core.agent.repairs import canonical_command, repair_arguments, validate_arguments
+from core.messages import flatten_messages
 from core.types import EvaluationResult, Evaluator
 from core.types import LLMClient
 from core.types import Logger
@@ -850,28 +851,7 @@ def _safe_error_text(exc: Exception) -> str:
 
 def _render_evicted(messages: list[dict[str, Any]]) -> str:
     """Flatten evicted turns to plain text for the summariser."""
-    lines: list[str] = []
-    for message in messages:
-        role = message.get("role", "?")
-        content = message.get("content") or ""
-        if not isinstance(content, str):
-            content = str(content)
-        if role == "assistant" and message.get("tool_calls"):
-            names = ", ".join(
-                (call.get("function") or {}).get("name", "?")
-                for call in message["tool_calls"]
-                if isinstance(call, dict)
-            )
-            lines.append(f"assistant: [called {names}]")
-            if content:
-                lines.append(f"assistant: {content}")
-            continue
-        if role == "tool":
-            body = content if len(content) <= 300 else content[:300] + " ..."
-            lines.append(f"result of {message.get('name', 'tool')}: {body}")
-            continue
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
+    return flatten_messages(messages, tolerant=True)
 
 
 # The summariser is told to carry state forward rather than to narrate: a

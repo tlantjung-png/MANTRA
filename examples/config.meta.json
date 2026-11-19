@@ -19,7 +19,8 @@
     "run_command",
     "search_code",
     "find_file",
-    "git_diff"
+    "git_diff",
+    "prose_audit"
   ],
   "evaluator": {
     "type": "command",

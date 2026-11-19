@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 
 from core.tui.review import ReviewRow
+from core.tui.scroll import ScrollOffsetMixin
 
 
 @dataclass
@@ -26,7 +27,7 @@ class SessionEntry:
 
 
 @dataclass
-class SessionPanelState:
+class SessionPanelState(ScrollOffsetMixin):
     entries: list[SessionEntry]
     index: int = 0
     offset: int = 0
@@ -34,14 +35,6 @@ class SessionPanelState:
     @property
     def entry(self) -> SessionEntry | None:
         return self.entries[self.index] if self.entries else None
-
-    def clamp(self, total: int, viewport: int) -> None:
-        max_offset = max(0, total - max(1, viewport))
-        if self.offset > max_offset:
-            self.offset = max_offset
-
-    def step(self, delta: int, total: int, viewport: int) -> None:
-        self.offset = max(0, min(max(0, total - max(1, viewport)), self.offset + delta))
 
     def next(self, delta: int, total: int) -> None:
         if total:

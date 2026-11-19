@@ -648,12 +648,6 @@ class ReplyRenderingTest(unittest.TestCase):
         self.assertNotIn("1 STEPS", out)
 
 
-def _tty_stdin():
-    fake = mock.MagicMock()
-    fake.isatty.return_value = True
-    return fake
-
-
 class ToolObservationTest(unittest.TestCase):
     """Tool boxes: reads stay invisible (the STEP line names the file),
     and mutating/command observations are not double-printed."""

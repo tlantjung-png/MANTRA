@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from core.sandbox import LocalSandbox
 from core.tools.files import (
     EditFileTool,
     ListDirTool,
@@ -13,14 +12,6 @@ from core.tools.files import (
     _is_blocked_path_harness,
 )
 from core.tools.ledger import EditLedger
-
-
-@pytest.fixture()
-def sandbox(tmp_path) -> LocalSandbox:
-    box = LocalSandbox(workspace_root=str(tmp_path))
-    box.setup({})
-    yield box
-    box.cleanup()
 
 
 @pytest.fixture()

@@ -76,6 +76,37 @@ def _normalize_content(content: Any) -> str | None:
     raise LLMError(f"model content has unexpected type: {type(content).__name__}")
 
 
+def _read_response(response) -> str:
+    """Read a bounded response body as text, tolerating size-less reads."""
+    try:
+        raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
+    except TypeError:
+        # File-like responses (and test doubles) may expose a
+        # size-less read(); fall back to an unbounded read.
+        raw_bytes = response.read()
+    if len(raw_bytes) > _MAX_RESPONSE_BYTES:
+        raise LLMError("LLM response exceeds size cap")
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _parse_tool_arguments(raw: str, name: str) -> dict[str, Any]:
+    """Decode JSON tool arguments, repairing Windows-escaped paths once."""
+    try:
+        arguments = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        # Try quoted-escapes repair for Windows paths.
+        try:
+            from core.agent.repairs import repair_quoted_escapes_json_text
+
+            fixed = repair_quoted_escapes_json_text(raw or "{}")
+            arguments = json.loads(fixed)
+        except (json.JSONDecodeError, ValueError, TypeError, ImportError):
+            raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
+    if not isinstance(arguments, dict):
+        raise LLMError(f"tool arguments not an object for '{name}'")
+    return arguments
+
+
 def is_keyless_base_url(base_url: str) -> bool:
     """True when ``base_url`` points at a loopback/local endpoint."""
     base = (base_url or "").strip()
@@ -707,15 +738,7 @@ class OpenAICompatClient(LLMClient):
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - scheme validated in __init__
-                try:
-                    raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
-                except TypeError:
-                    # File-like responses (and test doubles) may expose a
-                    # size-less read(); fall back to an unbounded read.
-                    raw_bytes = response.read()
-                if len(raw_bytes) > _MAX_RESPONSE_BYTES:
-                    raise LLMError("LLM response exceeds size cap")
-                raw = raw_bytes.decode("utf-8", errors="replace")
+                raw = _read_response(response)
         except urllib.error.HTTPError as exc:
             return self._handle_http_error(exc, body)
         try:
@@ -760,19 +783,7 @@ class OpenAICompatClient(LLMClient):
             elif isinstance(args_raw, dict):
                 arguments = args_raw
             elif isinstance(args_raw, str):
-                try:
-                    arguments = json.loads(args_raw or "{}")
-                except json.JSONDecodeError as exc:
-                    # Try quoted-escapes repair for Windows paths
-                    try:
-                        from core.agent.repairs import repair_quoted_escapes_json_text
-
-                        fixed = repair_quoted_escapes_json_text(args_raw or "{}")
-                        arguments = json.loads(fixed)
-                    except (json.JSONDecodeError, ValueError, TypeError, ImportError):
-                        raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
-                if not isinstance(arguments, dict):
-                    raise LLMError(f"tool arguments not an object for '{name}'")
+                arguments = _parse_tool_arguments(args_raw, name)
             else:
                 raise LLMError(f"tool arguments wrong type for '{name}': {type(args_raw).__name__}")
             tool_calls.append(ToolCall(id=str(fid) if fid else "", name=name.strip(), arguments=arguments))
@@ -850,13 +861,7 @@ class OpenAICompatClient(LLMClient):
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - scheme validated in __init__
-            try:
-                raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
-            except TypeError:
-                raw_bytes = response.read()
-            if len(raw_bytes) > _MAX_RESPONSE_BYTES:
-                raise LLMError("LLM response exceeds size cap")
-            raw = raw_bytes.decode("utf-8", errors="replace")
+            raw = _read_response(response)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -887,18 +892,9 @@ class OpenAICompatClient(LLMClient):
             name = item.get("name") or ""
             args_value = item.get("arguments")
             if isinstance(args_value, str):
-                try:
-                    arguments = json.loads(args_value or "{}")
-                except json.JSONDecodeError as exc:
-                    # Match the chat-path contract: malformed arguments are
-                    # a failed turn, not a silent call with no arguments.
-                    try:
-                        from core.agent.repairs import repair_quoted_escapes_json_text
-
-                        fixed = repair_quoted_escapes_json_text(args_value or "{}")
-                        arguments = json.loads(fixed)
-                    except (json.JSONDecodeError, ValueError, TypeError, ImportError):
-                        raise LLMError(f"tool arguments not JSON for '{name}': {exc}") from exc
+                # Match the chat-path contract: malformed arguments are
+                # a failed turn, not a silent call with no arguments.
+                arguments = _parse_tool_arguments(args_value, name)
             elif isinstance(args_value, dict):
                 arguments = args_value
             else:

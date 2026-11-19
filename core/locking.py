@@ -43,3 +43,41 @@ def break_stale_lock(lock_path: str | Path, stale_seconds: float) -> bool:
         return True
     except OSError:
         return False
+
+
+def acquire_lock(lock_path: str | Path, wait: float, stale: float) -> int | None:
+    """Take an exclusive-create lock, retrying briefly on contention.
+
+    Returns the open file descriptor, or None when the lock could not be
+    taken in time (or creation failed for a non-conflict reason).
+    """
+    if os.path.exists(lock_path):
+        break_stale_lock(lock_path, stale)
+    start = time.monotonic()
+    while time.monotonic() - start < wait:
+        try:
+            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            time.sleep(0.02)
+            try:
+                if time.time() - os.stat(lock_path).st_mtime >= stale:
+                    break_stale_lock(lock_path, stale)
+            except OSError:
+                pass
+        except OSError:
+            return None
+    return None
+
+
+def release_lock(lock_path: str | Path, fd: int | None) -> None:
+    """Close and remove a lock taken by :func:`acquire_lock`."""
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass

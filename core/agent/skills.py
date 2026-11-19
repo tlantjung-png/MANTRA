@@ -15,9 +15,6 @@ _CANDIDATE_ROOTS = (
     ".mantra/skills",
 )
 
-_MARKDOWN_EXT = ".md"
-
-
 @dataclass
 class Skill:
     name: str = ""

@@ -13,14 +13,6 @@ from core.tools.search import FindFileTool, SearchCodeTool
 from core.tools.web import _is_private_hostname, _safe_url
 
 
-@pytest.fixture()
-def sandbox(tmp_path) -> LocalSandbox:
-    box = LocalSandbox(workspace_root=str(tmp_path))
-    box.setup({})
-    yield box
-    box.cleanup()
-
-
 def _write(root: str, rel: str, text: str) -> None:
     full = os.path.join(root, rel)
     os.makedirs(os.path.dirname(full) or root, exist_ok=True)

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -140,24 +139,7 @@ from core.console_session_persist import (  # noqa: F401
     _is_safe_session_path,
     _safe_int,
 )
-
-
-def _resolve_data_path(*parts: str) -> str:
-    """Locate a bundled data file in a source tree or an installed wheel.
-
-    Installed wheels place data-files under ``sys.prefix`` while the code
-    sits in site-packages, so a single PROJECT_ROOT-relative path would
-    miss them (installed console could not start with its default config).
-    """
-    candidates = [
-        os.path.join(PROJECT_ROOT, *parts),
-        os.path.join(os.path.dirname(PROJECT_ROOT), *parts),
-        os.path.join(sys.prefix, *parts),
-    ]
-    for cand in candidates:
-        if os.path.isfile(cand):
-            return cand
-    return candidates[0]
+from core.paths import _resolve_data_path  # noqa: F401 - kept importable from this facade
 
 
 KNOWN_FAILURES_PATH = _resolve_data_path("knowledge", "known-failures.md")
@@ -214,12 +196,12 @@ class ConsoleSession(
                 p = os.path.join(workspace, e)
                 files.append(f"{e}/" if os.path.isdir(p) else e)
             env += f"\n- workspace files: {', '.join(files) or '(empty)'}"
-            for hint in ("README.md", "package.json", "pyproject.toml", "AGENTS.md", "main.py", "index.html"):
+            for hint in ("README.md", "README.MD", "package.json", "pyproject.toml", "AGENTS.md", "main.py", "index.html"):
                 if hint in entries:
                     env += f"\n- has {hint}"
             # Preload the README head so the model can describe the
             # project without a tool call.
-            for readme in ("README.md", "readme.md"):
+            for readme in ("README.md", "README.MD", "readme.md"):
                 rp = os.path.join(workspace, readme)
                 if os.path.isfile(rp):
                     try:

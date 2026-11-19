@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from core.diffparse import FileDiff, Hunk
+from core.tui.scroll import ScrollOffsetMixin
 
 _SIDEBAR_MAX = 28
 _SIDEBAR_MIN = 14
@@ -19,7 +20,7 @@ _GUTTER_W = 4           # line-number gutter width per side
 
 
 @dataclass
-class ReviewState:
+class ReviewState(ScrollOffsetMixin):
     """Scroll and navigation state for the review surface."""
 
     files: list[FileDiff]
@@ -35,15 +36,6 @@ class ReviewState:
     @property
     def file_count(self) -> int:
         return len(self.files)
-
-    def clamp(self, total: int, viewport: int) -> None:
-        """Pin the offset after a render (total comes from the renderer)."""
-        max_offset = max(0, total - max(1, viewport))
-        if self.offset > max_offset:
-            self.offset = max_offset
-
-    def step(self, delta: int, total: int, viewport: int) -> None:
-        self.offset = max(0, min(max(0, total - max(1, viewport)), self.offset + delta))
 
     def next_file(self, delta: int) -> None:
         count = len(self.files)

@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from core.agent.keys import has_stored
+from core.paths import PROJECT_ROOT  # noqa: F401 - re-exported from this facade
 from core.agent.settings import endpoint_name_for_url, endpoints as known_endpoints
 from core.llm import KEYLESS_HOSTS
 from core.term import safe_write
@@ -27,8 +28,7 @@ if TYPE_CHECKING:
 
 
 # Single definition of the project root: the console facade, the
-# persistence mixin, and the data-file locator must agree on it.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# persistence mixin, and the data-file locator import it from core.paths.
 
 
 # Commands are listed alphabetically, here and in SLASH_COMMANDS below, so a

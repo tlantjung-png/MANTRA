@@ -19,9 +19,12 @@ from core.tui.buffer import Buffer
 S_TITLE = ("1;38;5;253",)
 S_DIM = ("2",)
 S_SELECT = ("1;38;5;131",)
-S_ACCENT = ("38;5;131",)
-S_ERROR = ("38;5;167",)
 S_BOX = ("38;5;238",)
+
+
+def _center_x(cols: int, width: int) -> int:
+    """Horizontal origin of a centered box, clamped into the frame."""
+    return max(0, min((cols - width) // 2, max(0, cols - width)))
 
 
 def _blank_box(buf: Buffer, x: int, y: int, w: int, h: int, style: int) -> None:
@@ -202,7 +205,7 @@ class MenuOverlay:
         target = max(40, self.width or 0) or self._auto_width()
         width = max(2, min(cols, target))
         height = max(3, min(rows - 2, self.max_rows + 4))
-        x = max(0, min((cols - width) // 2, max(0, cols - width)))
+        x = _center_x(cols, width)
         y = max(0, min((rows - height) // 2, max(0, rows - height)))
         return x, y, width, height
 
@@ -320,7 +323,7 @@ class QuestionCard:
             ),
         )
         height = max(3, min(rows - 2, max(4, len(body_lines) + 4)))
-        x = max(0, min((cols - width) // 2, max(0, cols - width)))
+        x = _center_x(cols, width)
         y = max(0, min(max(1, (rows - height) // 2 - 2), max(0, rows - height)))
         self._last_rect = (x, y, width, height)
         box_style = buf.styles_table.id_for(S_BOX)
@@ -461,7 +464,7 @@ class LinePrompt:
     def render(self, buf: Buffer, cols: int, rows: int) -> None:
         width = max(2, min(cols, max(56, visible_len(self.label) + 20)))
         height = min(4, max(3, rows - 2))
-        x = max(0, min((cols - width) // 2, max(0, cols - width)))
+        x = _center_x(cols, width)
         y = max(0, min(max(1, (rows - height) // 2 - 2), max(0, rows - height)))
         self._last_rect = (x, y, width, height)
         box_style = buf.styles_table.id_for(S_BOX)

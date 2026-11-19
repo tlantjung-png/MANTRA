@@ -18,18 +18,9 @@ from core.agent.approvals import ApprovalPolicy
 from core.agent.exceptions import ConfigError
 from core.config import load_config
 from core.mcp.server import MCPServer, run_stdio
+from core.paths import resolve_input_path
 from core.registry import build_sandbox, build_tools
 from core.term import force_utf8_output
-
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def _resolve_arg(path: str) -> str:
-    """Resolve an input path against cwd, then the project root."""
-    if os.path.exists(path):
-        return path
-    candidate = os.path.join(PROJECT_ROOT, path)
-    return candidate if os.path.exists(candidate) else path
 
 
 def _note(message: str) -> None:
@@ -45,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     force_utf8_output()
 
     try:
-        config = load_config(_resolve_arg(args.config))
+        config = load_config(resolve_input_path(args.config))
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

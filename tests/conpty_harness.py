@@ -52,7 +52,6 @@ HANDLE = ctypes.c_void_p
 LPVOID = ctypes.c_void_p
 LPCWSTR = ctypes.c_wchar_p
 LPWSTR = ctypes.c_wchar_p
-LONG = ctypes.c_long
 
 
 class COORD(ctypes.Structure):
@@ -471,16 +470,6 @@ class _ConsoleSession:
 
     def mouse(self, button: int, col: int, row: int, press: bool) -> None:
         self.send(f"\x1b[<{button};{col};{row}{'M' if press else 'm'}")
-
-    def drag(self, points: list[tuple[int, int]], button: int = 0) -> None:
-        first = points[0]
-        self.mouse(button, first[0], first[1], True)
-        for x, y in points[1:]:
-            # SGR motion reports carry button bit 32; the backend decodes
-            # those as drag events (contract pinned in test_tui.py).
-            self.mouse(button | 32, x, y, True)
-        last = points[-1]
-        self.mouse(button, last[0], last[1], False)
 
     def wheel(self, direction: int, col: int, row: int) -> None:
         self.send(f"\x1b[<{direction};{col};{row}M")

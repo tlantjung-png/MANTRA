@@ -14,10 +14,12 @@ from core.agent.exceptions import ConfigError
 from core.agent.knowledge import assemble_system_prompt
 from core.agent.observations import DEFAULT_MAX_CHARS
 from core.mcp import build_mcp_tools
+from core.paths import PROJECT_ROOT, _resolve_data_path, resolve_input_path  # noqa: F401 - kept importable from this module
 from core.registry import build_evaluator, build_llm, build_logger, build_sandbox, build_tools
 from core.term import force_utf8_output
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Kept importable: tests and callers patch this seam by its old name.
+_resolve_path = resolve_input_path
 
 
 def _observation_ceiling(config: dict) -> int:
@@ -37,19 +39,6 @@ def _observation_ceiling(config: dict) -> int:
 # Same ceiling the configuration loader applies: a task document is
 # operator-supplied but must not be read without a bound.
 _MAX_TASK_BYTES = 1_000_000
-
-
-def _resolve_data_path(*parts: str) -> str:
-    """Locate a bundled data file in a source tree or an installed wheel."""
-    candidates = [
-        os.path.join(PROJECT_ROOT, *parts),
-        os.path.join(os.path.dirname(PROJECT_ROOT), *parts),
-        os.path.join(sys.prefix, *parts),
-    ]
-    for cand in candidates:
-        if os.path.isfile(cand):
-            return cand
-    return candidates[0]
 
 
 class _HeadlessApprover:
@@ -81,20 +70,6 @@ class _HeadlessApprover:
         return False
 
 
-def _resolve_path(path: str) -> str:
-    """Resolve input paths against cwd then project root.
-
-    Relative logging paths are instead anchored to the project root in
-    main() so the same config works from any working directory.
-    """
-    if os.path.exists(path):
-        return path
-    candidate = os.path.join(PROJECT_ROOT, path)
-    if os.path.exists(candidate):
-        return candidate
-    return path  # let the normal error path report it
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mantra", description="MANTRA coding-agent harness")
     parser.add_argument("--config", required=True, help="Path to config file (resolved against cwd then project root; relative log paths inside anchor to project root)")
@@ -105,12 +80,12 @@ def main(argv: list[str] | None = None) -> int:
     force_utf8_output()
 
     try:
-        config = load_config(_resolve_path(args.config))
+        config = load_config(resolve_input_path(args.config))
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     try:
-        task_path = _resolve_path(args.task)
+        task_path = resolve_input_path(args.task)
         with open(task_path, "r", encoding="utf-8") as handle:
             raw_task = handle.read(_MAX_TASK_BYTES + 1)
         if len(raw_task) > _MAX_TASK_BYTES:

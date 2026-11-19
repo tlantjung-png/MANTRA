@@ -1,7 +1,7 @@
 ---
 name: humanize
 description: Rewrite stiff, robotic, repetitive, or overly polished prose into natural human-sounding writing while preserving meaning, facts, terminology, and the writer's intended voice.
-version: 1.0.0
+version: 1.1.0
 user-invocable: true
 ---
 
@@ -38,6 +38,17 @@ Do not use this skill to change the author's actual position, invent personal ex
 11. Avoid hyperbole and exaggerated claims.
 
 ## Procedure
+
+### 0. Audit the Source
+
+Run the `prose_audit` tool on the source text (or the file that holds it). Its
+findings are a diagnosis, not a checklist to satisfy mechanically: a flagged
+phrase can be correct in context, and a clean audit does not mean the prose is
+already natural. Each finding carries a stable rule id and a line number; use
+those to focus the read-through, then set them aside while rewriting.
+
+Never report a detector score or a percentage. `prose_audit` counts patterns;
+it does not measure authorship.
 
 ### 1. Diagnose the Source
 
@@ -93,18 +104,6 @@ A rewrite is invalid if it changes the author's meaning, silently strengthens a 
 ### 3. Rewrite for Natural Voice
 
 Rewrite the passage as a whole rather than performing word-by-word synonym substitution.
-
-**Self-evaluation (backend, hidden):**
-- NO_AI_WORDS (shared from ai-constants.ts)
-- VOICE_CONSISTENT (Levenshtein ≤0.3 on key 100 words)
-- FACTUAL_FIDELITY (proposition drift ≤0.2)
-- BURSTINESS (σ >8, anti-uniform)
-- LENGTH_REASONABLE (≤1.2× original)
-- NO_TEMPLATE_UNIFORMITY
-- NATURAL_FLOW
-- NO_ARTIFICIAL_PACKAGING
-
-If any check fails → generateFixPrompt for targeted re-run.
 
 Priorities, in order:
 
@@ -288,7 +287,9 @@ Quality is judged by:
 - absence of unnecessary template language
 - absence of invented material
 
-A successful rewrite should read naturally on its own. Do not use a detector percentage as the definition of success.
+Re-run `prose_audit` on the rewrite. A remaining finding is acceptable when the phrase is genuinely right for the context; report the reason briefly rather than editing the text until the count is zero. Never use a detector percentage as the definition of success.
+
+A successful rewrite should read naturally on its own.
 
 ## Boundaries
 

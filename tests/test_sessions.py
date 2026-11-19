@@ -275,7 +275,6 @@ class ResumeReplayFidelityTest(SessionTestBase):
         # colour is the shared marker, and no stamp is fabricated.
         from core.console_render import Style, operator_line
 
-        session = self._session()
         line = operator_line(Style(enabled=True), "question 0")
         self.assertIn("question 0", line)
         self.assertNotIn("you", line.lower())
@@ -284,7 +283,6 @@ class ResumeReplayFidelityTest(SessionTestBase):
     def test_the_live_echo_uses_the_same_line_with_a_stamp(self):
         from core.console_render import Style, operator_line
 
-        session = self._session()
         stamped = operator_line(Style(enabled=True), "question 0", stamp="18:13")
         self.assertIn("18:13", stamped)
         self.assertIn("question 0", stamped)
@@ -398,12 +396,6 @@ class ResumeTest(SessionTestBase):
 
 
 class DispatchTest(SessionTestBase):
-    def _dispatch(self, line):
-        session = self._session()
-        from core.console import dispatch
-
-        return dispatch(session, line)
-
     def test_sessions_with_no_args_opens_the_picker(self):
         session = self._session()
         with mock.patch.object(ConsoleSession, "pick_session") as picked:

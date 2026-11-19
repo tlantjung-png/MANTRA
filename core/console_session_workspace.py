@@ -5,7 +5,6 @@ listing, the diff view, undo, and the /cost figures."""
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 

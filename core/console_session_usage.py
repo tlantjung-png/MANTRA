@@ -17,6 +17,7 @@ from core.agent.knowledge import (
 from core.agent.exceptions import HarnessError
 from core.agent.observations import DEFAULT_MAX_CHARS
 from core.console_common import _short
+from core.messages import flatten_messages
 
 from typing import TYPE_CHECKING
 
@@ -43,27 +44,7 @@ def _format_elapsed(seconds: float) -> str:
 
 def _transcript(messages: list[dict]) -> str:
     """Flatten history to plain text for the summariser."""
-    lines = []
-    for message in messages:
-        role = message.get("role", "?")
-        content = message.get("content") or ""
-        if role == "system":
-            continue
-        if role == "assistant" and message.get("tool_calls"):
-            names = ", ".join(
-                (call.get("function") or {}).get("name", "?")
-                for call in message["tool_calls"]
-            )
-            lines.append(f"assistant: [called {names}]")
-            if content:
-                lines.append(f"assistant: {content}")
-            continue
-        if role == "tool":
-            body = content if len(content) <= 300 else content[:300] + " ..."
-            lines.append(f"result of {message.get('name', 'tool')}: {body}")
-            continue
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
+    return flatten_messages(messages, skip_system=True)
 
 
 class UsageMixin:

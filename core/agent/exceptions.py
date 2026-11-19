@@ -27,9 +27,5 @@ class LLMError(HarnessError):
     retryable_truncation: bool = False
 
 
-class EvaluationError(HarnessError):
-    """Evaluator produced no verdict."""
-
-
 class AbortError(HarnessError):
     """Operator interrupt; stop cleanly."""

@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 
-from core.locking import break_stale_lock as _break_stale_lock_shared
+from core.locking import acquire_lock, release_lock
 
 _memory_lock = threading.Lock()
 
@@ -231,32 +231,10 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                 pass
         # Inter-process lock via file (best effort).
         lock_path = memory_path + ".lock"
-        lock_acquired = False
-        lock_handle = None
         try:
-            # Opportunistically break a stale lock, but treat exclusive create
-            # as the arbiter; stale removal is verified to avoid deleting a
-            # freshly created lock.
-            if os.path.exists(lock_path):
-                _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
             # Brief lock wait on interactive thread.
-            start = time.monotonic()
-            while time.monotonic() - start < _LOCK_WAIT_SECONDS:
-                try:
-                    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    lock_handle = fd
-                    lock_acquired = True
-                    break
-                except FileExistsError:
-                    time.sleep(0.02)
-                    try:
-                        if time.time() - os.stat(lock_path).st_mtime >= _LOCK_STALE_SECONDS:
-                            _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-                    except OSError:
-                        pass
-                except OSError:
-                    break
-            if not lock_acquired:
+            lock_handle = acquire_lock(lock_path, _LOCK_WAIT_SECONDS, _LOCK_STALE_SECONDS)
+            if lock_handle is None:
                 # Another process holds the lock: skip the write rather
                 # than race it. The entry is dropped this turn instead of
                 # two writers clobbering each other's lines.
@@ -299,15 +277,7 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                         pass
                     return False
         finally:
-            if lock_acquired and lock_handle is not None:
-                try:
-                    os.close(lock_handle)
-                except OSError:
-                    pass
-                try:
-                    os.remove(lock_path)
-                except OSError:
-                    pass
+            release_lock(lock_path, lock_handle)
     return False
 
 
@@ -519,28 +489,9 @@ def rewrite_memory(memory_path: str | None, body: str, new_entry: str | None = N
         except OSError:
             pass
     lock_path = memory_path + ".lock"
-    lock_acquired = False
-    lock_handle = None
     try:
-        if os.path.exists(lock_path):
-            _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-        start = time.monotonic()
-        while time.monotonic() - start < _LOCK_WAIT_SECONDS:
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                lock_handle = fd
-                lock_acquired = True
-                break
-            except FileExistsError:
-                time.sleep(0.02)
-                try:
-                    if time.time() - os.stat(lock_path).st_mtime >= _LOCK_STALE_SECONDS:
-                        _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-                except OSError:
-                    pass
-            except OSError:
-                break
-        if not lock_acquired:
+        lock_handle = acquire_lock(lock_path, _LOCK_WAIT_SECONDS, _LOCK_STALE_SECONDS)
+        if lock_handle is None:
             return False
         try:
             fd_tmp, tmp_path = tempfile.mkstemp(
@@ -566,13 +517,5 @@ def rewrite_memory(memory_path: str | None, body: str, new_entry: str | None = N
                 pass
             return False
     finally:
-        if lock_acquired and lock_handle is not None:
-            try:
-                os.close(lock_handle)
-            except OSError:
-                pass
-            try:
-                os.remove(lock_path)
-            except OSError:
-                pass
+        release_lock(lock_path, lock_handle)
     return False

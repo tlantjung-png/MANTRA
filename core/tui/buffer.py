@@ -20,7 +20,6 @@ from core.term import _WidthScanner
 _CONT = "\x00"
 
 _ANSI_RE = re.compile(r"\033\[([0-9;?]*)([ -/]*[@-~])|\033\][^\x07\x1b]*(?:\x07|\x1b\\)?")
-_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
 
 # Control bytes must never reach the terminal through a cell: a bare ESC
 # or C1 byte would be written raw by the renderer. Tab (\t) and newline
@@ -142,10 +141,6 @@ class Buffer:
             if 0 <= y < self.rows:
                 i = self._index(cx, y)
                 self.styles[i] = style
-
-    def fill_style(self, x: int, y: int, width: int, height: int, style: int) -> None:
-        for cy in range(y, min(y + height, self.rows)):
-            self.set_style(x, cy, width, style)
 
     def set_str(self, x: int, y: int, text: str, style: int = DEFAULT_STYLE, max_width: int | None = None) -> int:
         """Write text at (x, y); returns the ending column (clipped)."""

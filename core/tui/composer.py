@@ -85,10 +85,6 @@ class Composer:
         assert self.sel_anchor is not None and self.sel_head is not None
         return (self.sel_anchor, self.sel_head) if self.sel_anchor < self.sel_head else (self.sel_head, self.sel_anchor)
 
-    def selected_text(self) -> str:
-        span = self.selected_range()
-        return "" if span is None else self.buffer[span[0] : span[1]]
-
     def clear_selection(self) -> None:
         self.sel_anchor = None
         self.sel_head = None
@@ -120,28 +116,6 @@ class Composer:
 
     def total_lines(self) -> int:
         return self.buffer.count("\n") + 1
-
-    def scroll_by(self, delta: int, visible_rows: int) -> None:
-        """Wheel the prompt box: move the free view by ``delta`` lines.
-
-        Clamped so the last line can rise to the bottom of the box (but
-        no further) and the first line stays at the top. Typing re-
-        anchors the view to the caret afterwards.
-        """
-        if not self.is_multiline or delta == 0:
-            return
-        lines = self.total_lines()
-        window = max(1, visible_rows)
-        first = self._view_first
-        if first is None:
-            # Leaving caret-follow mode: the current caret-anchored view
-            # becomes the starting offset.
-            caret_line = self._caret_line_index()
-            first = max(0, caret_line + 1 - window)
-        self._view_first = max(0, min(first + delta, max(0, lines - window)))
-
-    def _reanchor_to_caret(self) -> None:
-        self._view_first = None
 
     def _view_start(self, height: int) -> int:
         """First visible line index for a box of ``height`` rows."""
@@ -321,14 +295,6 @@ class Composer:
         self.completion = None
         self._last_token = None
 
-    def popup_click(self, row: int) -> bool:
-        """A mouse click at screen ``row``; handled when it hits the popup.
-
-        Returns True when the click was consumed (including paging and
-        dismissal), so the app does not also treat it as a transcript
-        selection.
-        """
-        return False  # replaced by the overlay's own hit map in the app
 
     def _recompute_soft(self) -> None:
         if self.popup_open:

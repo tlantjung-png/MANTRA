@@ -206,36 +206,6 @@ def raw_mode():
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
-@contextmanager
-def cbreak_mode():
-    """Per-character input without echo; SIGINT still delivered. No-op on Windows.
-
-    ``raw_mode`` (tty.setraw) also switches ISIG off, so Ctrl+C would
-    arrive as a literal byte. cbreak only drops line buffering and echo.
-    """
-    if os.name == "nt":
-        yield
-        return
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    original = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        yield
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, original)
-
-
-def is_interactive() -> bool:
-    """True when stdin and stdout are terminals."""
-    try:
-        return bool(sys.stdin.isatty() and sys.stdout.isatty())
-    except (ValueError, OSError):  # pragma: no cover - closed streams
-        return False
-
-
 def safe_write(text: str) -> None:
     """Write to stdout, replacing characters the stream cannot encode.
 

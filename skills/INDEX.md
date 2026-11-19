@@ -28,7 +28,7 @@
 | `excel` | Build auditable spreadsheets, financial models, trackers, or data workbooks with explicit inputs, formulas, tie-outs, and usage guidance. |
 | `exec-mode` | Recommend whether a task should run in a regular session, as a MANTRA workflow, or as a goal, using a deterministic signal table, and log the decision to the workspace memory. |
 | `help` | Explain current MANTRA setup, configuration, authentication, skills, commands, and troubleshooting from the actual repository and ~/.mantra state. |
-| `humanize` | Rewrite stiff, robotic, repetitive, or overly polished prose into natural human-sounding writing while preserving meaning, facts, terminology, and the writer's intended voice. |
+| `humanize` | Audit prose with the deterministic `prose_audit` tool, then rewrite stiff, robotic, repetitive, or overly polished writing into natural prose while preserving meaning, facts, terminology, and the writer's intended voice; re-run the audit to verify. |
 | `imagine` | Plan image generation, image editing, short video workflows, and UI demonstration GIFs with accurate prompts, references, consistency checks, and safe handling of likenesses. |
 | `improve-coverage` | Add meaningful tests for existing behavior by prioritizing high-risk boundaries, regressions, failures, and untested contracts rather than chasing a percentage. |
 | `instruction-audit` | Audit always-loaded instruction assets - the base system prompt, workspace memory, AGENTS.md instructions, the known-failure registry, and command rules - for token weight, staleness, contradiction, and attention dilution. |

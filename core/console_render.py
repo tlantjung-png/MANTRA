@@ -42,7 +42,6 @@ class Style:
     def warn(self, t):     return self._wrap(theme.WARN, t)        # warnings — soft ochre
     def ember(self, t):    return self._wrap(theme.EMBER, t)       # errors — dusty red
     def bone(self, t):     return self._wrap(theme.BONE, t)
-    def ash(self, t):      return self._wrap(theme.ASH, t)
     def hair(self, t):     return self._wrap(theme.HAIR, t)
 
 

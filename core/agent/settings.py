@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core.agent.keys import warn_insecure_transport
-from core.locking import break_stale_lock as _break_stale_lock_shared
+from core.locking import acquire_lock, release_lock
 
 _VERSION = 1
 
@@ -150,29 +150,8 @@ def _write(data: dict[str, Any]) -> bool:
     # opportunistic and its removal is verified to avoid deleting a
     # freshly created lock from another process.
     lock_path = file.with_suffix(file.suffix + ".lock")
-    # Opportunistically break a stale lock before trying; if break fails,
-    # the subsequent open will simply wait.
-    if lock_path.exists():
-        _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-    acquired = False
-    lock_fd = None
-    start = time.monotonic()
-    while time.monotonic() - start < _LOCK_WAIT:
-        try:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            acquired = True
-            break
-        except FileExistsError:
-            time.sleep(0.02)
-            # Opportunistically retry stale break if lock looks old
-            try:
-                if time.time() - lock_path.stat().st_mtime >= _LOCK_STALE_SECONDS:
-                    _break_stale_lock_shared(lock_path, _LOCK_STALE_SECONDS)
-            except OSError:
-                pass
-        except OSError:
-            break
-    if not acquired:
+    lock_fd = acquire_lock(lock_path, _LOCK_WAIT, _LOCK_STALE_SECONDS)
+    if lock_fd is None:
         # Another process holds the lock: skip the write rather than race it.
         return False
     # Unique temp name: no fixed path for a planted symlink to hijack and
@@ -184,15 +163,7 @@ def _write(data: dict[str, Any]) -> bool:
     except OSError:
         # Temporary-file creation failed outside the guarded region below;
         # release the lock and report the failure per the bool contract.
-        if acquired and lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        release_lock(lock_path, lock_fd)
         return False
     tmp = Path(tmp_name)
     try:
@@ -216,15 +187,7 @@ def _write(data: dict[str, Any]) -> bool:
             pass
         return False
     finally:
-        if acquired and lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        release_lock(lock_path, lock_fd)
 
 
 def load() -> dict[str, Any]:

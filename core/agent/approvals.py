@@ -7,6 +7,7 @@ import sys
 import threading
 from typing import Any, Callable
 
+from core.agent.permissions import icacls_owner_only
 from core.agent.repairs import canonical_command
 
 AskCallback = Callable[[str], str]  # returns "y" | "n" | "a"
@@ -666,8 +667,8 @@ _LOG_CHECK_LOCK = threading.Lock()
 def _restrict_audit_log(log_path: str) -> None:
     """Best-effort owner-only access for the audit log, once per process.
 
-    os.chmod(0o600) is a no-op on Windows, so the icacls tightening from
-    keys._restrict_file is repeated here, minus its credentials warning.
+    os.chmod(0o600) is a no-op on Windows, so the icacls tightening is
+    applied here too, minus the credentials warning from keys._restrict_file.
     Runs only once the file exists; the ACL then persists.
     """
     import os
@@ -684,15 +685,7 @@ def _restrict_audit_log(log_path: str) -> None:
         pass
     if os.name == "nt":
         try:
-            import getpass
-            import subprocess
-
-            user = getpass.getuser()
-            subprocess.run(
-                ["icacls", log_path, "/inheritance:r", "/grant:r", f"{user}:F"],
-                capture_output=True,
-                timeout=5,
-            )
+            icacls_owner_only(log_path)
         except Exception:
             pass
 
@@ -776,9 +769,6 @@ class ApprovalPolicy:
             return True
 
         return self._confirm(tool, detail, risk, key)
-
-    def allow_for_session(self, tool: str, arguments: dict[str, Any]) -> None:
-        self.session_allowed.add(self._key(tool, arguments))
 
     def reset_session(self) -> None:
         self.session_allowed.clear()

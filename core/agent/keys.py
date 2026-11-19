@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.agent.permissions import icacls_owner_only
+
 # Tests point this at a temporary file; nobody else should need to.
 _OVERRIDE_ENV = "MANTRA_CREDENTIALS"
 
@@ -155,14 +157,9 @@ def _restrict_dir(directory: Path) -> None:
         pass
     if os.name == "nt":
         # Best-effort ACL tightening via icacls where available; ignore failures.
+        import subprocess
         try:
-            import subprocess
-            import getpass
-            user = getpass.getuser()
-            subprocess.run(
-                ["icacls", str(directory), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
-                capture_output=True, timeout=5
-            )
+            icacls_owner_only(str(directory), directory=True)
         except (OSError, ImportError, subprocess.SubprocessError):
             # icacls is missing, the user name is undeterminable, or the
             # call failed; the chmod fallback above already ran.
@@ -177,14 +174,9 @@ def _restrict_file(path: Path) -> None:
         pass
     if os.name == "nt":
         _platform_warn_if_insecure()
+        import subprocess
         try:
-            import subprocess
-            import getpass
-            user = getpass.getuser()
-            subprocess.run(
-                ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                capture_output=True, timeout=5
-            )
+            icacls_owner_only(str(path))
         except (OSError, ImportError, subprocess.SubprocessError):
             # Same as _restrict_dir: best effort, chmod already ran.
             pass

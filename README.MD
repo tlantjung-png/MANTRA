@@ -88,18 +88,20 @@ Beyond the file and command tools, the agent has two bounded helpers for reading
 - search_code and find_file: literal substring search across workspace text files, and filename substring search. One shared bounded walk honors ignore files, never descends into ignored or symlinked-out directories, skips files above five hundred kilobytes and non-text extensions, and notes when result or scan ceilings are reached.
 - extract_document: reads a single structured file and returns a bounded plain-text representation for common formats such as markup, JSON, XML, CSV, markdown, and ini-like configuration. Formats it cannot render are reported as a note instead of being silently parsed; malformed structured files fall back to a short raw snippet.
 
-## Documentation Map
+## Repository Documentation
 
-- docs/Architecture.md: layers, module interactions, trade-offs.
-- docs/Setup.md: prerequisites, installation, local development.
-- docs/Api.md: entry points, commands, configuration, environment variables.
-- docs/Deployment.md: build, testing, sandbox levels, runbooks.
-- docs/Configuration.md: loader behaviour and user-wide settings.
-- docs/Console.md: terminal interface and session management.
-- docs/Core.md: orchestration, context, knowledge, approvals, events.
-- docs/Implementations.md: concrete clients, sandboxes, tools, loggers.
-- docs/Interfaces.md: abstract contracts.
-- docs/Adoption.md: what was kept and what was left out.
+These documents live in the source repository; they are not installed with the wheel.
+
+- docs/ARCHITECTURE.md: layers, module interactions, trade-offs.
+- docs/SETUP.md: prerequisites, installation, local development.
+- docs/API.md: entry points, commands, configuration, environment variables.
+- docs/DEPLOYMENT.md: build, testing, sandbox levels, runbooks.
+- docs/CONFIGURATION.md: loader behaviour and user-wide settings.
+- docs/CONSOLE.md: terminal interface and session management.
+- docs/CORE.md: orchestration, context, knowledge, approvals, events.
+- docs/IMPLEMENTATIONS.md: concrete clients, sandboxes, tools, loggers.
+- docs/INTERFACES.md: abstract contracts.
+- docs/ADOPTION.md: what was kept and what was left out.
 
 ## License
 

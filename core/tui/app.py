@@ -89,7 +89,6 @@ def _redact_model_line_keys(text: str) -> str:
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
-DRAW_INTERVAL = 0.033
 RESIZE_DEBOUNCE = 0.016
 
 # "↓ bottom" chip timings: accent pulse on turn-end and on output
@@ -129,7 +128,6 @@ MIN_ROWS = 8
 STYLE_HAIR = ("38;5;238",)
 STYLE_ACCENT = (theme.BLOOD,)
 STYLE_SELECT = ("7",)
-STYLE_WARN = (theme.WARN,)
 STYLE_BONE = (theme.BONE,)
 STYLE_FAINT = ("2",)
 
@@ -175,10 +173,6 @@ class LayoutBridge:
         self.app.mark_dirty()
 
     @property
-    def app_scrolls(self) -> bool:
-        return True
-
-    @property
     def following(self) -> bool:
         """True while the viewport is at the tail (not scrolled up)."""
         with self.app.lock:
@@ -197,10 +191,6 @@ class LayoutBridge:
     @property
     def _cols(self) -> int:
         return self.app.cols
-
-    @property
-    def prompt_row(self) -> int:
-        return self.app.rows
 
     @property
     def content_top(self) -> int:
@@ -238,9 +228,6 @@ class LayoutBridge:
     def draw_chrome(self) -> None:
         self.app.mark_dirty()
 
-    def draw_border_status(self, text: str = "") -> None:
-        self.app.set_status(text)
-
     def draw_prompt(self, body: str = "") -> None:
         # The composer owns the prompt row; only the live token counter
         # riding in the body carries information the border can show.
@@ -257,9 +244,6 @@ class LayoutBridge:
     def prompt_text(self, body: str = "") -> str:
         return ""
 
-    def check_resize(self) -> bool:
-        return False
-
     def scroll_up(self, amount: int = 3) -> None:
         with self.app.lock:
             self.app.transcript.scroll_up(amount)
@@ -275,41 +259,7 @@ class LayoutBridge:
             self.app.transcript.jump_bottom()
         self.app.mark_dirty()
 
-    def show_splash(self) -> int:
-        return 0
-
     def hide_splash(self) -> None:
-        pass
-
-    def render_content(self) -> None:
-        self.app.mark_dirty()
-
-    def redraw_content_and_chrome(self) -> None:
-        self.app.mark_dirty()
-
-    def restore_popup_rows(self, count: int) -> None:
-        self.app.mark_dirty()
-
-    def move_to_content(self) -> None:
-        pass
-
-    def move_to_prompt(self) -> None:
-        pass
-
-    def get_line_at_row(self, screen_row: int) -> str | None:
-        row = self.app.row_at(screen_row)
-        return row[1] if row else None
-
-    def wall_glyph(self) -> str:
-        return "│"
-
-    def box_edge_row(self, text: str = "") -> str:
-        return "╭─ " + text
-
-    def start_prompt_pulse(self) -> None:
-        pass
-
-    def stop_prompt_pulse(self) -> None:
         pass
 
 
@@ -481,10 +431,6 @@ class TuiApp:
         if self.transcript.scrolled > 0 and now - self._chip_last_pulse >= CHIP_PULSE_THROTTLE:
             self._chip_last_pulse = now
             self._chip_flash_until = now + CHIP_FLASH_SECONDS
-        self.mark_dirty()
-
-    def set_status(self, text: str) -> None:
-        self.status_text = text
         self.mark_dirty()
 
     def set_counter(self, text: str) -> None:
@@ -760,9 +706,6 @@ class TuiApp:
                 on_delete=on_delete,
             )
         )
-
-    def confirm(self, title: str, body: str) -> bool:
-        return (self._prompt_with_overlay(QuestionCard(title, body, choices="yn")) or "n") == "y"
 
     def _finish_overlay(self, value: Any) -> None:
         self.overlay = None
