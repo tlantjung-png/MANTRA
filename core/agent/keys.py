@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.agent.backup_paths import unique_corrupt_path
 from core.agent.permissions import icacls_owner_only
 
 # Tests point this at a temporary file; nobody else should need to.
@@ -52,13 +53,9 @@ def _quarantine_once(path: Path) -> None:
     _QUARANTINED.add(signature)
     try:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = path.with_suffix(path.suffix + f".corrupt-{stamp}")
-        counter = 1
-        while backup.exists():
-            backup = path.with_suffix(path.suffix + f".corrupt-{stamp}-{counter}")
-            counter += 1
-            if counter > 100:
-                return
+        backup = unique_corrupt_path(path, stamp)
+        if backup is None:
+            return
         shutil.copy2(path, backup)
     except OSError:
         pass

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 
 from core.console_common import MENTION_RE, _MENTION_TRIM
 
@@ -90,6 +91,13 @@ class MentionsMixin:
                 paths = self._resolve_mention(cand, root)
                 if paths:
                     break
+                # Source references often include a line or range. Try the
+                # literal name first so a real file containing ':' still wins.
+                without_line = re.sub(r":\d+(?:-\d+)?(?::\d+)?$", "", cand)
+                if without_line != cand:
+                    paths = self._resolve_mention(without_line, root)
+                    if paths:
+                        break
             if not paths:
                 # Show the trimmed form in the note so the operator sees
                 # what was actually tried, not the raw token with punctuation.

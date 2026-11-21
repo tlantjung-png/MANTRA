@@ -11,7 +11,7 @@ user-invocable: true
 
 When something is misbehaving and you need to find where: a failing tool, a slow
 operation, a recurring warning, or a broad health audit. Use the console's own
-signals - `/cost` for token usage, `/tools` for the surface, per-turn footers for
+signals - `/cost` for token usage, `/mcp` for external tools, per-turn footers for
 step/context sizes - plus the log files, and correlate the evidence into one
 report.
 

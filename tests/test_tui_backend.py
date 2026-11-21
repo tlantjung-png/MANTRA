@@ -124,6 +124,68 @@ class BackendParseTest(unittest.TestCase):
         self.assertIn("?1002h", Backend._MOUSE_ON)
         self.assertIn("?1006h", Backend._MOUSE_ON)
 
+    @unittest.skipUnless(os.name == "nt", "Windows console mode")
+    def test_windows_input_mode_requests_vt_mouse_reports(self):
+        import ctypes
+        from unittest import mock
+
+        class Console:
+            def __init__(self):
+                self.modes = []
+
+            def GetStdHandle(self, which):
+                return which
+
+            def GetConsoleMode(self, handle, mode):
+                mode._obj.value = 0x0040  # Quick Edit was enabled.
+                return 1
+
+            def SetConsoleMode(self, handle, mode):
+                self.modes.append((handle, mode))
+                return 1
+
+        console = Console()
+        with mock.patch.object(ctypes.windll, "kernel32", console):
+            Backend()._enter_windows()
+        input_mode = console.modes[-1][1]
+        self.assertTrue(input_mode & 0x0200)  # VT input
+        self.assertTrue(input_mode & 0x0010)  # mouse records
+        self.assertFalse(input_mode & 0x0040)  # Quick Edit
+
+    @unittest.skipUnless(os.name == "nt", "Windows console mode")
+    def test_windows_input_mode_recovers_after_another_client_resets_it(self):
+        import ctypes
+        from unittest import mock
+
+        class Console:
+            def __init__(self):
+                self.mode = 0x0200 | 0x0010 | 0x0008 | 0x0080
+                self.writes = []
+
+            def GetConsoleMode(self, handle, mode):
+                mode._obj.value = self.mode
+                return 1
+
+            def SetConsoleMode(self, handle, mode):
+                self.writes.append(mode)
+                self.mode = mode
+                return 1
+
+        console = Console()
+        backend = Backend()
+        backend._stdin_handle = -10
+        backend._saved_in_mode = 0
+        backend._vt_input_supported = True
+        with mock.patch.object(ctypes.windll, "kernel32", console), mock.patch.object(backend, "write") as write:
+            backend._ensure_windows_input_mode()
+            self.assertEqual(console.writes, [])
+            console.mode = 0x0040  # another client restored Quick Edit/default input
+            backend._ensure_windows_input_mode()
+            self.assertTrue(console.mode & 0x0200)
+            self.assertTrue(console.mode & 0x0010)
+            self.assertFalse(console.mode & 0x0040)
+            write.assert_called_once_with(Backend._MOUSE_ON)
+
     def test_windows_arrow_keys_decode_by_virtual_key(self):
         # A real Windows KEY_EVENT for an arrow carries VK_UP etc. with a
         # NUL uChar. The NUL used to be read as Ctrl+Space, which dropped
@@ -143,6 +205,7 @@ class BackendParseTest(unittest.TestCase):
         self.assertEqual(decode(0x27), [Key("right")])
         self.assertEqual(decode(0x21), [Key("pageup")])
         self.assertEqual(decode(0x22), [Key("pagedown")])
+        self.assertEqual(decode(0, "\x7f"), [Key("backspace")])
         # Ctrl+Space (NUL) keeps its control identity instead of a space.
         self.assertEqual(decode(0x20, mods=frozenset({"ctrl"})),
                          [Key("ctrl+space", frozenset({"ctrl"}))])

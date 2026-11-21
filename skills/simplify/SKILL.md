@@ -32,8 +32,8 @@ flows.
    consumer uses; speculative product generality; or hand-rolled code where a
    stdlib feature already exists (weigh net deletion: implementation plus
    dedicated tests plus docs, minus the glue that remains).
-4. Route small cleanups to the session todo list (`/todo add`) and durable
-   decisions to the workspace memory; do not manufacture a note for a typo.
+4. State deferred cleanups in the final report and put durable decisions in
+   workspace memory; do not manufacture a note for a typo.
 5. Identify a smaller ownership boundary or a source of truth that removes
    concepts rather than relocating them.
 6. Reconcile only non-conflicting, clearly safe changes and classify them by risk.

@@ -26,6 +26,43 @@ class AppIntegrationTest(unittest.TestCase):
         for ws in list(_TEMP_WORKSPACES):
             shutil.rmtree(ws, ignore_errors=True)
         _TEMP_WORKSPACES.clear()
+
+    def test_live_token_estimate_uses_total_text_not_fragment_count(self):
+        app, session, backend = _make_app([])
+        for _ in range(20):
+            session._on_delta("x")
+        self.assertEqual(session._stream_tokens, 5)
+        session._last_counter_update = 0
+        session._update_live_counter()
+        self.assertIn("5 tok", app.counter_text)
+
+    def test_live_speed_resets_after_a_pause_without_resetting_total(self):
+        app, session, backend = _make_app([])
+        session._on_delta("x" * 40)
+        session._last_delta_at = time.monotonic() - 3
+        session._on_delta("y" * 40)
+        self.assertEqual(session._stream_tokens, 20)
+        self.assertEqual(session._stream_segment_chars, 40)
+
+    def test_cache_rate_is_unknown_when_provider_counts_cache_separately(self):
+        from core.term import ansi_strip
+
+        app, session, backend = _make_app([])
+        session.totals["tokens_in"] = 10
+        session.totals["cache_hit"] = 20
+        self.assertIn("CACHE: —", ansi_strip(app._info_text()))
+        shown = []
+        session._print = shown.append
+        session.show_cost()
+        self.assertIn("cache hit    20", shown)
+        self.assertFalse(any("200%" in line or "cache saved" in line for line in shown))
+
+    def test_usage_footer_pluralizes_multiple_steps(self):
+        app, session, backend = _make_app([])
+        session._turn_started = time.monotonic()
+        result = type("Result", (), {"metrics": {}, "steps_used": 2})()
+        self.assertIn("2 STEPS", session._usage_line(result))
+
     def test_turn_lands_in_the_grid(self):
         from core.scripted import LLMResponse
 
@@ -40,6 +77,49 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertIn("Hello there", joined)
         # The usage footer was printed by the session through the bridge.
         self.assertTrue(any("STEP" in row or "in context" in row or "CTX" in row for row in rows))
+
+    def test_wheel_still_scrolls_conversation_after_several_turns(self):
+        from core.scripted import ScriptedLLMClient, final_response, tool_call_response
+
+        replies = [f"reply {i}: " + (f"detail {i} " * 45) for i in range(5)]
+        client = ScriptedLLMClient([
+            tool_call_response("write_file", {"path": "note.txt", "content": "hello"}),
+            final_response(replies[0]),
+            tool_call_response("run_command", {"command": "echo verified"}),
+            *[final_response(reply) for reply in replies[1:]],
+        ])
+        scripted_chat = client.chat
+
+        def streaming_chat(messages, tools=None, on_delta=None, **kwargs):
+            response = scripted_chat(messages, tools=tools, **kwargs)
+            if on_delta and response.is_final:
+                midpoint = len(response.content) // 2
+                on_delta(response.content[:midpoint])
+                on_delta(response.content[midpoint:])
+            return response
+
+        client.chat = streaming_chat
+        app, session, backend = _make_app([client])
+        for i in range(5):
+            app.submit(f"question {i}")
+            self.assertTrue(wait_until(lambda: not app.busy))
+        self.assertTrue(os.path.isfile(os.path.join(session.sandbox.root, "note.txt")))
+        app.render_frame()
+        self.assertTrue(app.transcript.follow)
+        before_prompt = app.composer.buffer
+        app.handle_event(Mouse("wheel", 64, 10, 10, frozenset()))
+        self.assertGreater(app.transcript.offset, 0)
+        self.assertEqual(app.composer.buffer, before_prompt)
+        self.assertFalse(app.transcript.follow)
+        app.handle_event(Mouse("wheel", 65, 10, 10, frozenset()))
+        self.assertEqual(app.transcript.offset, 0)
+        self.assertTrue(app.transcript.follow)
+        history = "\n".join(str(m.get("content") or "") for m in session.context.messages)
+        for reply in replies:
+            self.assertIn(reply, history)
+        transcript = "\n".join(app.transcript.raw)
+        self.assertEqual(transcript.count("detail 4"), 45)
+        self.assertIn("$ echo verified → exit 0", transcript)
 
     def test_typing_reaches_the_composer_and_renders(self):
         app, session, backend = _make_app([])
@@ -589,6 +669,16 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertNotIn("queued", border)
         self.assertNotIn("note", border)
 
+    def test_long_busy_status_keeps_the_right_border(self):
+        app, session, backend = _make_app([])
+        app.busy = True
+        app.counter_text = "x" * 200
+        app.render_frame()
+        border = grid_rows(app.renderer.buffer)[app.rows - 3]
+        self.assertEqual(len(border), app.cols)
+        self.assertTrue(border.endswith("╮"))
+        self.assertIn("…", border)
+
     def test_idle_border_is_clean(self):
         # The model/approval summary lives in the top bar; the idle
         # border chip stays clean and shows only a queued prompt notice.
@@ -640,17 +730,20 @@ class AppIntegrationTest(unittest.TestCase):
         from core.scripted import final_response
 
         app, session, backend = _make_app([final_response("done")])
+        app.render_frame()
         with app.lock:
             for i in range(40):
                 app.transcript.append(f"line {i}")
             app.transcript.scroll_up(5)
             detached = app.transcript.offset
+            visible_before = app.transcript.visible_rows(app.transcript.viewport_height)
         self.assertGreater(detached, 0)
         self.assertFalse(session.layout.following)
         app.submit("go")
         wait_until(lambda: not app.busy, 10)
         app.render_frame()
-        self.assertEqual(app.transcript.offset, detached)
+        self.assertGreaterEqual(app.transcript.offset, detached)
+        self.assertEqual(app.transcript.visible_rows(app.transcript.viewport_height), visible_before)
         self.assertFalse(session.layout.following)
 
     def test_busy_chip_waits_for_real_tokens_before_showing_counter(self):

@@ -245,7 +245,7 @@ class ReadFileTool(Tool):
                         return f"ERROR: refusing to read path {p!r}: blocked"
                     if ".." in p.replace("\\", "/").split("/"):
                         return f"ERROR: refusing to read path {p!r}: traversal blocked"
-                return self._execute_bulk_list(sandbox, parts, limit)
+                return self._execute_bulk_list(sandbox, parts, offset, limit)
 
         return self._execute_single(sandbox, path, offset, limit)
 
@@ -313,12 +313,12 @@ class ReadFileTool(Tool):
             # surfaces as a crash instead of a suspiciously empty bulk read.
             return f"ERROR: glob failed for {pattern!r}: {exc}"
 
-    def _execute_bulk_list(self, sandbox: Sandbox, paths: list[str], limit: int) -> str:
+    def _execute_bulk_list(self, sandbox: Sandbox, paths: list[str], offset: int, limit: int) -> str:
         out_parts: list[str] = []
         file_count = 0
         total = 0
         for rel in paths[:20]:
-            res = self._execute_single(sandbox, rel.strip(), 0, 400)
+            res = self._execute_single(sandbox, rel.strip(), offset, limit)
             if res.startswith("ERROR"):
                 out_parts.append(f"--- {rel} ---\n{res}\n")
                 file_count += 1

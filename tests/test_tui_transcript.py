@@ -58,13 +58,43 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual(t.offset, 3)
         self.assertFalse(t.follow)
         t.append("new line")
-        self.assertEqual(t.offset, 3)  # detached: the tail does not drag
+        self.assertEqual(t.offset, 4)  # detached: the visible rows stay pinned
         # Scrolling past the end clamps instead of showing blank rows.
         t.scroll_up(500)
         self.assertEqual(t.offset, len(t.display) + (1 if t.partial else 0) - 10)
         t.scroll_down(20)
         self.assertTrue(t.follow)
         self.assertEqual(t.offset, 0)
+
+    def test_wheel_scroll_keeps_live_wrapped_rows_visible(self):
+        t = Transcript()
+        t.set_width(10)
+        t.viewport_height = 3
+        t.append_partial("a" * 80)
+        t.scroll_up(3)
+        self.assertEqual(len(t.visible_rows(3)), 3)
+        self.assertEqual(len(t.row_source(3)), 3)
+
+    def test_new_streamed_rows_do_not_move_detached_view(self):
+        t = Transcript()
+        t.set_width(10)
+        t.viewport_height = 3
+        for i in range(8):
+            t.append(f"line {i}")
+        t.scroll_up(2)
+        before = t.visible_rows(3)
+        t.append("line 8")
+        t.append_partial("x" * 30)
+        self.assertEqual(t.visible_rows(3), before)
+
+    def test_long_streamed_reply_keeps_its_beginning(self):
+        t = Transcript()
+        t.set_width(80)
+        content = "START" + "x" * 9000 + "END"
+        t.append_partial(content)
+        self.assertEqual("".join(t.raw) + t.partial, content)
+        t.append_partial("\n")
+        self.assertEqual("".join(t.raw), content)
 
     def test_wrap_ansi_keeps_styling_across_rows(self):
         lines = wrap_ansi("\033[1m" + "x" * 15 + "\033[0m", 10)

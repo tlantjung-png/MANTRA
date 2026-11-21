@@ -12,6 +12,7 @@ import time
 import core.agent.skills as skills
 from core.agent.models import is_reasoning_model
 from core.agent.settings import endpoints as known_endpoints
+from core.config import REASONING_EFFORTS
 from core.console_common import (
     MAX_INDEX_ENTRIES,
     SLASH_COMMANDS,
@@ -138,14 +139,25 @@ class ConsoleCompleter:
         # them (operator may indent). Keep start-based token for replacement.
         stripped = buffer.lstrip()
         if stripped.startswith("/model "):
-            return self._complete_model(cursor, token)
+            return self._complete_model(cursor, token, buffer[:start])
         if stripped.startswith("/skills"):
             c = self._complete_skills(buffer, start, cursor, token)
             if c:
                 return c
         return None
 
-    def _complete_model(self, cursor: int, token: str):
+    def _complete_model(self, cursor: int, token: str, prefix: str = ""):
+        parts = prefix.strip().split()
+        if len(parts) > 2:
+            return None
+        if len(parts) == 2 and parts[0] == "/model":
+            # /model <model> <effort>; a saved endpoint instead takes a
+            # model name in this position.
+            if parts[1].lower() not in known_endpoints():
+                levels = ("off", *REASONING_EFFORTS)
+                matches = [level for level in levels if level.startswith(token.lower())]
+                return (Completion(items=matches, start=cursor - len(token), end=cursor)
+                        if matches else None)
         known = getattr(self.session, "known_models", None) or []
         lowered = token.lower()
         matches = [m for m in known if m.lower().startswith(lowered)]
@@ -193,7 +205,7 @@ class ConsoleCompleter:
         # No other commands, no menu — just skills.
         prefix = buffer[:start]
         parts = prefix.strip().split()
-        if not parts or parts[0] not in ("/skills", "/skill"):
+        if not parts or parts[0] != "/skills":
             return None
         # Only the first argument after /skills is completed; ignore deeper args
         if len(parts) > 1:

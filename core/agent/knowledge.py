@@ -132,10 +132,19 @@ def assemble_system_prompt(
     if environment:
         sections.append("## Environment (facts, do not guess)\n\n" + environment.strip())
 
+    # Workspace instructions are actionable and should not be displaced by
+    # lower-priority history when the total cap is reached.
+    instr_text = _read_capped(instructions_path, INSTRUCTIONS_CAP_CHARS)
+    if instr_text:
+        sections.append(
+            "## Project instructions (from the workspace; apply when relevant)\n\n"
+            + instr_text.strip()
+        )
+
     kf_text = _read_capped(known_failures_path, MEMORY_CAP_CHARS)
     if kf_text:
         sections.append(
-            "## Known-failure classes (never repeat these)\n\n" + kf_text.strip()
+            "## Known-failure notes (check against current code)\n\n" + kf_text.strip()
         )
 
     mem_text = read_active_memory_tail(memory_path, MEMORY_CAP_CHARS)
@@ -143,13 +152,6 @@ def assemble_system_prompt(
         sections.append(
             "## Workspace memory (durable notes from earlier sessions)\n\n"
             + mem_text.strip()
-        )
-
-    instr_text = _read_capped(instructions_path, INSTRUCTIONS_CAP_CHARS)
-    if instr_text:
-        sections.append(
-            "## Project instructions (from the workspace itself; follow these)\n\n"
-            + instr_text.strip()
         )
 
     result = "\n\n".join(sections)

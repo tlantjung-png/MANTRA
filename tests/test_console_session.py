@@ -114,6 +114,50 @@ class ConversationContinuityTest(unittest.TestCase):
         self.assertEqual(session.context.messages[0]["role"], "system")
 
 
+class TurnEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="mantra-evidence-")
+
+    def tearDown(self):
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_repeated_file_edit_and_command_exit_are_reported_per_turn(self):
+        session = make_session(self.workspace, [
+            tool_call_response("write_file", {"path": "note.txt", "content": "first"}),
+            tool_call_response("run_command", {"command": "echo verified"}),
+            final_response("first turn done"),
+            tool_call_response("write_file", {"path": "note.txt", "content": "second"}),
+            final_response("second turn done"),
+        ])
+        lines = []
+        session._print = lines.append
+        session.handle("write note")
+        first = "\n".join(lines)
+        self.assertIn("changed: note.txt", first)
+        self.assertIn("$ echo verified → exit 0", first)
+        self.assertIn("verification: no automatic grading", first)
+
+        lines.clear()
+        session.handle("update note")
+        second = "\n".join(lines)
+        self.assertIn("changed: note.txt", second)
+        self.assertNotIn("$ echo verified", second)
+        self.assertIn("verification: no automatic grading", second)
+
+    def test_nonzero_command_exit_is_shown_without_a_pass_claim(self):
+        session = make_session(self.workspace, [
+            tool_call_response("run_command", {"command": "exit 7"}),
+            final_response("done"),
+        ])
+        session.approvals.mode = "yolo"
+        lines = []
+        session._print = lines.append
+        session.handle("run a failing command")
+        output = "\n".join(lines)
+        self.assertIn("$ exit 7 → exit 7", output)
+        self.assertIn("verification: no automatic grading", output)
+
+
 class TurnAwareTruncationTest(unittest.TestCase):
     """Dropping messages must never orphan a tool result."""
 
@@ -404,6 +448,18 @@ class MentionTest(unittest.TestCase):
         self.assertEqual(attached, [os.path.join("src", "util.py")])
         self.assertIn("X = 1", expanded)
 
+    def test_dotfile_mention_attaches_content(self):
+        with open(os.path.join(self.workspace, ".env"), "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_TEST=1\n")
+        expanded, attached = self.expand("explain @.env")
+        self.assertEqual(attached, [".env"])
+        self.assertIn("LOCAL_TEST=1", expanded)
+
+    def test_line_reference_attaches_the_file(self):
+        expanded, attached = self.expand("explain @app.py:2-3")
+        self.assertEqual(attached, ["app.py"])
+        self.assertIn("def add(a, b):", expanded)
+
     def test_unknown_mention_leaves_text_alone(self):
         expanded, attached = self.expand("look at @nope.py")
         self.assertEqual(attached, [])
@@ -639,6 +695,19 @@ class ReplyRenderingTest(unittest.TestCase):
         rendered = [line.rstrip() for line in out.splitlines() if line.strip()]
         self.assertEqual(rendered.count("ENCHANTER Hello there, how can I help?"), 1)
         self.assertNotIn("**Hello**", out)
+
+    def test_failed_stream_shows_error_after_partial_reply(self):
+        from core.agent.exceptions import LLMError
+
+        class CuttingClient(ScriptedLLMClient):
+            def chat(self, messages, tools=None, on_delta=None, **kwargs):
+                if on_delta:
+                    on_delta("half a reply")
+                raise LLMError("stream ended without DONE")
+
+        out = self._framed_output([CuttingClient([])])
+        self.assertIn("half a reply", out)
+        self.assertIn("stream ended without DONE", out)
 
     def test_the_footer_says_one_step_not_one_steps(self):
         # Use a streamed reply so the footer (which carries

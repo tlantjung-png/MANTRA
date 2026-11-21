@@ -20,9 +20,8 @@ any work that must proceed without an operator watching each turn.
 
 ## Procedure
 
-1. Choose the vehicle: a one-shot bounded run (headless `core.main` with a task
-   JSON file) or a resumable work list via `/workflow` steps driven against the
-   same workspace.
+1. Choose a bounded headless run (`mantra-headless --config <cfg> --task <file>`)
+   for each item. Keep any multi-item work list in a file the operator can review.
 2. Set the bounds before starting: provider retry limit (default 1), max steps in
    the task config (`max_steps`), and a wall-clock budget.
 3. Write the escalation contract down first: transient conditions (rate limit,

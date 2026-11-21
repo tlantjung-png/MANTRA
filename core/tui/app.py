@@ -1539,6 +1539,12 @@ class TuiApp:
             marker += f" +{missed_now}"
         if self.transcript.scrolled:
             status = (status + marker) if status else marker.lstrip()
+        # Keep the right corner visible even when a long status or token
+        # counter fills the row. This chip is plain text, so slicing by
+        # characters is safe for its single-cell glyphs.
+        available = max(0, cols - 4)
+        if len(status) > available:
+            status = status[: max(0, available - 1)] + "…" if available else ""
         line = "╭─" + status + " "
         line += "─" * max(0, cols - visible_len(line) - 1) + "╮"
         if not status:
@@ -1642,7 +1648,10 @@ class TuiApp:
         totals = getattr(s, "totals", {}) or {}
         tokens_in = totals.get("tokens_in", 0)
         cache = totals.get("cache_hit", 0)
-        rate = f"{cache * 100 // tokens_in}%" if tokens_in else "0%"
+        # Some providers report cache reads outside their prompt-token
+        # count. In that case the denominator is unknown; never show an
+        # impossible percentage (or call an unknown rate zero).
+        rate = f"{cache * 100 // tokens_in}%" if tokens_in > 0 and cache <= tokens_in else "—"
 
         # Coloured fields, same theme as the transcript: faint labels,
         # semantic values (model in info blue, approval by mode, cache

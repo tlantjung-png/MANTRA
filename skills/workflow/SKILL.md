@@ -1,7 +1,7 @@
 ---
 name: workflow
-description: Route an ambiguous, cross-category, or skill-selection request to the correct workflow family without executing the task itself.
-version: 1.0.0
+description: Choose the relevant installed skill or ordered skill bundle for an ambiguous request, using the catalog and the user's actual goal.
+version: 1.1.0
 user-invocable: true
 ---
 
@@ -9,20 +9,22 @@ user-invocable: true
 
 ## Use When
 
-Use for questions about which skill to use, a skill-library overview, ambiguous intent, or a task that spans several workflow families.
+Use when the user asks which MANTRA skill fits a task, or when several skills
+could reasonably apply. A direct task request should normally be worked on,
+not routed into a separate discussion.
 
 ## Procedure
 
-1. Classify the request by function rather than provider or implementation language.
-2. Ask one targeted question when two routes remain genuinely ambiguous.
-3. Route a multi-skill task as a complete chain, composing the individual skills in order. Note that no bundle catalog ships yet (the bundle loader returns an empty map and the console reports no bundles found), so there are no named bundles to route through.
-4. Load the selected skill's full procedure before executing a real task.
-5. End the routed workflow with a verification skill when code or operational changes are involved.
-
-## Verification
-
-Confirm that the selected skill produces the user's requested deliverable and that the route includes required safety, testing, diagnostics, and review steps.
+1. Read the installed skill names and descriptions with `/skills` or the
+   catalog. Inspect a candidate's full procedure with `/skills show <name>`.
+2. Choose the narrowest skill that covers the requested result. Explain a
+   multi-skill sequence only when each step adds a distinct deliverable.
+3. If a skills root provides `BUNDLES.md`, check `/skills bundles` before
+   suggesting `/skills launch <name>`. Do not invent a named bundle.
+4. State the route and its reason briefly. If the user asked for the actual
+   work, continue with it using the selected procedure.
 
 ## Boundaries
 
-Routing does not execute work, invent a new workflow, or stretch an unrelated skill. Money and execution paths always include the trading-safe skill; security and performance audits use their focused skills.
+Do not claim that an unlisted slash command exists. Do not create or launch a
+bundle without the user's task calling for that action.

@@ -151,6 +151,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
     # present, else by id so an index-less gateway keeps calls separate.
     tool_acc: dict[Any, dict[str, str]] = {}
     usage: dict | None = None
+    finish_reason: str | None = None
     malformed = 0
     malformed_total = 0
     seen_done = False
@@ -178,7 +179,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             raise LLMError(f"stream contained too many malformed chunks total ({malformed_total}) — possible protocol mismatch")
 
     def _apply_chunk(chunk: Any) -> None:
-        nonlocal malformed, usage, content_bytes, args_bytes
+        nonlocal malformed, usage, finish_reason, content_bytes, args_bytes
         if not isinstance(chunk, dict):
             _count_malformed()
             return  # tolerate keep-alive / noise
@@ -192,6 +193,8 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
         choice = choices[0]
         if not isinstance(choice, dict):
             raise LLMError(f"stream choice not an object: {choice!r}")
+        if choice.get("finish_reason") is not None:
+            finish_reason = str(choice["finish_reason"])
         delta = choice.get("delta") or {}
         if not isinstance(delta, dict):
             raise LLMError(f"stream delta not an object: {delta!r}")
@@ -317,7 +320,8 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             ToolCall(id=slot["id"] or f"call_{i}", name=name, arguments=arguments)
         )
     content = "".join(content_parts)
-    return LLMResponse(content=content or None, tool_calls=tool_calls, usage=usage)
+    return LLMResponse(content=content or None, tool_calls=tool_calls, usage=usage,
+                       finish_reason=finish_reason)
 
 
 def parse_retry_after(value: str | None) -> float | None:
@@ -791,6 +795,7 @@ class OpenAICompatClient(LLMClient):
             content=_normalize_content(message.get("content")),
             tool_calls=tool_calls,
             usage=data.get("usage") or None,
+            finish_reason=choices[0].get("finish_reason"),
         )
 
     def _request_via_responses(self, body: bytes, on_delta: DeltaCallback | None = None) -> LLMResponse:

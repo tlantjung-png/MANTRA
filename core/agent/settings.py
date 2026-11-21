@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from core.agent.backup_paths import unique_corrupt_path
 from core.agent.keys import warn_insecure_transport
 from core.locking import acquire_lock, release_lock
 
@@ -107,15 +108,9 @@ def _quarantine(file: Path, reason: str) -> str | None:
     if not file.is_file():
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = file.with_suffix(file.suffix + f".corrupt-{stamp}")
-    # Second-resolution stamp collides within the same second; make the
-    # name unique instead of silently overwriting the last backup.
-    counter = 1
-    while backup.exists():
-        backup = file.with_suffix(file.suffix + f".corrupt-{stamp}-{counter}")
-        counter += 1
-        if counter > 100:
-            return None
+    backup = unique_corrupt_path(file, stamp)
+    if backup is None:
+        return None
     try:
         shutil.copy2(file, backup)
         return str(backup)
@@ -139,10 +134,14 @@ def _write(data: dict[str, Any]) -> bool:
     # process-global read state, so an unrelated failed read cannot cause a
     # healthy file to be backed up.
     if file.is_file():
+        needs_backup = False
         try:
-            json.loads(file.read_text(encoding="utf-8"))
+            existing = json.loads(file.read_text(encoding="utf-8"))
+            needs_backup = not isinstance(existing, dict)
         except (OSError, ValueError):
-            _quarantine(file, "unparseable before write")
+            needs_backup = True
+        if needs_backup and _quarantine(file, "unparseable before write") is None:
+            return False
     data["version"] = _VERSION  # Force the current schema version on every write.
     content = json.dumps(data, indent=2, sort_keys=True) + "\n"
     # File lock for inter-process safety (best effort).
@@ -224,10 +223,15 @@ def load() -> dict[str, Any]:
 
 def _clean_endpoint(entry: dict[str, Any]) -> dict[str, Any]:
     base_url = str(entry.get("base_url", "")).strip().rstrip("/")
+    raw_models = entry.get("models")
+    if isinstance(raw_models, str):
+        raw_models = [raw_models]
+    elif not isinstance(raw_models, (list, tuple)):
+        raw_models = []
     return {
         "base_url": base_url,
         "api_key_env": str(entry.get("api_key_env", "")).strip(),
-        "models": [str(m) for m in entry.get("models") or [] if str(m).strip()],
+        "models": [str(m) for m in raw_models if str(m).strip()],
         "note": str(entry.get("note", "")).strip(),
     }
 
@@ -269,7 +273,8 @@ def add_endpoint(
             "api_key_env": api_key_env or (existing or {}).get("api_key_env", ""),
             # Hand-added models survive a re-connect: only replace the
             # list when new ones were actually discovered (None means keep).
-            "models": list(models) if models is not None else (existing or {}).get("models", []),
+            "models": ([models] if isinstance(models, str) else list(models))
+            if models is not None else (existing or {}).get("models", []),
             "note": note or (existing or {}).get("note", ""),
         }
     )
@@ -301,6 +306,8 @@ def set_models(name: str, models: Iterable[str]) -> bool:
     entry = data["endpoints"].get(name)
     if entry is None:
         return False
+    if isinstance(models, str):
+        models = [models]
     entry["models"] = [str(m) for m in models if str(m).strip()]
     return _write(data)
 

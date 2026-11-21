@@ -111,6 +111,7 @@ class LLMResponse:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, Any] | None = None  # {"prompt_tokens": n, "completion_tokens": n}
+    finish_reason: str | None = None
 
     @property
     def is_final(self) -> bool:

@@ -1,45 +1,26 @@
 ---
 name: vault
-description: Verify the append-only integrity history of project state (the .mantra/vault chain) at checkpoints, after refinements, or before declaring done, where the target installation ships a verifier.
-version: 1.0.0
-user-invocable: true
+description: Check whether a workspace has an external integrity verifier and report its scope; this MANTRA build does not ship vault tooling.
+version: 1.1.0
+user-invocable: false
 ---
 
-# Vault
+# External Integrity Check
 
 ## Use When
 
-Use at a meaningful checkpoint, after a refinement completion, before or after a
-backup, or before declaring a task done that depends on durable state.
+Use only when the user explicitly asks about an existing integrity chain or
+verifier in their workspace. MANTRA does not create or verify such a chain.
 
 ## Procedure
 
-1. Locate the chain: a project's integrity chain lives at `<workspace>/.mantra/vault/`
-   with `chain.json` and `blobs/`. This repo does not ship vault tooling -
-   integrity chains were deliberately left behind (docs/ADOPTION.md) - so the
-   verifier must come from the installation that owns the chain.
-2. Verify the chain before declaring done: run that installation's verifier
-   against the workspace (or against its state directory for a standalone one).
-   It replays `chain.json`, checks linkage, hashes, and missing references.
-3. Confirm linkage, stored content hashes, and that referenced blobs exist and
-   match. Drift from current live files is separate from chain tampering and is
-   reported, not failed.
-4. When verification fails, identify the exact break and treat the state as
-   untrusted. Recover through a backup, a trusted checkpoint, or version control;
-   the vault does not repair.
-
-## Notes
-
-- Verification is read-only. Initializing or checkpointing a chain is out of
-  scope here; the `.mantra/vault` directory is the machine-local store and
-  version control remains the portability mechanism.
-
-## Verification
-
-Run the available verifier and confirm a clean result. A tampered blob or changed
-archive must be reported by name.
+1. Inspect the workspace for an existing chain and its documented verifier.
+2. If a verifier is installed, read its instructions and run it only within
+   the user's requested scope. Report what files it covers and what it cannot
+   establish.
+3. If no verifier exists, state that integrity cannot be verified through
+   this skill; do not infer a clean result from Git status or file hashes.
 
 ## Boundaries
 
-The vault detects and reports integrity problems; it never repairs them. It proves
-integrity for the recorded scope only, not provenance for arbitrary files.
+Do not invent a vault command, chain format, or successful verification.

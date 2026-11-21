@@ -30,14 +30,15 @@ user-invocable: true
 the attached procedure is injected into the agent's system prompt so it is
 followed rather than improvised.
 
-## Humanize and Copywriting
+## Writing skills
 
-Two writing skills are intentionally kept separate:
+The writing skills have distinct jobs:
 
 - `humanize` rewrites existing prose. Its priority is meaning preservation, factual fidelity, voice consistency, and natural flow. It should not inject a generic persona, artificial mistakes, statistical irregularities, or detector-evasion tactics.
+- `copy` handles a single short asset such as a headline or caption.
 - `copywriting` creates new persuasive copy. It adapts the message to audience, awareness, channel, offer, objection, and desired action while avoiding unsupported claims and formulaic marketing language.
 
-Neither skill guarantees a particular AI-detector score or claims that text is "100% human." Naturalness is treated as a writing-quality goal rather than a numerical detector target.
+None of these skills guarantees a particular AI-detector score or claims that text is "100% human." Naturalness is treated as a writing-quality goal rather than a numerical detector target.
 
 ## Origin
 
@@ -49,10 +50,10 @@ monitor stack) were rewritten to use the primitives this repo really ships:
 - workspace memory: `<workspace>/.mantra/memory.md`
 - known-failure registry: `knowledge/known-failures.md`
 - command rules: `rules/commands.rules` + `~/.mantra/rules/commands.rules`
-- workflows: `/workflow` (JSON prompt sequences in `~/.mantra/workflows.json`)
+- skill bundles: `/skills bundles` and `/skills launch <name>` when a skills root has `BUNDLES.md`
 - integrity chain: not shipped - deliberately left behind (see docs/ADOPTION.md)
 - sessions & logs: `~/.mantra/sessions/`, `logs/*.jsonl`
-- session state: `/goal`, `/todo`, `/compact`, `/sessions` (resume was folded into `/sessions`)
+- session state: `/compact`, `/sessions`; checklist items are reported in assistant replies
 - tools: the console's bounded `read_file` / `list_dir` / `search_code` / diff
   renderer, with read-before-edit enforcement built into `edit_file`
 

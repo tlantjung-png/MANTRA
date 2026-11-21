@@ -99,7 +99,7 @@ class UsageMixin:
             self.totals.get("digest_failures", 0) + int(result.metrics.get("digest_failures", 0))
         )
         # Record per-turn metrics for trend analysis.
-        rate = min(100, cache * 100 // tin) if tin > 0 else 0
+        rate = cache * 100 // tin if tin > 0 and cache <= tin else None
         self.turn_history.append({
             "turn": self.totals["turns"],
             "tokens_in": tin,
@@ -119,6 +119,7 @@ class UsageMixin:
         tout = int(result.metrics.get("tokens_out", 0))
         cache = int(result.metrics.get("cache_hit", 0))
         steps = result.steps_used
+        step_label = "STEP" if steps == 1 else "STEPS"
         elapsed = time.monotonic() - self._turn_started
         elapsed_str = _format_elapsed(elapsed)
         cache_bit = f" · {_short(cache)} CACHED" if cache else ""
@@ -128,9 +129,9 @@ class UsageMixin:
         saved = int(result.metrics.get("observation_chars_saved", 0))
         obs_bit = f" · {_short(saved)} OBS SAVED" if saved > 0 else ""
         if not tin and not tout:
-            return f"{elapsed_str} · {steps} STEP{cache_bit}{obs_bit} · CTX {_short(self.context.tokens)}"
+            return f"{elapsed_str} · {steps} {step_label}{cache_bit}{obs_bit} · CTX {_short(self.context.tokens)}"
         return (
-            f"{elapsed_str} · {steps} STEP · "
+            f"{elapsed_str} · {steps} {step_label} · "
             f"I/O {_short(tin)} / {_short(tout)}{cache_bit}{obs_bit} · CTX {_short(self.context.tokens)}"
         )
 
@@ -158,9 +159,11 @@ class UsageMixin:
             self._print("(memory write skipped: store busy or unwritable)")
 
     def _report_changes(self: "ConsoleSession") -> None:
-        """Announce files the agent touched, newest first, once each."""
+        """Announce files touched in this turn, including repeat edits."""
         changed = getattr(self.sandbox, "changed", set()) or set()
-        fresh = sorted(changed - self.reported_changes)
+        # A file edited again in a later turn still belongs in that turn's
+        # evidence, even when it was already announced earlier in the session.
+        fresh = sorted(self._turn_changed_paths | (changed - self.reported_changes))
         if not fresh:
             return
         self.reported_changes.update(fresh)

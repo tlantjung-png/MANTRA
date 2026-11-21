@@ -1,6 +1,6 @@
 ---
 name: context-handoff
-description: Manage the context budget across compaction - watch capacity signals, offload volatile state to durable files (workspace memory, the standing goal), write a continuation brief before compacting, and rebuild intent afterwards.
+description: Preserve task context across compaction by recording verified state in workspace memory or a continuation brief, then reconstructing it before resuming.
 version: 1.0.0
 user-invocable: true
 ---
@@ -18,11 +18,10 @@ in a transcript.
 1. Watch the signals: the console shows `CTX <tokens>` in the per-turn footer and
    the `/cost` dashboard. A steady climb toward the window cap means a compaction
    is coming.
-2. Offload before pressure becomes compaction: record durable state through the
-   workspace memory ledger (`<workspace>/.mantra/memory.md`), set or refresh the
-   standing goal (`/goal <text>`), and keep the session todo list (`/todo`) as the
-   checklist of what remains. Anything needed later must live on disk, not in
-   conversation memory.
+2. Before compaction, record durable facts in the workspace memory ledger
+   (`<workspace>/.mantra/memory.md`) and write the remaining actions in a
+   continuation brief. Do not rely on a chat-only checklist to survive a new
+   session.
 3. Write a continuation brief before a known stop or `/compact`: goal in one line,
    what is done with evidence pointers (files, commits, test names), exact next
    actions, open risks, and the paths that own the state. Keep it in
@@ -37,8 +36,8 @@ in a transcript.
 
 ## Verification
 
-Confirm every item needed to resume exists on disk (memory entries, brief, todo
-list) rather than in transcript memory. Confirm the first post-compaction edits
+Confirm every item needed to resume exists on disk (memory entries and brief)
+rather than in transcript memory. Confirm the first post-compaction edits
 follow the read-before-edit rule (the file tools enforce it and reject edits
 without a prior read).
 

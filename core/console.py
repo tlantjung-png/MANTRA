@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -300,6 +301,10 @@ class ConsoleSession(
         self._turn_started: float = 0.0
         # Live token counter: approximate tokens received during streaming.
         self._stream_tokens: int = 0
+        self._stream_chars: int = 0
+        self._stream_started: float | None = None
+        self._stream_segment_chars: int = 0
+        self._last_delta_at: float | None = None
         self._last_counter_update: float = 0.0
         # Timestamp of when the last prompt was sent (Enter pressed).
         self._prompt_sent_at: float = 0.0
@@ -327,6 +332,8 @@ class ConsoleSession(
         # boxes that follow each step can title themselves.
         self._last_command: str | None = None
         self._last_shell_task: str | None = None
+        self._turn_commands: list[dict[str, str]] = []
+        self._turn_changed_paths: set[str] = set()
         # Ctrl+O during a run toggles whether tool-output boxes print.
         self._show_tool_output = True
         # Tool output too big for one screenful is queued here (title,
@@ -419,6 +426,15 @@ class ConsoleSession(
         output, diffs and file contents the agent sees, not just the tool
         name. Ctrl+O (typed mid-run) hides or restores these boxes.
         """
+        if tool == "run_command" and self._turn_commands:
+            command = self._turn_commands[-1]
+            match = re.match(r"exit_code:\s*(-?\d+)\b", observation or "")
+            if match:
+                command["status"] = f"exit {match.group(1)}"
+            elif "background task " in (observation or "") and " started" in observation:
+                command["status"] = "started in background"
+            else:
+                command["status"] = "no exit code"
         # Turn-scoped evidence for the TUI's post-task suggestion engine:
         # it names the tools that ran and the artifacts they touched, so
         # the next-step rows follow the work that actually happened.
@@ -601,6 +617,7 @@ class ConsoleSession(
             elif tool == "run_command":
                 cmd = args.get("command") or ""
                 self._last_command = cmd
+                self._turn_commands.append({"command": str(cmd), "status": "pending"})
                 if cmd:
                     detail = f" {self.style.dim('>')} {self.style.dim(_sanitize_output(cmd[:60].upper()))}{'...' if len(cmd) > 60 else ''}"
             elif tool == "shell_output":
@@ -624,6 +641,8 @@ class ConsoleSession(
             else:
                 self._print(msg)
         elif name == "tool_denied":
+            if payload.get("tool") == "run_command":
+                self._turn_commands.append({"command": "(denied command)", "status": "denied"})
             self._print(f"  {self.style._wrap(theme.EMBER, 'DENIED')} {self.style.dim(payload.get('tool','').upper())}")
         elif name == "llm_rate_limited":
             # The request is paused, not failed: say so, with how long
@@ -641,6 +660,10 @@ class ConsoleSession(
             result = payload.get("result")
             ok = payload.get("ok")
             seconds = payload.get("seconds")
+            if tool in ("edit_file", "write_file") and ok and self._last_edit_path:
+                self._turn_changed_paths.add(self._last_edit_path)
+            if tool == "run_command" and not ok and self._turn_commands and self._turn_commands[-1]["status"] == "pending":
+                self._turn_commands[-1]["status"] = "failed before exit"
             # Show what changed on disk for file-edit tools: a coloured
             # before/after diff for edits, a syntax preview for newly
             # written files — the operator sees the file being edited as
@@ -661,8 +684,20 @@ class ConsoleSession(
         """Streamed content fragment from the LLM client."""
         if self._abort.is_set():
             raise AbortError("interrupted by operator")
-        # Approximate token count: ~4 chars per token.
-        self._stream_tokens += max(1, len(piece) // 4)
+        # Estimate from the whole stream. Rounding each tiny transport
+        # fragment up to one token can multiply the displayed count.
+        if piece:
+            now = time.monotonic()
+            if self._last_delta_at is None or now - self._last_delta_at > 1.0:
+                # A tool call or a new model request can pause output for
+                # seconds. Start a new speed segment while keeping the
+                # whole-turn token count.
+                self._stream_started = now
+                self._stream_segment_chars = 0
+            self._last_delta_at = now
+            self._stream_chars += len(piece)
+            self._stream_segment_chars += len(piece)
+            self._stream_tokens = max(1, (self._stream_chars + 3) // 4)
         rendered = self._stream_renderer.render_piece(piece)
         if self.layout is not None and self.layout.active:
             # The terminal host owns the mouse during streaming: while a
@@ -678,7 +713,8 @@ class ConsoleSession(
             self._stream_write(rendered)
             # Live token counter; the throttled fragment is flushed at
             # the handle() tail.
-            self._update_live_counter()
+            if self._stream_tokens:
+                self._update_live_counter()
         else:
             if not self._stream_header_done:
                 sys.stdout.write(f"{self.style.brand('ENCHANTER')} ")
@@ -716,8 +752,11 @@ class ConsoleSession(
         # Short form (1.2k); the label stays bone while the live counter
         # sits faint to its right, followed by the stream rate.
         tok_str = _short(self._stream_tokens)
-        elapsed = max(0.1, now - (self._turn_started or now))
-        rate_str = _short(round(self._stream_tokens / elapsed))
+        # Speed measures text delivery, not time spent waiting for the
+        # model's first fragment or executing tools earlier in the turn.
+        elapsed = max(0.1, now - (self._stream_started or now))
+        segment_tokens = max(1, (self._stream_segment_chars + 3) // 4)
+        rate_str = _short(round(segment_tokens / elapsed))
         if self.style.enabled:
             counter = self.style._wrap(theme.FAINT, f" {tok_str} tok · {rate_str} tok/s")
             body = self.style.hair("\u2502 ") + self.style.bone("MANTRA >") + counter
@@ -779,49 +818,56 @@ class ConsoleSession(
     # ---- message handling ------------------------------------------------
 
     def _effective_system_prompt(self, request_text: str = "") -> str:
-        """The base prompt plus whatever the session is working through.
-
-        Rebuilt per turn rather than frozen at startup, because the
-        checklist changes while the session is running. Appended rather
-        than spliced into the base so the standing instructions stay
-        intact. Re-applies total cap after additions.
-        """
-        prompt = self.system_prompt
+        """Keep selected procedures and the live checklist within the cap."""
+        skill_budget = 12_000
+        skill_blocks: list[str] = []
+        used = 0
+        available_skills = skills.load_all() if self.active_skills else {}
         for name in self.active_skills:
-            skill = skills.get(name)
+            skill = available_skills.get(name.lower())
             if skill is None or not skill.body.strip():
                 continue
-            prompt += (
+            block = (
                 "\n\n## Skill in force: " + skill.name
                 + "\nFollow this procedure where it applies to the current task.\n\n"
                 + skill.body.strip()
             )
             if skill.resources:
-                prompt += "\n\nBundled with this skill: " + ", ".join(skill.resources)
+                block += "\n\nBundled with this skill: " + ", ".join(skill.resources)
+            if used + len(block) > skill_budget:
+                if not skill_blocks:
+                    marker = "\n... [skill procedure truncated to fit prompt budget]"
+                    block = block[: skill_budget - len(marker)] + marker
+                    skill_blocks.append(block)
+                self._note(f"skill '{skill.name}' was clipped or skipped because attached skills exceed the prompt budget")
+                break
+            skill_blocks.append(block)
+            used += len(block)
+
+        skill_text = "".join(skill_blocks)
+        todo_text = "\n" + "\n".join(self._todos_prompt_lines()) if self.todos else ""
+        if len(todo_text) > 3_000:
+            marker = "\n... [checklist truncated to fit prompt budget]"
+            todo_text = todo_text[: 3_000 - len(marker)] + marker
+            self._note("checklist truncated to fit prompt budget")
+
+        # The base has project instructions before historical notes. Trim its
+        # tail to make room for the chosen skill and current checklist.
+        base_budget = SYSTEM_PROMPT_CAP - len(skill_text) - len(todo_text)
+        prompt = self.system_prompt
+        if len(prompt) > base_budget:
+            marker = "\n... [older prompt context trimmed for active work]"
+            prompt = prompt[: max(0, base_budget - len(marker))] + marker
+        prompt += skill_text + todo_text
+
         # Progressive disclosure: the newest memory entries already ride
         # in the base prompt; add only the older entries this request
         # actually touches (keyword-ranked, capped).
         rel = relevant_memory(self.memory_path, request_text)
         if rel:
-            prompt += "\n\n## Memory relevant to this request\n" + rel
-        if not self.todos:
-            # Re-apply cap even when only skills were added
-            if len(prompt) > SYSTEM_PROMPT_CAP:
-                prompt = _truncate_codepoint(prompt, SYSTEM_PROMPT_CAP) + "\n... [truncated — system prompt exceeded cap]"
-            return prompt
-        lines: list[str] = []
-        lines += self._todos_prompt_lines()
-        injected_block = "\n" + "\n".join(lines)
-        base_len = len(prompt)
-        prompt = prompt + injected_block
-        if len(prompt) > SYSTEM_PROMPT_CAP:
-            # Truncate on a code-point boundary so no multibyte char is
-            # split mid-sequence.
-            prompt = _truncate_codepoint(prompt, SYSTEM_PROMPT_CAP) + "\n... [truncated — prompt exceeded cap after checklist injection]"
-            # The injected checklist block is the tail, so a cap hit can
-            # drop it entirely; say so rather than losing it silently.
-            if base_len >= SYSTEM_PROMPT_CAP:
-                self._note("checklist block dropped - system prompt over the total cap")
+            block = "\n\n## Memory relevant to this request\n" + rel
+            if len(prompt) + len(block) <= SYSTEM_PROMPT_CAP:
+                prompt += block
         return prompt
 
     def _todos_prompt_lines(self) -> list[str]:
@@ -940,17 +986,19 @@ class ConsoleSession(
         # said, not the message with attached file dumps appended, and a
         # launched bundle must still see the original wording.
         request_text = text
-        text, attached = self.expand_mentions(text)
-        if attached:
-            shown = attached[:8]
-            extra = "" if len(attached) <= 8 else f" (+{len(attached) - 8} more)"
-            self._note("attached: " + ", ".join(shown) + extra)
         # Routed before the turn runs, so the chosen procedure is in the
         # system prompt the agent actually reads rather than in the next
         # one, which may never come.
         bundle = self.auto_route(request_text)
         if bundle:
-            return _skills_launch(self, bundle, initial_text=text)
+            # The first bundle step calls handle() again. Leave mentions
+            # untouched here so that step attaches them exactly once.
+            return _skills_launch(self, bundle, initial_text=request_text)
+        text, attached = self.expand_mentions(text)
+        if attached:
+            shown = attached[:8]
+            extra = "" if len(attached) <= 8 else f" (+{len(attached) - 8} more)"
+            self._note("attached: " + ", ".join(shown) + extra)
         task = {"task_id": f"console-{self._task_counter}", "problem_statement": text}
 
         self._auto_compact()
@@ -975,12 +1023,18 @@ class ConsoleSession(
         self._streamed_this_run = False
         self._stream_header_done = False
         self._stream_tokens = 0
+        self._stream_chars = 0
+        self._stream_started = None
+        self._stream_segment_chars = 0
+        self._last_delta_at = None
         self._last_counter_update = 0.0
         self._stream_renderer.reset()
         # Reports the agent emits this turn are applied and announced as
         # its reply streams; the list is cleared so the end-of-turn pass
         # knows what it still has to handle.
         self._turn_todo_reports = []
+        self._turn_commands = []
+        self._turn_changed_paths = set()
         self._stream_renderer.report_hook = self._handle_stream_todo_report
 
         self._turn_started = time.monotonic()
@@ -1032,6 +1086,10 @@ class ConsoleSession(
                 else:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
+                if result is not None and result.stopped_reason == "error" and result.final_message:
+                    # A stream can fail after showing part of a reply. The
+                    # partial text must not be mistaken for a finished answer.
+                    self._print(self.style.ember(f"  !! {result.final_message}"))
             elif result is not None and result.final_message:
                 # Same sanitization contract as the streaming path: model
                 # text must never drive the terminal, whether it arrives
@@ -1092,6 +1150,7 @@ class ConsoleSession(
         self._record_usage(result)
         self._record_memory(task, result)
         self._report_changes()
+        self._report_verification(result)
         self._check_todo_completion(result)
         # Attention: a failed turn or a denied approval is the
         # one thing that must not pass silently.
@@ -1105,6 +1164,22 @@ class ConsoleSession(
         self._stream_tokens = 0
         if result is not None:
             self._print(f"  {self.style.dim(self._usage_line(result))}")
+
+    def _report_verification(self, result: "RunResult") -> None:
+        """Show observed command outcomes without claiming automatic grading."""
+        if self._turn_commands:
+            for item in self._turn_commands[-8:]:
+                command = _sanitize_output(item["command"].replace("\r", " ").replace("\n", " "))
+                if len(command) > 180:
+                    command = command[:177] + "..."
+                self._print(f"  {self.style.dim('$ ' + command + ' → ' + item['status'])}")
+            if len(self._turn_commands) > 8:
+                self._print(self.style.dim(f"  ({len(self._turn_commands) - 8} earlier commands omitted)"))
+        if self._turn_changed_paths or self._turn_commands or result.stopped_reason != "final":
+            status = "no automatic grading"
+            if result.stopped_reason != "final":
+                status += f"; turn stopped: {result.stopped_reason}"
+            self._print(f"  {self.style.dim('verification: ' + status)}")
 
     # ---- inspection commands ---------------------------------------------
 

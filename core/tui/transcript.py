@@ -183,7 +183,7 @@ def wrap_ansi(text: str, width: int) -> list[str]:
     return out if out else [""]
 
 _MAX_LINES = 8000
-_PARTIAL_CAP = 4096  # longest live tail held for an unterminated line
+_PARTIAL_CAP = 4096  # longest uncommitted tail of an unterminated line
 
 
 class Transcript:
@@ -215,15 +215,31 @@ class Transcript:
                     self.display.extend(added)
                     if not self.follow:
                         self.missed += len(added)
+                        self.offset += len(added)
             self.version += 1
 
     def append_partial(self, styled_text: str) -> None:
         """Feed a live fragment: complete lines commit, the tail is held."""
         with self._lock:
+            old_partial_rows = len(self._partial_rows)
             data = (self.partial + styled_text).replace("\r", "")
             parts = data.split("\n")
-            self.partial = parts.pop()[-_PARTIAL_CAP:]
+            tail = parts.pop()
+            # Commit long unbroken output in bounded chunks. Keeping only
+            # the last 4096 chars silently erased the start of a streamed
+            # reply before its first newline arrived.
+            while len(tail) > _PARTIAL_CAP:
+                cut = _PARTIAL_CAP
+                for match in _ANSI_RE.finditer(tail[:cut + 32]):
+                    if match.start() < cut < match.end():
+                        cut = match.start()
+                        break
+                parts.append(tail[:cut])
+                tail = tail[cut:]
+            self.partial = tail
             self._cache_partial_locked()
+            if not self.follow:
+                self.offset = max(0, self.offset + len(self._partial_rows) - old_partial_rows)
             for line in parts:
                 self.append(line)
 
@@ -231,8 +247,11 @@ class Transcript:
         with self._lock:
             if self.partial:
                 pending = self.partial
+                old_partial_rows = len(self._partial_rows)
                 self.partial = ""
                 self._partial_rows = []
+                if not self.follow:
+                    self.offset = max(0, self.offset - old_partial_rows)
                 self.append(pending)
 
     def clear(self) -> None:
@@ -280,7 +299,7 @@ class Transcript:
 
     def visible_rows(self, height: int) -> list[str]:
         with self._lock:
-            pool = self.display if self.offset > 0 else self.display + self._partial_rows
+            pool = self.display + self._partial_rows
             if height <= 0:
                 return []
             if self.offset > 0:
@@ -345,13 +364,10 @@ class Transcript:
     def row_source(self, height: int) -> list[tuple[int, str]]:
         """(display-row-index, styled-text) for the currently visible rows."""
         with self._lock:
-            if self.offset > 0:
-                end = max(0, len(self.display) - self.offset)
-                start = max(0, end - height)
-                return [(i, self.display[i]) for i in range(start, end)]
             pool = self.display + self._partial_rows
-            start = max(0, len(pool) - height)
-            return [(i, pool[i]) for i in range(start, len(pool))]
+            end = max(0, len(pool) - self.offset)
+            start = max(0, end - height)
+            return [(i, pool[i]) for i in range(start, end)]
 
     def row_text(self, display_index: int) -> str:
         with self._lock:

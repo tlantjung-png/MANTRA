@@ -29,7 +29,7 @@ include-package-data = true
 "knowledge" = ["knowledge/*.md"]
 "rules" = ["rules/*.rules"]
 # data-files installs each matched file by basename into its key's folder.
-# A single skills-wide glob would collapse all 55 manifests into one
+# A single skills-wide glob would collapse all skill manifests into one
 # SKILL.md, so every skill needs its own destination key.
 "skills" = ["skills/INDEX.md"]
 "skills/adopt-workspace" = ["skills/adopt-workspace/SKILL.md"]
@@ -54,8 +54,8 @@ include-package-data = true
 "skills/diff-review" = ["skills/diff-review/SKILL.md"]
 "skills/eval" = ["skills/eval/SKILL.md"]
 "skills/evolve" = ["skills/evolve/SKILL.md"]
-"skills/excel" = ["skills/excel/SKILL.md"]
 "skills/exec-mode" = ["skills/exec-mode/SKILL.md"]
+"skills/excel" = ["skills/excel/SKILL.md"]
 "skills/help" = ["skills/help/SKILL.md"]
 "skills/humanize" = ["skills/humanize/SKILL.md"]
 "skills/imagine" = ["skills/imagine/SKILL.md"]

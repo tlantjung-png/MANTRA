@@ -77,6 +77,7 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
             session.active_skills = []
         else:
             session._print(session.style.dim("  no skills attached"))
+        session.auto_attached = []
     else:
         # A bare skill name attaches in 1 step; the explicit "use" form
         # covers names that collide with a verb above.
@@ -244,16 +245,26 @@ def _skills_one_shot(session: "ConsoleSession", found, reference: str) -> None:
     marked auto-attached so the turn's end detaches it again.
     """
     key = found.name.lower()
-    if key not in session.active_skills:
+    added = key not in session.active_skills
+    if added:
         session.active_skills.append(key)
         session.auto_attached.append(key)
     _warn_untrusted_skill(session, found)
     session._print(session.style.dim(f"  running '{found.name}' once on: {reference}"))
-    session.handle(f"Apply the {found.name} skill to: {reference}")
-    # handle detaches auto-attached skills at turn end; this guards the
-    # path where the turn aborts before its own cleanup runs.
-    session._detach_auto()
-    session._print(session.style.dim(f"  '{found.name}' ran once and is detached"))
+    try:
+        result = session.handle(f"Apply the {found.name} skill to: {reference}")
+    finally:
+        # Keep any skill that was already attached. Clean up even if handle
+        # fails before its own turn-finally block runs.
+        if added:
+            session.auto_attached = [s for s in session.auto_attached if s != key]
+            session.active_skills = [s for s in session.active_skills if s != key]
+    if result is None or getattr(result, "stopped_reason", None) in ("error", "aborted"):
+        session._print(session.style.warn(f"  '{found.name}' did not complete"))
+    elif added:
+        session._print(session.style.dim(f"  '{found.name}' ran once and is detached"))
+    else:
+        session._print(session.style.dim(f"  '{found.name}' ran once; existing attachment kept"))
 
 
 def _skills_use_all(session: "ConsoleSession") -> None:
@@ -349,10 +360,10 @@ def _skills_launch(
                 result = session.handle(prompt)
             except KeyboardInterrupt:
                 session._print(session.style.warn("  bundle stopped"))
-                return last
-            if result is None:
+                return None
+            if result is None or getattr(result, "stopped_reason", None) in ("error", "aborted"):
                 session._print(session.style.warn("  bundle stopped: the step did not complete"))
-                return last
+                return result
             last = result
     finally:
         session.in_bundle = was_in_bundle

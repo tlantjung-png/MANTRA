@@ -24,8 +24,7 @@ Use at turn end or manually when a completed phase may contain a durable lesson.
 5. Restate every saved lesson from the repository's vantage: a durable entry must
    read correctly at HEAD with no session transcript available. Do not save
    session-vantage narration, review choreography, or hedged planning residue;
-   promote deferred work to the session todo list (`/todo add`) or a stated bound
-   instead.
+   state deferred work concretely in the final report instead.
 6. Complete the refinement with an evidence record, then remove the brief.
 7. Undo a bad refinement by restoring the snapshots and recording the rollback.
 

@@ -68,7 +68,7 @@ Escape also stops the current run while it is streaming."""
 # "user@example.com" and "a@b" from being read as file references.
 # Trailing punctuation like .,;:!?) is stripped later so "@src/app.py." at
 # the end of a sentence still resolves to the file.
-MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_][\w.:/\\\-*]*)")
+MENTION_RE = re.compile(r"(?<![\w])@([\w.\-][\w.:/\\\-*]*)")
 # Characters that are often trailing punctuation after a mention and
 # should not be considered part of the path.
 _MENTION_TRIM = ".,;:!?)]'\"`"

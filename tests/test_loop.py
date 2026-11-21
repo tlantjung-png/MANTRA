@@ -51,6 +51,21 @@ def test_final_answer_passes(tmp_path) -> None:
     sandbox.cleanup()
 
 
+def test_token_limited_answer_continues_instead_of_ending_mid_reply(tmp_path) -> None:
+    from core.types import LLMResponse
+
+    script = _script_client(
+        LLMResponse(content="first half ", finish_reason="length"),
+        LLMResponse(content="second half", finish_reason="stop"),
+    )
+    loop, sandbox = _loop(script, tmp_path)
+    result = loop.run(_task())
+    assert result.stopped_reason == "final"
+    assert result.final_message == "first half second half"
+    assert "Continue the unfinished answer" in script.received_messages[1][-1]["content"]
+    sandbox.cleanup()
+
+
 def test_tool_call_executes_and_returns_observation(tmp_path) -> None:
     script = _script_client(
         tool_call_response("write_file", {"path": "out.txt", "content": "hi"}),

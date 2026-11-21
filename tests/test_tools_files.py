@@ -50,6 +50,18 @@ def test_read_window_and_resume(sandbox, tools) -> None:
     assert "more lines remain" in out
 
 
+def test_comma_list_read_honors_window(sandbox, tools) -> None:
+    import os
+
+    for name in ("a.txt", "b.txt"):
+        with open(os.path.join(sandbox.root, name), "w", encoding="utf-8") as fh:
+            fh.write("first\nsecond\nthird")
+    out = tools["read"].execute(sandbox, path="a.txt,b.txt", offset=1, limit=1)
+    assert out.count("second") == 2
+    assert "first" not in out
+    assert "third" not in out
+
+
 def test_read_offset_past_eof(sandbox, tools) -> None:
     import os
 

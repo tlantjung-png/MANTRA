@@ -111,17 +111,16 @@ class WorkspaceMixin:
         context_chars = self.context.chars
 
         # Derived metrics.
-        cache_rate = (cache_hit * 100 // tokens_in) if tokens_in > 0 else 0
-        cache_saved = cache_hit // 2  # ~50% discount
+        cache_rate = (cache_hit * 100 // tokens_in) if tokens_in > 0 and cache_hit <= tokens_in else None
         obs_saved = int(t.get("observation_saved", 0) or 0)
 
         self._print(f"turns        {t['turns']}")
         self._print(f"tokens in    {tokens_in}")
         self._print(f"tokens out   {tokens_out}")
-        # Cache analytics: show hit rate and estimated savings.
-        if tokens_in > 0 and cache_hit > 0:
+        # Show a percentage only when the provider's prompt count includes
+        # cache reads. Actual price savings depend on the selected provider.
+        if cache_rate is not None and cache_hit > 0:
             self._print(f"cache hit    {cache_hit} ({cache_rate}% of prompt)")
-            self._print(f"cache saved  {cache_saved} tokens (~50% discount)")
         else:
             self._print(f"cache hit    {cache_hit}")
         self._print(f"tool errors  {t['tool_errors']}")
@@ -154,6 +153,7 @@ class WorkspaceMixin:
                 tout = entry['tokens_out']
                 ch = entry['cache_hit']
                 cr = entry['cache_rate']
+                rate_label = f"{cr}%" if cr is not None else "—"
                 self._print(
-                    f"  {entry['turn']:<6}{tin:<8}{tout:<8}{ch:<8}{cr}%"
+                    f"  {entry['turn']:<6}{tin:<8}{tout:<8}{ch:<8}{rate_label}"
                 )

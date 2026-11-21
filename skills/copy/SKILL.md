@@ -1,28 +1,27 @@
 ---
 name: copy
-description: Write specific, persuasive marketing or branded content in a truthful voice without invented claims, guarantees, or generic filler.
-version: 1.0.0
+description: Write short standalone marketing copy such as a headline, caption, subject line, or call to action from supported facts.
+version: 1.1.0
 user-invocable: true
 ---
 
-# Copy
+# Short Copy
 
 ## Use When
 
-Use for product pages, campaigns, advertisements, email, social content, or brand messaging.
+Use for one short asset: a headline, caption, subject line, product blurb, or
+call to action. Use `copywriting` for a full page, campaign, email sequence, or
+multi-part persuasion brief.
 
 ## Procedure
 
-1. Clarify the audience, offer, desired action, proof, channel, and voice.
-2. Choose one benefit-led angle rather than blending several weak promises.
-3. Structure the message around a clear hook, specific value, credible proof, and appropriate action.
-4. Produce variants only when they serve a real channel or audience distinction.
-5. Remove generic claims and verify every factual statement.
+1. Identify the audience, message, channel, length, and one desired action.
+2. Write the shortest clear version that conveys a supported benefit.
+3. Check each claim against the brief. Remove invented proof, urgency, and
+   guarantees.
+4. Offer alternatives only when they differ meaningfully in angle or tone.
 
 ## Verification
 
-Deliver the copy with a short rationale describing the chosen angle and any assumptions that remain.
-
-## Boundaries
-
-Never invent pricing, performance, customer evidence, or guarantees. Do not promise returns or certainty for financial or trading content.
+Deliver the requested asset in its channel's format and state any material
+assumption needed before publication.

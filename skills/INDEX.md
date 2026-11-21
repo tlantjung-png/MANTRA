@@ -11,11 +11,11 @@
 | `code-review` | Perform a strict maintainability and structural-quality review focused on correctness risks, lifecycle, boundaries, duplication, code growth, and the model-visible surface, reporting evidence-backed findings. |
 | `commit-message` | Derive a conventional commit message from the actual staged or working-tree change while keeping unrelated concerns separate. |
 | `compress-output` | Use the console's bounded tools (read_file with caps, list_dir, search_code, the paged diff renderer) instead of raw file dumps, ls, grep, or git diff when the result would be large. Compression at the source keeps the context window small and the model focused on the relevant signal. |
-| `context-handoff` | Manage the context budget across compaction - watch capacity signals, offload volatile state to durable files (workspace memory, the standing goal), write a continuation brief before compacting, and rebuild intent afterwards. |
-| `copy` | Write specific, persuasive marketing or branded content in a truthful voice without invented claims, guarantees, or generic filler. |
-| `copywriting` | Create persuasive copy that sounds natural, audience-aware, specific, and credible while preserving factual accuracy and avoiding formulaic marketing language. |
+| `context-handoff` | Preserve task context across compaction by recording verified state in workspace memory or a continuation brief, then reconstructing it before resuming. |
+| `copy` | Write short standalone marketing copy such as a headline, caption, subject line, or call to action from supported facts. |
+| `copywriting` | Write persuasive product and brand copy for a specific audience and channel, using only claims the brief supports. |
 | `create-skill` | Create and register a new workflow skill with valid metadata, a focused procedure, catalog and routing entries, and verification coverage. |
-| `create-workflow` | Create, register, and launch a MANTRA workflow (an ordered prompt sequence in ~/.mantra/workflows.json) using the /workflow commands. |
+| `create-workflow` | Define an ordered skill bundle in a skills root using installed skill names, then verify it with the supported /skills bundle commands. |
 | `debug` | Reproduce a bug or failure, identify its root cause from the actual path, make the smallest safe correction, and prove the regression is gone. |
 | `dependency-upgrade` | Upgrade one dependency while researching compatibility, handling breaking changes, preserving scope, and proving the result with project checks. |
 | `deploy-parity` | Copy changed assets (skills, rules, scripts, knowledge) to a target directory or backup backup-first, with SHA-256 parity proof and a recorded rollback path. |
@@ -25,8 +25,8 @@
 | `diff-review` | Inspect a working-tree diff hunk by hunk and selectively accept or reject changes using the console's /diff and file tools without mutating unread content. |
 | `eval` | Measure agent-loop quality with the repo's test suite and session logs - validate gates, classify blast radius, and report cost per accepted change. |
 | `evolve` | Run a closed task-aware harness-evolution loop that diagnoses a task against pass/fail success criteria, proposes a harness change and model lane, and locks regressions into the known-failure registry. Use when a task repeatedly fails, when a harness needs tuning, or when a failure should become a durable regression. |
+| `exec-mode` | Choose between an interactive MANTRA turn, a named skill bundle, and a bounded headless task using the interfaces this repository ships. |
 | `excel` | Build auditable spreadsheets, financial models, trackers, or data workbooks with explicit inputs, formulas, tie-outs, and usage guidance. |
-| `exec-mode` | Recommend whether a task should run in a regular session, as a MANTRA workflow, or as a goal, using a deterministic signal table, and log the decision to the workspace memory. |
 | `help` | Explain current MANTRA setup, configuration, authentication, skills, commands, and troubleshooting from the actual repository and ~/.mantra state. |
 | `humanize` | Audit prose with the deterministic `prose_audit` tool, then rewrite stiff, robotic, repetitive, or overly polished writing into natural prose while preserving meaning, facts, terminology, and the writer's intended voice; re-run the audit to verify. |
 | `imagine` | Plan image generation, image editing, short video workflows, and UI demonstration GIFs with accurate prompts, references, consistency checks, and safe handling of likenesses. |
@@ -51,9 +51,9 @@
 | `trading-safe` | Review live-money, order, position, execution, and risk paths with a fail-closed standard, proof requirements, numerical checks, and explicit operator decisions. |
 | `ui-verify` | Verify web and UI changes end to end in the browser - exercise the changed flow like a real user, hunt cross-page regressions, check edge states, and confirm desktop and mobile viewports. |
 | `unattended` | Run bounded unattended work headless or scheduled with provider fallback limits, resumable state, and an explicit escalation contract. |
-| `update-memory` | Maintain a concise dated project-state ledger (workspace .mantra/memory.md) with goals, constraints, progress, decisions, next steps, critical context, and relevant files, pruning entries by future decision value. |
+| `update-memory` | Preserve verified facts that will matter in later sessions in the workspace memory ledger, without duplicating or retaining stale entries. |
 | `update-taste` | Maintain concise durable coding and documentation conventions in the repo (knowledge/known-failures.md and AGENTS.md) without inventing one-off preferences. |
-| `vault` | Verify the append-only integrity history of project state (the .mantra/vault chain) at checkpoints, after refinements, or before declaring done, where the target installation ships a verifier. |
-| `workflow` | Route an ambiguous, cross-category, or skill-selection request to the correct workflow family without executing the task itself. |
+| `vault` | Check whether a workspace has an external integrity verifier and report its scope; this MANTRA build does not ship vault tooling. |
+| `workflow` | Choose the relevant installed skill or ordered skill bundle for an ambiguous request, using the catalog and the user's actual goal. |
 | `write-docs` | Write precise technical documentation for current code, APIs, workflows, or features by tracing behavior, applying placement and detail hierarchy, and cross-checking every claim. |
 | `write-migration` | Design a safe reversible database migration by following existing conventions and assessing data loss, defaults, indexes, locks, downtime, and rollback. |

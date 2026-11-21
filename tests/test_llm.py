@@ -27,6 +27,17 @@ def test_plain_text_stream() -> None:
     assert response.tool_calls == []
 
 
+def test_stream_preserves_length_finish_reason() -> None:
+    lines = _sse_content("unfinished", done=False)
+    lines.extend([
+        "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "length"}]}),
+        "",
+        "data: [DONE]",
+    ])
+    response = parse_sse_stream(lines)
+    assert response.finish_reason == "length"
+
+
 def test_stream_without_done_is_rejected() -> None:
     with pytest.raises(LLMError, match="without DONE"):
         parse_sse_stream(_sse_content("hi", done=False))

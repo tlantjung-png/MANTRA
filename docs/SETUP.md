@@ -30,7 +30,7 @@ Repository-specific instructions are discovered by searching the workspace root 
 
 The system prompt is assembled from the base instruction, environment facts, known-failure knowledge, the durable memory tail, and any repository instructions, with a total cap that is re-applied after per-turn additions.
 
-The interactive console requires a terminal for full functionality. When standard input or output is not a terminal, the console falls back to plain line input and omits decorative framing. A non-interactive single-message mode is available for scripting and for probes. On Windows the console runs on the record-based input path, which delivers every key as a structured record; on other platforms the byte-stream decoder applies the same rules for escape, delete, modifiers, and pastes, so key behaviour does not depend on the platform.
+The interactive console requires a terminal for full functionality. When standard input or output is not a terminal, the console falls back to plain line input and omits decorative framing. A non-interactive single-message mode is available for scripting and for probes. On Windows the console requests virtual-terminal input so Windows Terminal sends mouse-wheel reports instead of alternate-screen arrow keys; the record reader reassembles encoded keys and mouse reports while also accepting native records. It checks the input mode during the session and restores mouse reporting if another console client resets it. On other platforms the byte-stream decoder applies the same rules for escape, delete, modifiers, and pastes.
 
 ## Verification
 

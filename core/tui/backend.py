@@ -131,6 +131,7 @@ class Backend:
         # Windows console mode to restore on exit.
         self._saved_in_mode: int | None = None
         self._saved_out_mode: int | None = None
+        self._vt_input_supported = False
         self._stopped = False
 
     # ── lifecycle ─────────────────────────────────────────────
@@ -265,21 +266,43 @@ class Backend:
         if kernel32.GetConsoleMode(self._stdout_handle, ctypes.byref(mode)):
             self._saved_out_mode = mode.value
             kernel32.SetConsoleMode(self._stdout_handle, mode.value | 0x0004)
-        # Input: mouse + window (resize) events; quick-edit selection is
-        # disabled because the application draws its own. VT-input mode
-        # (0x0200) is deliberately NOT enabled: it makes the pseudoconsole
-        # deliver the whole input as a raw VT byte stream — arrow keys
-        # decompose into escape garbage and backspace arrives as an
-        # invisible DEL character. Without it every key arrives as a
-        # proper virtual-key record, which is exactly what the decoder
-        # below consumes.
+        # Request VT input as well as mouse/window records. Windows Terminal
+        # can translate wheel motion in the alternate screen to arrow keys
+        # unless the application requests terminal-encoded mouse input.
+        # The reader below reassembles VT sequences delivered as key records
+        # (including arrows, backspace and SGR wheel reports).
         mode = wintypes.DWORD()
         if kernel32.GetConsoleMode(self._stdin_handle, ctypes.byref(mode)):
             self._saved_in_mode = mode.value
-            new = mode.value | 0x0010 | 0x0008 | 0x0080
+            new = mode.value | 0x0010 | 0x0008 | 0x0080 | 0x0200
             new &= ~0x0040  # ENABLE_QUICK_EDIT_MODE
-            new &= ~0x0200  # ENABLE_VIRTUAL_TERMINAL_INPUT
-            kernel32.SetConsoleMode(self._stdin_handle, new)
+            self._vt_input_supported = bool(kernel32.SetConsoleMode(self._stdin_handle, new))
+            if not self._vt_input_supported:
+                # Older hosts may not support VT input. Keep native mouse
+                # and window events available as a fallback.
+                kernel32.SetConsoleMode(self._stdin_handle, new & ~0x0200)
+
+    def _ensure_windows_input_mode(self) -> None:
+        """Restore mouse input flags if another console client cleared them."""
+        import ctypes
+        from ctypes import wintypes
+
+        if self._saved_in_mode is None:
+            return
+        kernel32 = ctypes.windll.kernel32
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(self._stdin_handle, ctypes.byref(mode)):
+            return
+        required = 0x0010 | 0x0008 | 0x0080
+        if self._vt_input_supported:
+            required |= 0x0200
+        if mode.value & required == required and not mode.value & 0x0040:
+            return
+        restored = (mode.value | required) & ~0x0040
+        if kernel32.SetConsoleMode(self._stdin_handle, restored):
+            # A console mode reset can also leave the host's mouse tracking
+            # out of sync. Reassert the SGR request before the next wheel.
+            self.write(self._MOUSE_ON)
 
     def _leave_windows(self) -> None:
         import ctypes
@@ -465,6 +488,7 @@ class Backend:
             now = time.monotonic()
             if now - last_size_poll >= 0.2:
                 last_size_poll = now
+                self._ensure_windows_input_mode()
                 self.emit_resize_if_changed()
             # A decomposed sequence whose records arrive gappily gets a
             # generous grace window: flushing early would spray the
@@ -634,6 +658,10 @@ class Backend:
         # character form is ambiguous with control codes.
         if vk == 0x1B:
             return [Key("esc", mods)]
+        if ch == "\x7f":
+            # VT input encodes Backspace as DEL even when the virtual key
+            # field is absent. Keep it out of the composer text buffer.
+            return [Key("backspace", mods)]
         # Control characters arrive as their control code in uChar. A NUL
         # uChar means the key carries no character at all (arrows, function
         # keys): it must fall through to the virtual-key lookup below

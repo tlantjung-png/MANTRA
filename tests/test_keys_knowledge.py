@@ -69,6 +69,20 @@ def test_corrupt_store_quarantined(monkeypatch, tmp_path) -> None:
     assert backups, "corrupt store must be copied aside"
 
 
+def test_corrupt_credentials_keep_distinct_backups_with_same_timestamp(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "credentials.json"
+    monkeypatch.setattr(keys.time, "strftime", lambda _format: "20200101-000000")
+    path.write_text("{first", encoding="utf-8")
+    assert keys.stored_keys() == {}
+    path.write_text("{second document", encoding="utf-8")
+    assert keys.stored_keys() == {}
+    backups = sorted(tmp_path.glob("credentials.json.corrupt-*"))
+    assert len(backups) == 2
+    assert {backup.read_text(encoding="utf-8") for backup in backups} == {
+        "{first", "{second document",
+    }
+
+
 def test_append_memory_caps_size(tmp_path) -> None:
     mem = tmp_path / "MEMORY.md"
     for i in range(50):
@@ -127,6 +141,19 @@ def test_assemble_system_prompt_caps_total(tmp_path) -> None:
     # stays far below the 20k prompt ceiling.
     assert len(prompt) < 20_000
     assert prompt.startswith("BASE")
+
+
+def test_project_instructions_precede_history_under_prompt_pressure(tmp_path) -> None:
+    failures = tmp_path / "failures.md"
+    instructions = tmp_path / "AGENTS.md"
+    failures.write_text("k" * 8_000, encoding="utf-8")
+    instructions.write_text("PROJECT_RULE: keep the public API stable", encoding="utf-8")
+    prompt = assemble_system_prompt(
+        "B" * 15_000,
+        known_failures_path=str(failures),
+        instructions_path=str(instructions),
+    )
+    assert "PROJECT_RULE: keep the public API stable" in prompt
 
 
 def test_canonical_command_aliases() -> None:

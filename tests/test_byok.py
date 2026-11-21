@@ -22,6 +22,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from pathlib import Path
 from unittest import mock
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -207,6 +208,12 @@ class EndpointStoreTest(TempStorage, unittest.TestCase):
         set_models("mybox", ["new-a", "new-b"])
         self.assertEqual(models_for("mybox"), ["new-a", "new-b"])
 
+    def test_single_model_string_is_not_split_into_characters(self):
+        add_endpoint("mybox", "https://llm.internal/v1", models="model-one")
+        self.assertEqual(models_for("mybox"), ["model-one"])
+        set_models("mybox", "model-two")
+        self.assertEqual(models_for("mybox"), ["model-two"])
+
     def test_set_models_ignores_an_unknown_endpoint(self):
         set_models("never-added", ["x"])
         self.assertEqual(endpoints(), {})
@@ -287,6 +294,14 @@ class HandEditTest(TempStorage, unittest.TestCase):
         self.assertEqual(get_endpoint("bare")["models"], [])
         self.assertEqual(active()["endpoint"], "")
 
+    def test_malformed_models_do_not_break_other_endpoints(self):
+        self._write(json.dumps({"endpoints": {
+            "bad": {"base_url": "https://bad/v1", "models": 42},
+            "good": {"base_url": "https://good/v1", "models": ["usable"]},
+        }}))
+        self.assertEqual(models_for("bad"), [])
+        self.assertEqual(models_for("good"), ["usable"])
+
     def test_broken_json_loads_as_empty_rather_than_crashing(self):
         self._write("{ this is not json")
         self.assertEqual(endpoints(), {})
@@ -300,6 +315,33 @@ class HandEditTest(TempStorage, unittest.TestCase):
     def test_a_non_object_file_is_ignored(self):
         self._write('"just a string"')
         self.assertEqual(endpoints(), {})
+
+    def test_non_object_file_is_backed_up_before_replacement(self):
+        self._write('"just a string"')
+        self.assertTrue(add_endpoint("new", "https://new/v1"))
+        backups = list(settings_path().parent.glob("config.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), '"just a string"')
+
+    def test_corrupt_backups_keep_both_copies_in_the_same_second(self):
+        from core.agent import settings as settings_module
+
+        self._write("{ first bad document")
+        with mock.patch.object(settings_module.time, "strftime", return_value="20200101-000000"):
+            first = settings_module._quarantine(settings_path(), "test")
+            self._write("{ second bad document")
+            second = settings_module._quarantine(settings_path(), "test")
+        self.assertNotEqual(first, second)
+        self.assertEqual(Path(first).read_text(encoding="utf-8"), "{ first bad document")
+        self.assertEqual(Path(second).read_text(encoding="utf-8"), "{ second bad document")
+
+    def test_failed_backup_preserves_unreadable_settings(self):
+        from core.agent import settings as settings_module
+
+        self._write("{ invalid json")
+        with mock.patch.object(settings_module, "_quarantine", return_value=None):
+            self.assertFalse(add_endpoint("new", "https://new/v1"))
+        self.assertEqual(settings_path().read_text(encoding="utf-8"), "{ invalid json")
 
     def test_saved_output_is_written_for_humans(self):
         # Indented and newline-terminated: this file exists to be read.
@@ -741,6 +783,19 @@ class ModelMenuTest(TempStorage, unittest.TestCase):
 
 
 class ModelCompletionTest(unittest.TestCase):
+    def test_second_model_argument_completes_reasoning_effort(self):
+        class _Session:
+            known_models = ["o3-mini"]
+            sandbox = type("Sandbox", (), {"root": "."})()
+
+        from core.console import ConsoleCompleter
+
+        text = "/model o3-mini h"
+        result = ConsoleCompleter(_Session()).complete(text, len(text))
+        self.assertIsNotNone(result)
+        self.assertIn("high", result.items)
+        self.assertNotIn("o3-mini", result.items)
+
     def test_model_token_completes_from_the_catalogue(self):
         class _Session:
             known_models = ["gpt-4o", "gpt-4o-mini", "o3-mini"]

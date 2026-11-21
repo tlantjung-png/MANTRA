@@ -20,10 +20,10 @@ deciding whether a repeated workflow deserves a skill.
    failures, and log trends.
 3. Collect raw candidates from every session, then run the **Reduce** phase below
    to produce a cross-session weighted candidate set.
-4. Where a turn ran a workflow (`/workflow`), note workflow names and step
-   outcomes using the saved session and workflow file (`~/.mantra/workflows.json`).
+4. Where turns followed a named skill bundle, note its steps and outcomes from
+   the saved session and the relevant skills root's `BUNDLES.md`.
 5. Route durable facts to memory, style lessons to the repo conventions, repeated
-   workflows to /workflow or a new skill through create-skill, repeated denies to
+   procedures to a skill or bundle, repeated denies to
    rules review, and recurring failures to the known-failure registry.
 6. Run the relevant verification and baseline checks after any follow-up change.
 

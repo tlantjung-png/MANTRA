@@ -275,7 +275,7 @@ class CommandTest(unittest.TestCase):
             _skills(self.session, "tdd @flappy.py")
         shown = self._shown()
         self.assertIn("running 'tdd' once on: @flappy.py", shown)
-        self.assertIn("ran once and is detached", shown)
+        self.assertIn("did not complete", shown)
         self.assertNotIn("attached 'tdd'", shown)
         self.assertNotIn("skills for:", shown)
         self.assertEqual(self.session.active_skills, [])
@@ -289,6 +289,20 @@ class CommandTest(unittest.TestCase):
         self.assertNotIn("attached 'tdd'", shown)
         self.assertEqual(self.session.active_skills, [])
 
+    def test_one_shot_cleans_up_after_handle_raises(self):
+        with mock.patch.object(self.session, "handle", side_effect=RuntimeError("failed")):
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                _skills(self.session, "tdd @flappy.py")
+        self.assertEqual(self.session.active_skills, [])
+        self.assertEqual(self.session.auto_attached, [])
+
+    def test_one_shot_keeps_an_existing_attachment(self):
+        self.session.active_skills = ["tdd"]
+        with mock.patch.object(self.session, "handle", return_value=object()):
+            _skills(self.session, "tdd @flappy.py")
+        self.assertEqual(self.session.active_skills, ["tdd"])
+        self.assertIn("existing attachment kept", self._shown())
+
     def test_show_prints_the_procedure(self):
         _skills(self.session, "show tdd")
         self.assertIn("## Procedure", self._shown())
@@ -301,6 +315,14 @@ class CommandTest(unittest.TestCase):
         _skills(self.session, "use tdd")
         self.assertIn("## Skill in force: tdd", self.session._effective_system_prompt())
         self.assertIn("## Procedure", self.session._effective_system_prompt())
+
+    def test_attached_skill_survives_a_nearly_full_base_prompt(self):
+        self.session.system_prompt = "BASE\n" + "m" * 19_000
+        self.session.active_skills = ["tdd"]
+        prompt = self.session._effective_system_prompt()
+        self.assertIn("## Skill in force: tdd", prompt)
+        self.assertIn("## Procedure", prompt)
+        self.assertLessEqual(len(prompt), 20_000)
 
     def test_attaching_twice_does_not_duplicate_it(self):
         _skills(self.session, "use tdd")
@@ -382,6 +404,23 @@ class CommandTest(unittest.TestCase):
             _skills(self.session, "launch fix-bug")
         self.assertEqual(handled.call_count, 1)
         self.assertIn("stopped", self._shown())
+
+    def test_launch_stops_on_error_result(self):
+        failed = type("Failed", (), {"stopped_reason": "error"})()
+        with mock.patch.object(self.session, "handle", return_value=failed) as handled:
+            from core.console import _skills_launch
+            result = _skills_launch(self.session, "fix-bug")
+        self.assertEqual(handled.call_count, 1)
+        self.assertIs(result, failed)
+        self.assertIn("bundle stopped", self._shown())
+
+    def test_auto_bundle_leaves_mentions_for_its_first_step(self):
+        with mock.patch.object(self.session, "auto_route", return_value="fix-bug"), \
+             mock.patch.object(self.session, "expand_mentions") as expand, \
+             mock.patch("core.console._skills_launch", return_value=None) as launch:
+            self.session.handle("review @flappy.py")
+        expand.assert_not_called()
+        self.assertEqual(launch.call_args.kwargs["initial_text"], "review @flappy.py")
 
     def test_ctrl_c_stops_the_bundle(self):
         with mock.patch.object(self.session, "handle", side_effect=KeyboardInterrupt):
@@ -735,6 +774,22 @@ def test_every_shipped_skill_has_a_data_files_destination() -> None:
     for name in names:
         expected = f'"skills/{name}" = ["skills/{name}/SKILL.md"]'
         assert expected in manifest, f"missing wheel destination for skill {name!r}"
+
+
+def test_shipped_skill_catalog_and_commands_match_the_console() -> None:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    directory = os.path.join(root, "skills")
+    with open(os.path.join(directory, "INDEX.md"), encoding="utf-8") as handle:
+        catalog = handle.read()
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name, "SKILL.md")
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            body = handle.read()
+        assert f"| `{name}` |" in catalog, f"{name} missing from the skill catalog"
+        for removed_command in ("/workflow", "/goal", "/todo", "/tools"):
+            assert removed_command not in body, f"{name} names removed command {removed_command}"
 
 
 if __name__ == "__main__":

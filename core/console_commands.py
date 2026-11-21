@@ -271,8 +271,8 @@ def _mcp_tools(session: "ConsoleSession", name: str) -> None:
     if client is None:
         session._print(
             session.style.warn(
-                f"  {name} is not running - enable it under mcp.servers."
-                f"{name} in the config file and restart"
+                f"  {name} is not running - enable mcp.servers.{name} "
+                "in the config file and restart"
             )
         )
         return
