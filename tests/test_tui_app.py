@@ -988,6 +988,28 @@ class ConversationSuggestionsTest(unittest.TestCase):
         )
         self.assertIn("fail", failed[0].label.lower())
 
+    def test_history_never_demotes_hard_evidence(self):
+        from core.tui.suggest import suggestions_for
+
+        # A failing turn stays a diagnosis no matter how often that row
+        # was shown before — hard evidence always re-leads.
+        first = suggestions_for("fix the parser", "It still fails.", "run_command: exit_code: 1", True)
+        cmds = [s.command for s in first]
+        second = suggestions_for("fix the parser", "It still fails.", "run_command: exit_code: 1", True,
+                                 history=cmds)
+        self.assertEqual(second[0].label, first[0].label)
+        self.assertIn("fail", second[0].label.lower())
+
+    def test_same_subject_goes_deeper_from_turn_to_turn(self):
+        from core.tui.suggest import suggestions_for
+
+        first = suggestions_for("fix the login redirect bug", "fixed", "", False)
+        self.assertTrue(any("continue working on: fix login redirect bug" == s.command for s in first), first)
+        second = suggestions_for("fix the login redirect bug", "fixed", "", False,
+                                 prior_subject="fix login redirect bug")
+        self.assertTrue(any("go deeper on fix login redirect bug" == s.label for s in second), second)
+        self.assertTrue(all("continue working on: fix login redirect bug" != s.command for s in second), second)
+
     def test_suggestion_row_is_plain_text_not_chips(self):
         # The row renders as dim numbered text at the tail of the content
         # area - no reverse-video boxes - and still answers 1-9 and clicks.

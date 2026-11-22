@@ -347,6 +347,11 @@ class TuiApp:
         self._suggestion_rects: list[tuple[int, int, int]] = []
         self._suggestion_selected: int | None = None
         self._suggestions_until = 0.0
+        # Memory for the suggestion engine: commands shown in recent turns
+        # (newest first) and the subject of the previous turn, so the row
+        # rotates instead of repeating the same chips every turn.
+        self._suggestion_history_commands: list[str] = []
+        self._last_suggestion_subject: str | None = None
 
         self.cols = 0
         self.rows = 0
@@ -569,12 +574,18 @@ class TuiApp:
         suggestions = suggestions_for(
             prompt, reply, tool_text, self._turn_had_error, max_items=SUGGESTION_MAX,
             recent_topics=self._recent_topics, changed_files=changed,
+            history=self._suggestion_history_commands,
+            prior_subject=self._last_suggestion_subject,
         )
         # The engine guarantees at least one row for every agent turn,
         # so this is a shape guard, not a filter: an empty result must
         # never reach the paint path.
         self.suggestions = [s.label for s in suggestions][:SUGGESTION_MAX]
         self._suggestion_commands = [s.command for s in suggestions][:SUGGESTION_MAX]
+        shown_commands = self._suggestion_commands
+        self._suggestion_history_commands = [
+            c for c in shown_commands + self._suggestion_history_commands
+        ][:24]
         if self.suggestions:
             self._suggestion_selected = None
             self._suggestions_until = time.monotonic() + SUGGESTION_LINGER
@@ -584,6 +595,7 @@ class TuiApp:
             self._recent_topics = [effective_topic] + [
                 t for t in self._recent_topics if t != effective_topic
             ][:7]
+            self._last_suggestion_subject = effective_topic
         self._turn_user_prompt = ""  # consumed
         self._turn_tool_text = []
 

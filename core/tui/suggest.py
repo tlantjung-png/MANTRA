@@ -217,6 +217,8 @@ def suggestions_for(
     max_items: int = 3,
     recent_topics: list[str] | None = None,
     changed_files: list[str] | None = None,
+    history: list[str] | None = None,
+    prior_subject: str | None = None,
 ) -> list[Suggestion]:
     """Derive follow-up rows from the finished turn.
 
@@ -226,6 +228,13 @@ def suggestions_for(
     (newest first), and ``changed_files`` the workspace paths this turn
     actually wrote - the strongest evidence available, straight from the
     session's change ledger.
+
+    ``history`` lists commands already suggested in recent turns (newest
+    first): soft follow-up rows that repeat are demoted so the row does
+    not show the same chips every turn, while hard evidence (a failure, a
+    green test run) always re-leads. ``prior_subject`` is the subject of
+    the previous turn: when it is unchanged, the continuation chip is
+    phrased as going deeper instead of repeating the same label.
 
     Rows come back highest-evidence first: what the turn did, then what the
     operator asked about, then the generic follow-ups that fill the row.
@@ -291,6 +300,11 @@ def suggestions_for(
         if evidence["asks_why"] or evidence["failed"] or had_error:
             add(f"explain {subject} in more detail",
                 f"explain {subject} in more detail", 0.9)
+        elif subject == prior_subject:
+            # Same thread as the previous turn: go deeper instead of
+            # repeating the exact same "continue with ..." chip.
+            add(f"go deeper on {subject}",
+                f"explore edge cases and details of: {subject}", 0.9)
         else:
             add(f"continue with {subject}", f"continue working on: {subject}", 0.9)
 
@@ -332,5 +346,14 @@ def suggestions_for(
             add("summarize this conversation",
                 "summarize this conversation so far in a short paragraph", 0.4)
 
-    order = sorted(range(len(out)), key=lambda i: (-scores[i], i))
+    # Hard evidence always re-leads. Soft rows that were already shown in
+    # recent turns are pushed behind any unshown alternative, so the row
+    # rotates instead of repeating the same chips every turn.
+    known = set(history or [])
+    hard_now = [i for i in range(len(out)) if scores[i] >= 7.0]
+    soft_now = [i for i in range(len(out)) if scores[i] < 7.0]
+    soft_now.sort(key=lambda i: (-scores[i], i))
+    fresh = [i for i in soft_now if out[i].command not in known]
+    stale = [i for i in soft_now if out[i].command in known]
+    order = sorted(hard_now, key=lambda i: (-scores[i], i)) + fresh + stale
     return [out[i] for i in order][:limit]
