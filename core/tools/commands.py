@@ -199,6 +199,58 @@ def _prune_done_logs(log_path: str) -> None:
         pass
 
 
+# Unix-only utilities that do not exist on the native Windows shell. When
+# one leads a command, fail fast with the Windows equivalent instead of
+# letting cmd.exe print a confusing "'x' is not recognized" line that
+# costs the agent a turn.
+_UNIX_ONLY_COMMANDS: dict[str, str] = {
+    "cat": "Get-Content <file>",
+    "tail": "Get-Content <file> -Tail <n>",
+    "head": "Get-Content <file> -TotalCount <n>",
+    "less": "Get-Content <file> | Out-Host -Paging",
+    "grep": "Select-String -Path <file> -Pattern <pattern>",
+    "egrep": "Select-String -Path <file> -Pattern <pattern>",
+    "fgrep": "Select-String -Path <file> -Pattern <pattern> -SimpleMatch",
+    "sed": "PowerShell -replace / -split operators",
+    "awk": "ForEach-Object { ... } or Import-Csv",
+    "cut": "Select-Object -Property or .Split(',' )[0]",
+    "tr": "PowerShell .Replace() / -replace",
+    "uniq": "Sort-Object -Unique",
+    "xargs": "ForEach-Object { ... }",
+    "chmod": "icacls <file> (Windows ACLs)",
+    "chown": "takeown /f <file> /a",
+    "ls": "Get-ChildItem (or dir)",
+    "touch": "New-Item -ItemType File <path>",
+    "rm": "Remove-Item <path> (or del)",
+    "cp": "Copy-Item <src> <dst> (or copy)",
+    "mv": "Move-Item <src> <dst> (or move)",
+    "pwd": "Get-Location (or cd with no args)",
+    "ps": "Get-Process",
+    "top": "Get-Process | Sort-Object CPU -Descending",
+    "which": "Get-Command <name> (or where.exe)",
+    "wc": '(Get-Content <file>).Count (lines); else find /c /v "" <file> in cmd',
+}
+
+
+def _windows_unix_guard(command: str) -> str | None:
+    """Guidance when a pipeline/chain segment starts with a Unix-only utility."""
+    if os.name != "nt":
+        return None
+    for segment in re.split(r"\|\||&&|;|\n|\|", command or ""):
+        token = segment.strip()
+        if not token:
+            continue
+        first = re.split(r"\s+", token, maxsplit=1)[0].strip("\"'")
+        base = first.lower().rstrip(".exe")
+        if base in _UNIX_ONLY_COMMANDS and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\-\.]*", first):
+            return (
+                f"ERROR: '{first}' is a Unix utility and does not exist on this "
+                f"Windows host. Use the Windows equivalent instead: "
+                f"{_UNIX_ONLY_COMMANDS[base]}"
+            )
+    return None
+
+
 def _map_exit_status(result: ExecResult, command: str) -> tuple[int, str]:
     """Display exit code and its note for one finished command.
 
@@ -270,6 +322,13 @@ class RunCommandTool(Tool):
             return "ERROR: command contains NUL bytes"
         if len(command) > 10000:
             return "ERROR: command too long"
+
+        # Pre-empt Unix-only commands on Windows so the model sees the
+        # Windows equivalent instead of a bare "'x' is not recognized"
+        # failure from cmd.exe.
+        unix_hint = _windows_unix_guard(command)
+        if unix_hint is not None:
+            return unix_hint
 
         # Background requires an explicit boolean opt-in; anything else
         # is an error so the model learns to send the right type.

@@ -45,6 +45,14 @@ def render_environment(workspace: str) -> str:
     git_line = _git_facts(workspace)
     if git_line:
         lines.append(git_line)
+    if os.name == "nt":
+        lines.append(
+            "- windows: Unix tools (wc, head, tail, cat, less, grep, sed, awk, "
+            "ls, rm, cp, mv, which, ps) do NOT exist; use equivalents: "
+            "Get-Content, Select-String, Get-ChildItem, Remove-Item, "
+            "Copy-Item, Move-Item, Get-Command, Get-Process, and for line "
+            "counts (Get-Content <file>).Count or find /c /v \"\" <file>"
+        )
     return "\n".join(lines)
 
 

@@ -28,6 +28,48 @@ import unittest
 from urllib.error import HTTPError
 
 
+class UnixOnlyCommandGuardTest(unittest.TestCase):
+    """run_command pre-empts Unix-only utilities on Windows with guidance."""
+
+    class _BoomSandbox:
+        def exec(self, *args, **kwargs):
+            raise AssertionError("sandbox must not run a banned command")
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only guard")
+    def test_wc_returns_windows_equivalent(self):
+        from core.tools.commands import RunCommandTool
+
+        out = RunCommandTool().execute(self._BoomSandbox(), "wc -l nailvin.html")
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertIn("Get-Content", out)
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only guard")
+    def test_pipeline_segment_is_caught(self):
+        from core.tools.commands import RunCommandTool
+
+        # The first banned utility in the chain is the one reported.
+        out = RunCommandTool().execute(self._BoomSandbox(), "cat greeting.txt | grep hi")
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertIn("Get-Content", out)
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only guard")
+    def test_grep_gets_select_string_guidance(self):
+        from core.tools.commands import RunCommandTool
+
+        out = RunCommandTool().execute(self._BoomSandbox(), "grep -n hello file.txt")
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertIn("Select-String", out)
+
+    def test_allowed_commands_are_not_blocked(self):
+        from core.tools.commands import _windows_unix_guard
+
+        self.assertIsNone(_windows_unix_guard("dir /b *.html"))
+        self.assertIsNone(_windows_unix_guard("cd C:\\x && type f.txt"))
+        self.assertIsNone(_windows_unix_guard("python script.py --flag"))
+        self.assertIsNone(_windows_unix_guard('find /c /v "" < f.txt'))
+        self.assertIsNone(_windows_unix_guard("cd C:\\Users && dir"))
+
+
 class D1RedirectSchemeTest(unittest.TestCase):
     """A redirect to file://, ftp:// or data:// is refused before fetching."""
 

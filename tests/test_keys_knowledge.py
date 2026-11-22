@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 
 import pytest
 
@@ -13,6 +14,7 @@ from core.agent.knowledge import (
     assemble_system_prompt,
     parse_entries,
     plan_memory_write,
+    render_environment,
 )
 from core.agent.repairs import canonical_command, repair_arguments, validate_arguments
 
@@ -160,6 +162,16 @@ def test_canonical_command_aliases() -> None:
     assert canonical_command({"command": "ls"}) == "ls"
     assert canonical_command({"cmd": "ls -la"}) == "ls -la"
     assert canonical_command({}) == ""
+
+
+def test_render_environment_notes_windows_unix_gap() -> None:
+    env = render_environment(os.getcwd())
+    if os.name == "nt":
+        assert "Unix tools" in env
+        assert "Get-Content" in env
+        assert "Select-String" in env
+    else:
+        assert "Unix tools" not in env
 
 
 def test_repair_arguments_alias_and_numeric() -> None:
