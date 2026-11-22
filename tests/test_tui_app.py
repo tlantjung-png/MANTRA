@@ -27,24 +27,10 @@ class AppIntegrationTest(unittest.TestCase):
             shutil.rmtree(ws, ignore_errors=True)
         _TEMP_WORKSPACES.clear()
 
-    def test_enchanter_pulse_cycles_the_lit_letter(self):
-        from core.tui.app import _ENCHANTER_HOLD, _enchanter_pulse
-
+    def test_chat_state_cycles_theme_words(self):
         import re as _re
 
-        word_len = len("ENCHANTER")
-        for phase in range(0, word_len * _ENCHANTER_HOLD * 2, _ENCHANTER_HOLD):
-            out = _enchanter_pulse(phase)
-            plain = _re.sub(r"\033\[[0-9;]*m", "", out)
-            self.assertEqual(plain, "ENCHANTER")
-            lit = out.split("\033[0m")
-            lit_segments = [p for p in lit if app_module.theme.BLOOD_BOLD in p]
-            self.assertEqual(len(lit_segments), 1, f"phase {phase} lit count")
-            expected_lit = (phase // _ENCHANTER_HOLD) % word_len
-            self.assertIn("ENCHANTER"[expected_lit], lit_segments[0])
-
-    def test_chat_state_shows_animated_chip(self):
-        import re as _re
+        from core.tui.app import _CHAT_THEME_HOLD, _CHAT_THEME_WORDS
 
         app, session, backend = _make_app([])
         app.busy = True
@@ -52,13 +38,21 @@ class AppIntegrationTest(unittest.TestCase):
         app.set_chat_state(True, model="LongCat-2.5", budget=16384)
         self.assertEqual(app.chat_model, "LongCat-2.5")
         self.assertEqual(app.chat_budget, 16384)
-        app.tick_animation()
-        border = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
-        self.assertIn("ENCHANTER", border)
+        seen = []
+        for i in range(len(_CHAT_THEME_WORDS) * _CHAT_THEME_HOLD + 1):
+            if i > 0:
+                app.tick_animation()
+            border = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
+            seen.append(border)
+            self.assertNotIn("ENCHANTER", border)
+        # Every MANTRA-themed word appears across one full cycle.
+        for word in _CHAT_THEME_WORDS:
+            self.assertTrue(any(word in b for b in seen), f"{word} never shown")
+        self.assertGreater(len({b.split(" ")[1] for b in seen}), 1)
         app.set_chat_state(False)
-        border_after = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
-        self.assertNotIn("ENCHANTER", border_after)
         self.assertEqual(app.chat_model, "")
+        border_after = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
+        self.assertNotIn("Enchanting", border_after)
 
     def test_live_token_estimate_uses_total_text_not_fragment_count(self):
         app, session, backend = _make_app([])
