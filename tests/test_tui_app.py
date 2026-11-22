@@ -27,10 +27,10 @@ class AppIntegrationTest(unittest.TestCase):
             shutil.rmtree(ws, ignore_errors=True)
         _TEMP_WORKSPACES.clear()
 
-    def test_chat_state_cycles_theme_words(self):
+    def test_chat_state_shows_fixed_theme_word(self):
         import re as _re
 
-        from core.tui.app import _CHAT_THEME_HOLD, _CHAT_THEME_WORDS
+        from core.tui.app import _CHAT_THEME_WORD
 
         app, session, backend = _make_app([])
         app.busy = True
@@ -38,21 +38,20 @@ class AppIntegrationTest(unittest.TestCase):
         app.set_chat_state(True, model="LongCat-2.5", budget=16384)
         self.assertEqual(app.chat_model, "LongCat-2.5")
         self.assertEqual(app.chat_budget, 16384)
-        seen = []
-        for i in range(len(_CHAT_THEME_WORDS) * _CHAT_THEME_HOLD + 1):
+        borders = []
+        for i in range(20):
             if i > 0:
                 app.tick_animation()
-            border = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
-            seen.append(border)
-            self.assertNotIn("ENCHANTER", border)
-        # Every MANTRA-themed word appears across one full cycle.
-        for word in _CHAT_THEME_WORDS:
-            self.assertTrue(any(word in b for b in seen), f"{word} never shown")
-        self.assertGreater(len({b.split(" ")[1] for b in seen}), 1)
+            borders.append(_re.sub(r"\033\[[0-9;]*m", "", app._border_text()))
+        # One stable themed word the whole time — no cycling, no ENCHANTER.
+        for b in borders:
+            self.assertIn(_CHAT_THEME_WORD, b)
+            self.assertNotIn("ENCHANTER", b)
+        self.assertEqual(len({b.split(" ")[1] for b in borders}), 1)
         app.set_chat_state(False)
         self.assertEqual(app.chat_model, "")
         border_after = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
-        self.assertNotIn("Enchanting", border_after)
+        self.assertNotIn(_CHAT_THEME_WORD, border_after)
 
     def test_live_token_estimate_uses_total_text_not_fragment_count(self):
         app, session, backend = _make_app([])

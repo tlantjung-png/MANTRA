@@ -90,12 +90,11 @@ def _redact_model_line_keys(text: str) -> str:
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
 
-# The animated "thinking" words cycled in the busy chip while a chat
-# request is in flight. They stay inside MANTRA's own vocabulary
-# (channeling, enchanting, spelling, ...) instead of a fixed word, so
-# the chip reads alive without leaving the theme.
-_CHAT_THEME_WORDS = ("Channeling", "Enchanting", "Spelling", "Chanting")
-_CHAT_THEME_HOLD = 6  # frames each word stays on screen
+# The themed label shown in the busy chip while a chat request is in
+# flight. One fixed MANTRA-flavored word for "thinking" — the spinner
+# and the elapsed counter keep the chip animated, so the label itself
+# stays stable.
+_CHAT_THEME_WORD = "Enchanting"
 RESIZE_DEBOUNCE = 0.016
 
 # "↓ bottom" chip timings: accent pulse on turn-end and on output
@@ -276,12 +275,12 @@ class LayoutBridge:
 
 class TuiApp:
     def set_chat_state(self, busy: bool, model: str = "", budget=None) -> None:
-        """Show or clear the animated thinking indicator.
+        """Show or clear the themed thinking indicator.
 
         Called by the console when a chat request starts or ends. When
-        busy, the chip label cycles through MANTRA-themed words
-        (channeling, enchanting, spelling, ...) so a silent reasoning
-        stretch reads as alive.
+        busy, the chip label shows the fixed MANTRA-themed word
+        (Enchanting) so a silent reasoning stretch reads as alive
+        without the label itself changing.
         """
         with self.lock:
             self.chat_busy = bool(busy)
@@ -354,13 +353,12 @@ class TuiApp:
         self.busy_label = "Channeling"
         self._spinner_i = 0
         # Chat-in-flight indicator: while a chat request runs (thinking),
-        # the busy chip cycles MANTRA-themed words (channeling, enchanting,
-        # spelling, ...) instead of the plain label, so a silent reasoning
-        # stretch does not look frozen.
+        # the busy chip shows the fixed MANTRA-themed word (Enchanting)
+        # instead of the plain label; the spinner and elapsed counter keep
+        # it animated.
         self.chat_busy = False
         self.chat_model = ""
         self.chat_budget: int | None = None
-        self._chat_pulse_i = 0
         self.status_text = ""
         self.counter_text = ""
         self.toast = ""
@@ -797,8 +795,6 @@ class TuiApp:
     def tick_animation(self) -> None:
         if self.busy:
             self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
-        if self.chat_busy:
-            self._chat_pulse_i += 1
         if self.toast and time.monotonic() >= self._toast_until:
             self.toast = ""
         # At flash expiry repaint once to drop the accent styling.
@@ -1907,12 +1903,10 @@ class TuiApp:
                 elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
             label = self.busy_label if elapsed >= 1 else "Channeling"
             if self.chat_busy:
-                # Cycle MANTRA-themed words so the chip reads alive without
-                # leaving the theme; the label stays short enough that the
-                # live token counter remains visible.
-                label = _CHAT_THEME_WORDS[
-                    (self._chat_pulse_i // _CHAT_THEME_HOLD) % len(_CHAT_THEME_WORDS)
-                ]
+                # A fixed themed word for "thinking"; the spinner frame and
+                # elapsed counter carry the motion, and the label stays
+                # short enough that the live token counter remains visible.
+                label = _CHAT_THEME_WORD
             parts = [f"{frame} {label} {elapsed_str}"]
             if self.counter_text:
                 parts.append(self.counter_text)
