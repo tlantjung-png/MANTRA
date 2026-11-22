@@ -268,7 +268,7 @@ class ConsoleSession(
         )
         self.totals = {"tokens_in": 0, "tokens_out": 0, "turns": 0, "tool_errors": 0, "cache_hit": 0,
                    "observation_saved": 0, "digest_turns": 0, "digest_chars": 0, "digest_failures": 0}
-        self.last_reply = ""  # the finished turn's assistant reply (suggestion engine input)
+        self.last_reply = ""  # the finished turn's assistant reply
         self.reported_changes: set[str] = set()
         # Model ids discovered from the endpoint, so `/model <tab>` can
         # complete from what is actually served rather than a guess.
@@ -461,7 +461,7 @@ class ConsoleSession(
                 command["status"] = "started in background"
             else:
                 command["status"] = "no exit code"
-        # Turn-scoped evidence for the TUI's post-task suggestion engine:
+        # Turn-scoped evidence for the TUI:
         # it names the tools that ran and the artifacts they touched, so
         # the next-step rows follow the work that actually happened.
         ui = getattr(self, "ui", None)
@@ -1010,7 +1010,7 @@ class ConsoleSession(
         loop, and report the result (usage, memory, changes, todo
         checks). Must run on the main thread outside the TUI; inside the
         TUI it runs on the app's worker thread instead."""
-        self.last_reply = ""  # the finished turn's assistant reply (suggestion engine input)
+        self.last_reply = ""  # the finished turn's assistant reply
         # Turn-scoped read-before-edit: a fresh turn must not inherit
         # what the previous turn had already read or edited.
         for tool in self.tools:
@@ -1154,7 +1154,7 @@ class ConsoleSession(
                 self._print(f"{self.style.brand('ENCHANTER')} {body}")
             if result is not None:
                 self._finish_turn_report(task, result)
-                # The TUI's suggestion engine reads the assistant's final
+                # The TUI reads the assistant's final
                 # reply (plus the prompt it answers) to pick follow-up
                 # chips; stash it turn-scoped, cleared at next turn start.
                 self.last_reply = result.final_message or ""
@@ -1369,8 +1369,6 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         _skills(session, argument)
     elif command == "/mcp":
         _mcp(session, argument)
-    elif command == "/suggestions":
-        _set_suggestions(session, argument)
     else:
         # A line like "/tmp/x" or "/usr/local/bin" is a path, not a
         # command; hand it to the agent instead of swallowing it. A
@@ -1597,7 +1595,6 @@ from core.console_commands import (  # noqa: E402,F401
     _mcp,
     _no_arg,
     _sessions,
-    _set_suggestions,
 )
 from core.console_model import (  # noqa: E402,F401
     ADD_ENDPOINT,

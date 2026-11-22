@@ -3,7 +3,7 @@
 """The slash-command handlers split out of console.py.
 
 The command surfaces that remain (diff, approve, cost, compact, clear,
-sessions, suggestions, mcp). Calls into console go through the module
+sessions, mcp). Calls into console go through the module
 namespace so test patches of the interactive seams (menus, the
 multiline reader, the model picker) stay effective.
 """
@@ -147,40 +147,6 @@ def _sessions(session: "ConsoleSession", argument: str) -> None:
         session.show_sessions()
     else:
         session.resume_session(parts[0])
-
-
-def _set_suggestions(session: "ConsoleSession", argument: str) -> None:
-    """Flip the post-task suggestion row at runtime (/suggestions on|off)."""
-    from core.agent.settings import set_ui_prefs
-
-    arg = argument.strip().lower()
-    ui = getattr(session, "ui", None)
-    if arg in ("on", "off"):
-        enabled = arg == "on"
-        # Persist to the settings file on disk (survives restarts), the
-        # session config (this process), and the live TUI flag.
-        if not set_ui_prefs(suggestions=enabled):
-            session._print("warning: could not write the settings file")
-        session.config["suggestions"] = enabled
-        if ui is not None and hasattr(ui, "suggestions_enabled"):
-            ui.suggestions_enabled = enabled
-            if not enabled:
-                ui._dismiss_suggestions()
-        state = "on" if enabled else "off"
-        # The toast rides the TUI when there is one; the plain REPL
-        # gets the same message as a printed line.
-        if ui is not None and hasattr(ui, "toast_message"):
-            ui.toast_message(f"suggestions {state}", seconds=2.0)
-        else:
-            session._print(f"suggestions {state}")
-        return
-    # Bare /suggestions: report the current state.
-    current = None
-    if ui is not None and hasattr(ui, "suggestions_enabled"):
-        current = ui.suggestions_enabled
-    else:
-        current = bool(session.config.get("suggestions", True))
-    session._print(f"suggestions are {'on' if current else 'off'} - usage: /suggestions on|off")
 
 
 # ------------------------------------------------------------------- mcp

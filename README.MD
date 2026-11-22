@@ -42,11 +42,9 @@ The console maintains a compact command surface, listed in full by the help comm
 - compact: summarize a long conversation to free context
 - skills: discover and attach skill procedures, and launch bundles
 - mcp: inspect the configured external tool servers
-- suggestions: toggle the follow-up next-step line shown after each reply
 - clear: clear the conversation; files are kept
 - exit: leave the console; autosaves first
 
-After every agent reply the console shows a dim line of numbered next steps at the tail of the conversation, derived from what the turn actually did: the files it changed, the tests it ran, and the failure it hit. The line remembers the subject of recent turns, so switching to a new subject still offers a step back to the previous thread, and the suggestions command turns the line off and on.
 
 ## Headless Mode
 

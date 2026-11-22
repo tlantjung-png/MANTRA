@@ -63,9 +63,6 @@ DEFAULTS = {
     "observations": {"reshape": True, "max_chars": 12000},
     "auto_compact_tokens": 60000,  # compact when history exceeds; 0 disables
     "verbose": False,  # echo truncated tool output live
-    # Post-task suggestion chips ("run the tests", "commit", ...) shown
-    # after a finished turn; False removes the row entirely.
-    "suggestions": True,
     "skills": {
         # Auto-attach skill per turn; bundles auto-launch by default.
         "auto": True,

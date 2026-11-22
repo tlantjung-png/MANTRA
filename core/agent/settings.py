@@ -31,7 +31,6 @@ DEFAULT_FILE = {
     },
     # Console UI preferences (runtime-toggled, persisted across restarts).
     "ui": {
-        "suggestions": True,
         # Approval mode carried across sessions: the operator's /approve
         # choice outlives the process, so a session never restarts in a
         # mode nobody picked. yolo is the starting default.
@@ -398,11 +397,9 @@ def ui_prefs() -> dict[str, Any]:
     return dict(load()["ui"])
 
 
-def set_ui_prefs(suggestions: bool | None = None, approvals: str | None = None) -> bool:
+def set_ui_prefs(approvals: str | None = None) -> bool:
     """Record the UI preferences. Arguments left as-is when not given."""
     data = load()
-    if suggestions is not None:
-        data["ui"]["suggestions"] = bool(suggestions)
     if approvals is not None:
         data["ui"]["approvals"] = str(approvals)
     return _write(data)

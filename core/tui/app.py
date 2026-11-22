@@ -35,7 +35,6 @@ from core.tui.overlays import (
 )
 from core.tui.selection import Selection, col_to_offset
 from core.tui.transcript import Transcript
-from core.tui.suggest import suggestions_for, topic_of
 
 from core.diffparse import parse_diff
 from core.tui.review import ReviewState, render_review
@@ -106,11 +105,6 @@ CHIP_FADE_SECONDS = 0.6
 # once per this interval, so a fast token stream pulses instead of
 # burning the accent solid-on for the whole turn.
 CHIP_PULSE_THROTTLE = 1.0
-# Auto-suggestions after a finished task: a dim "next" line of
-# numbered steps at the tail of the conversation.
-SUGGESTION_MAX = 3
-SUGGESTION_LINGER = 45.0  # seconds the row stays before self-dismissing
-
 _WHEEL_UP = 64
 _WHEEL_DOWN = 65
 
@@ -323,35 +317,12 @@ class TuiApp:
         self._chip_fade_until = 0.0
         self._chip_fade_missed = 0  # missed count frozen for the fade echo
         self._chip_last_pulse = 0.0  # pulse throttle anchor
-        # Turn-scoped context the suggestion engine reads at turn end.
+        # Turn-scoped context kept for turn teardown bookkeeping.
         self._turn_user_prompt = ""
         self._turn_tool_text: list[str] = []
-        # The suggestion row shows at every turn end: _turn_pending marks a
-        # submitted turn not yet consumed, _turn_was_command suppresses it for
-        # slash-command turns (their "reply" is chrome, not agent work).
         self._turn_pending = False
         self._turn_was_command = False
-        # Subjects of recent turns, newest first: lets the row jump back to
-        # an older thread and inherit a subject when a turn is content-free
-        # ("thanks").
-        self._recent_topics: list[str] = []
         self._turn_had_error = False
-        # Auto-suggestions after a finished task: an ordered list of step
-        # strings, the hit rects painted for them, and the selected index
-        # while the row has keyboard focus. Gated by the persisted UI
-        # preference (settings file, via session config override) so
-        # /suggestions off survives a restart.
-        self.suggestions_enabled = self._resolve_suggestions_enabled(session)
-        self.suggestions: list[str] = []
-        self._suggestion_commands: list[str] = []
-        self._suggestion_rects: list[tuple[int, int, int]] = []
-        self._suggestion_selected: int | None = None
-        self._suggestions_until = 0.0
-        # Memory for the suggestion engine: commands shown in recent turns
-        # (newest first) and the subject of the previous turn, so the row
-        # rotates instead of repeating the same chips every turn.
-        self._suggestion_history_commands: list[str] = []
-        self._last_suggestion_subject: str | None = None
 
         self.cols = 0
         self.rows = 0
@@ -498,121 +469,7 @@ class TuiApp:
             # count) flashes in the accent colour for a moment.
             if self.transcript.scrolled > 0:
                 self._chip_flash_until = time.monotonic() + CHIP_FLASH_SECONDS
-            self._maybe_show_suggestions()
         self.mark_dirty()
-
-    @staticmethod
-    def _resolve_suggestions_enabled(session) -> bool:
-        """Suggestion toggle resolution: session config beats settings file.
-
-        The session config is authoritative within the process (the
-        /suggestions command keeps it in step); the settings file's
-        "ui.suggestions" is the default for a fresh start.
-        """
-        cfg = getattr(session, "config", None) or {}
-        if "suggestions" in cfg:
-            return bool(cfg["suggestions"])
-        try:
-            from core.agent.settings import ui_prefs
-
-            return bool(ui_prefs().get("suggestions", True))
-        except Exception:
-            return True  # settings unreadable: default on, never crash startup
-
-    def _maybe_show_suggestions(self) -> None:
-        """After a finished turn, derive and show next-step rows.
-
-        Runs at every agent-turn end: the engine always returns at least
-        one row, falling back to conversation-derived ones. Consumed
-        exactly once per turn (set_busy(False) can fire twice), and
-        slash-command turns show nothing - their output is chrome, so
-        follow-up rows there would answer a reply nobody read.
-        """
-        if not self._turn_pending:
-            return  # already consumed, or a spurious set_busy(False)
-        self._turn_pending = False
-        was_command, self._turn_was_command = self._turn_was_command, False
-        if not self.suggestions_enabled or was_command:
-            self._turn_user_prompt = ""
-            self._turn_tool_text = []
-            return
-        prompt = self._turn_user_prompt
-        # The assistant's final reply is the richest signal: it states
-        # what was done ("edited the files", "all tests pass") and what
-        # it would do next. The session stashes it turn-scoped.
-        reply = str(getattr(self.session, "last_reply", "") or "")
-        # The turn's tool evidence: what the console actually observed,
-        # collected turn-scoped by the session, plus the transcript tail
-        # for a session that never wired the collector (tests, --once).
-        tool_text = "\n".join(self._turn_tool_text)
-        if not tool_text:
-            with self.lock:
-                recent = list(self.transcript.raw[-80:])
-            tool_text = "\n".join(
-                ln for ln in recent
-                if "→" in ln or ln.lstrip().startswith(
-                    ("run_command", "edit_file", "write_file", "read_file")
-                )
-            )
-        # The files this turn actually changed - the strongest evidence a
-        # suggestion can be grounded in. Turn-scoped snapshots while the
-        # turn is still tearing down, the session's reported set after.
-        changed = []
-        for key in ("_edit_snapshots", "reported_changes"):
-            source = getattr(self.session, key, None)
-            if isinstance(source, dict):
-                changed = [str(p) for p in source.keys()]
-                break
-            if isinstance(source, (set, list, tuple)):
-                changed = [str(p) for p in source]
-                break
-        # The effective subject mirrors the engine's own choice (the
-        # prompt's topic, or the inherited one when the prompt was
-        # content-free); it is recorded so later turns can jump back to
-        # this thread or inherit it in turn.
-        effective_topic = topic_of(prompt) or (self._recent_topics[0] if self._recent_topics else "")
-        suggestions = suggestions_for(
-            prompt, reply, tool_text, self._turn_had_error, max_items=SUGGESTION_MAX,
-            recent_topics=self._recent_topics, changed_files=changed,
-            history=self._suggestion_history_commands,
-            prior_subject=self._last_suggestion_subject,
-        )
-        # The engine guarantees at least one row for every agent turn,
-        # so this is a shape guard, not a filter: an empty result must
-        # never reach the paint path.
-        self.suggestions = [s.label for s in suggestions][:SUGGESTION_MAX]
-        self._suggestion_commands = [s.command for s in suggestions][:SUGGESTION_MAX]
-        shown_commands = self._suggestion_commands
-        self._suggestion_history_commands = [
-            c for c in shown_commands + self._suggestion_history_commands
-        ][:24]
-        if self.suggestions:
-            self._suggestion_selected = None
-            self._suggestions_until = time.monotonic() + SUGGESTION_LINGER
-        if effective_topic:
-            # Newest first, deduped (re-raising a topic moves it to the
-            # front), and capped - a bounded memory, not a transcript.
-            self._recent_topics = [effective_topic] + [
-                t for t in self._recent_topics if t != effective_topic
-            ][:7]
-            self._last_suggestion_subject = effective_topic
-        self._turn_user_prompt = ""  # consumed
-        self._turn_tool_text = []
-
-    def _dismiss_suggestions(self) -> None:
-        """Clear the suggestion row (expiry, submit, or Esc)."""
-        self.suggestions = []
-        self._suggestion_commands = []
-        self._suggestion_rects = []
-        self._suggestion_selected = None
-        self._suggestions_until = 0.0
-
-    def _accept_suggestion(self, index: int) -> None:
-        """Run a suggestion step as if the operator had typed it."""
-        if 0 <= index < len(self._suggestion_commands):
-            command = self._suggestion_commands[index]
-            self._dismiss_suggestions()
-            self.submit(command)
 
     def _arm_chip_fade(self, missed: int) -> None:
         """Linger the chip as a fading echo after returning to the tail."""
@@ -667,7 +524,7 @@ class TuiApp:
             self.busy_label = "Chanting"
             self._turn_started = time.monotonic()
             self._spinner_i = 0
-            # Turn-scoped context for the post-task suggestion engine.
+            # Turn-scoped context for teardown bookkeeping.
             self._turn_user_prompt = text
             self._turn_tool_text = []
             self._turn_had_error = False
@@ -689,8 +546,6 @@ class TuiApp:
             operator_line(self.session.style, display_text, stamp=stamp) + "\n"
         )
         self.transcript.flush_partial()
-        # Typing a prompt supersedes the suggestion row.
-        self._dismiss_suggestions()
         self.mark_dirty()
         self.run_detached(lambda: self._run_turn(text))
 
@@ -802,9 +657,6 @@ class TuiApp:
         # ticking (and repaint once at each boundary) while they run.
         if now < self._chip_flash_until or now < self._chip_fade_until:
             return True
-        # The suggestion row self-dismisses after its linger window.
-        if self.suggestions and now >= self._suggestions_until:
-            return True
         return False
 
     def animation_interval(self) -> float:
@@ -824,10 +676,6 @@ class TuiApp:
         # At fade expiry repaint once to clear the lingering chip.
         if self._chip_fade_until and time.monotonic() >= self._chip_fade_until:
             self._chip_fade_until = 0.0
-            self.mark_dirty()
-        # Suggestion row self-dismisses after its linger window.
-        if self.suggestions and time.monotonic() >= self._suggestions_until:
-            self._dismiss_suggestions()
             self.mark_dirty()
         if self.selection.active and self._drag_autoscroll:
             with self.lock:
@@ -965,25 +813,7 @@ class TuiApp:
                 self.selection.clear()
                 self.mark_dirty()
                 return
-            if self.suggestions:
-                self._dismiss_suggestions()
-                self.mark_dirty()
-                return
             return
-        # While the suggestion row is up it owns Tab and the number
-        # keys: Tab moves between steps, 1-9 accept directly.
-        if self.suggestions and self.transcript.follow and not self.busy:
-            if key == "tab":
-                n = len(self.suggestions)
-                cur = self._suggestion_selected
-                self._suggestion_selected = 0 if cur is None else (cur + 1) % n
-                self.mark_dirty()
-                return
-            if key in "123456789" and len(key) == 1:
-                idx = int(key) - 1
-                if idx < len(self.suggestions):
-                    self._accept_suggestion(idx)
-                    return
         if key in ("pageup", "pagedown"):
             with self.lock:
                 if key == "pageup":
@@ -1156,8 +986,6 @@ class TuiApp:
                 return
             if self._press_scrollbar(ev.x, ev.y):
                 return
-            if self._press_suggestion(ev.x, ev.y):
-                return
             if self._content_top <= ev.y < self._content_top + self._content_height:
                 self.selection.begin_press(ev.x, ev.y)
             return
@@ -1201,14 +1029,6 @@ class TuiApp:
                 self.mark_dirty()
 
     # ── composer mouse editing ────────────────────────────────
-
-    def _press_suggestion(self, x: int, y: int) -> bool:
-        """Click on a suggestion step: accept it (submit its command)."""
-        for i, (sx, sy, sw) in enumerate(self._suggestion_rects):
-            if sy == y and sx <= x < sx + sw:
-                self._accept_suggestion(i)
-                return True
-        return False
 
     def _press_scroll_to_bottom(self, x: int, y: int) -> bool:
         """Click on the \"↓ bottom\" chip: jump back to the live tail."""
@@ -1523,40 +1343,6 @@ class TuiApp:
             self._scroll_to_bottom = None
         else:
             self._scroll_to_bottom = None
-
-        # Post-task suggestion row: one dim line of numbered next steps
-        # at the tail of the content area, directly under the finished
-        # turn's output. Plain text, not chips: a row of boxes reads as
-        # chrome the operator has to decode, while "next  1 run the
-        # tests · 2 commit" is the same information in the same voice as
-        # the conversation it follows. 1-9 accept, a click on a step runs
-        # it; the row self-dismisses after SUGGESTION_LINGER, on submit,
-        # or on Esc.
-        self._suggestion_rects = []
-        if self.suggestions and self.transcript.follow:
-            if now < self._suggestions_until:
-                x = 1
-                y = content_top + height - 1
-                label = f"{theme.FAINT}m next "
-                buf.set_styled_line(x, y, f"\033[{label}\033[0m", styles, cols)
-                x += visible_len(" next ")
-                for i, text in enumerate(self.suggestions):
-                    if i == self._suggestion_selected:
-                        step = f"\033[{theme.INFO}m {i + 1} {text} \033[0m"
-                    else:
-                        step = f"\033[{theme.HAIR}m {i + 1} {text} \033[0m"
-                    w = visible_len(step)
-                    if x + w > cols - 1:
-                        break  # no room for more steps this frame
-                    buf.set_styled_line(x, y, step, styles, cols)
-                    self._suggestion_rects.append((x, y, w))
-                    x += w + 1  # one blank cell between steps
-            else:
-                self._dismiss_suggestions()
-        elif self.suggestions and not self.transcript.follow:
-            # Detached from the tail: hold the row (no expiry countdown
-            # while hidden) so returning re-reveals it.
-            self._suggestions_until = max(self._suggestions_until, time.monotonic() + 5.0)
 
         # Transient toast (state flips, copies, quit warnings): centered
         # on the top hairline row, riding over the rule for its

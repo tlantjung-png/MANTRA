@@ -102,7 +102,7 @@ class AgentLoop:
         self.approver = approver
         # Ceiling for one observation as it enters context; 0 disables
         # reshaping. The raw observation still reaches the UI and the
-        # post-task suggestion engine.
+        # post-task teardown.
         self.observation_max_chars = observation_max_chars
         # Rolling digest of evicted turns. When off, eviction stays lossy
         # exactly as it was: turns are dropped and nothing is summarised.

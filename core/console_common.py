@@ -45,7 +45,6 @@ HELP_TEXT = """Commands:
   /model                provider & model: add endpoint, pick a model, replace key
   /sessions             saved conversations: browse and resume
   /skills <name>        attach skill; /skills + space, Tab filter
-  /suggestions on|off   post-task next-step line (bare: show state)
   /undo                 discard changes (confirm)
   /workspace            show workspace path + files
   /                     same as /help
@@ -109,7 +108,6 @@ SLASH_COMMANDS = [
     ("/model", "provider & model: add endpoint, pick a model, replace key"),
     ("/sessions", "saved conversations: browse and resume"),
     ("/skills", "attach skill"),
-    ("/suggestions", "next-step suggestions on|off"),
     ("/undo", "discard changes"),
     ("/workspace", "show workspace"),
 ]
