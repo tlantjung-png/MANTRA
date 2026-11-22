@@ -377,6 +377,37 @@ class BudgetEscalationTest(unittest.TestCase):
         self.assertIn("read the file", result.final_message)
 
 
+class ChatLivenessEventTest(unittest.TestCase):
+    """llm_chat_start/end events make long generations observable."""
+
+    def test_chat_lifecycle_events_emitted(self):
+        workspace = make_workspace()
+        seen = []
+        from core.agent.events import EventBus
+
+        bus = EventBus()
+        bus.subscribe(lambda name, payload: seen.append((name, payload)))
+        llm = ScriptedLLMClient([final_response("done")])
+        loop = AgentLoop(
+            llm=llm,
+            sandbox=LocalSandbox(workspace),
+            tools=build_tools(["read_file"]),
+            evaluator=NullEvaluator(),
+            logger=JsonlLogger(os.path.join(workspace, "run.jsonl")),
+            events=bus,
+            max_steps=5,
+        )
+        loop.run(TASK)
+        names = [n for n, _ in seen]
+        self.assertIn("llm_chat_start", names)
+        self.assertIn("llm_chat_end", names)
+        start = next(p for n, p in seen if n == "llm_chat_start")
+        self.assertIn("model", start)
+        self.assertIn("max_tokens", start)
+        end = next(p for n, p in seen if n == "llm_chat_end")
+        self.assertIn("elapsed_seconds", end)
+
+
 class SmokeAliasTest(unittest.TestCase):
     """Alias resolution of tool names (webfetch -> web_fetch)."""
 

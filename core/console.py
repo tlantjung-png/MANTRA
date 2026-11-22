@@ -653,6 +653,16 @@ class ConsoleSession(
                 f"rate limited - waiting {seconds}s"
                 + (f" (waited {waited}s so far)" if waited else "")
             )
+        elif name == "llm_chat_start":
+            # A chat request can take minutes (reasoning models stream
+            # little until the end), so say it started and at what budget
+            # instead of leaving the screen looking frozen.
+            model = payload.get("model") or ""
+            budget = payload.get("max_tokens")
+            label = f"chatting ({model})" if model else "chatting"
+            if budget:
+                label += f" · max {budget} tokens"
+            self._note(label)
         elif name == "run_error":
             self._print(f"  {self.style._wrap(theme.EMBER, '!! ' + str(payload.get('error')))}")
         elif name == "tool_result":

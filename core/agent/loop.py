@@ -208,12 +208,25 @@ class AgentLoop:
                 self._fold_evicted(context, metrics)
 
                 try:
+                    started_chat = time.monotonic()
+                    self._emit(
+                        "llm_chat_start",
+                        {
+                            "model": getattr(self.llm, "model", ""),
+                            "step": steps,
+                            "max_tokens": getattr(self.llm, "_token_budget", None),
+                        },
+                    )
                     response = self.llm.chat(
                         context.request_messages(),
                         tools=tool_schemas,
                         on_delta=self.on_delta,
                         should_abort=lambda: self.aborted,
                         on_wait=self._on_rate_limit_wait,
+                    )
+                    self._emit(
+                        "llm_chat_end",
+                        {"elapsed_seconds": round(time.monotonic() - started_chat, 1)},
                     )
                 except LLMError as exc:
                     message = str(exc)
