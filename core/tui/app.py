@@ -90,6 +90,11 @@ def _redact_model_line_keys(text: str) -> str:
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
 
+# Minimum time a tool activity word stays visible before a fresh
+# Channeling (next chat) may replace it. Tool execution is usually
+# faster than a glance; the hold stops the words from flickering away.
+_ACTIVITY_MIN_HOLD = 1.0
+
 
 RESIZE_DEBOUNCE = 0.016
 
@@ -278,10 +283,24 @@ class TuiApp:
         (Pondering), or the final answer streams (Manifesting). Empty
         activity falls back to the default busy label. The spinner and
         elapsed counter carry the motion; the word itself stays stable.
+
+        A tool word is held for a beat before a fresh Channeling may
+        replace it, because tool execution itself is usually very fast
+        and the next chat starts immediately after — otherwise the tool
+        words would be effectively invisible.
         """
         with self.lock:
+            now = time.monotonic()
+            if (
+                activity == "Channeling"
+                and self.activity
+                and self.activity != "Channeling"
+                and now - self.activity_since < _ACTIVITY_MIN_HOLD
+            ):
+                return  # keep the just-finished tool word visible briefly
             self.activity = activity
             self.activity_detail = detail
+            self.activity_since = now
             self.mark_dirty()
 
     def __init__(self, session, backend: Backend | None = None) -> None:
@@ -348,6 +367,7 @@ class TuiApp:
         # Casting, Manifesting, ...); empty means the default label.
         self.activity = ""
         self.activity_detail = ""
+        self.activity_since = 0.0
         self.status_text = ""
         self.counter_text = ""
         self.toast = ""

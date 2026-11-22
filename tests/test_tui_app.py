@@ -55,6 +55,25 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertNotIn("Scrying", border_after)
         self.assertNotIn("Inscribing", border_after)
 
+    def test_tool_word_survives_quick_followup_chat(self):
+        import re as _re
+
+        app, session, backend = _make_app([])
+        app.busy = True
+        app._turn_started = time.monotonic()
+        app.set_activity("Scrying")
+        # A chat starts right after the tool; the hold keeps Scrying visible.
+        app.set_activity("Channeling")
+        border = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
+        self.assertIn("Scrying", border)
+        self.assertNotIn("Channeling", border)
+        # Once the hold window has passed, the new state takes over.
+        app.activity_since = time.monotonic() - 5
+        app.set_activity("Channeling")
+        border_after = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
+        self.assertNotIn("Scrying", border_after)
+        self.assertIn("Channeling", border_after)
+
     def test_live_token_estimate_uses_total_text_not_fragment_count(self):
         app, session, backend = _make_app([])
         for _ in range(20):
