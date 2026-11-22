@@ -433,6 +433,26 @@ class OpenAICompatClient(LLMClient):
         # retry loop can then treat as transient).
         self._responses_unavailable = False
 
+    def raise_token_budget(self, multiplier: float = 2.0, ceiling: int = 65536) -> bool:
+        """Grow the completion budget used on subsequent requests.
+
+        Called by the agent loop when a response is cut off mid-tool-call,
+        so a repeated cut can recover instead of failing several identical
+        attempts. Returns True when the budget grew, False when it is
+        already at the ceiling (or the multiplier would not change it).
+        """
+        if not 1.0 < multiplier <= 8.0:
+            raise ValueError("multiplier must be in (1, 8]")
+        if ceiling < 1:
+            raise ValueError("ceiling must be positive")
+        with self._lock:
+            grown = int(self._token_budget) * multiplier
+            new_budget = min(int(ceiling), int(grown))
+            if new_budget <= self._token_budget:
+                return False
+            self._token_budget = new_budget
+            return True
+
     def chat(
         self,
         messages: list[dict[str, Any]],

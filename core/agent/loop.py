@@ -33,6 +33,21 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+def _truncation_nudge(raised: bool) -> str:
+    """Nudge text after a cut-off tool call; notes a raised budget when one happened."""
+    text = (
+        "(Your previous response was cut off mid-tool-call - the output "
+        "budget probably ran out while writing the tool call. "
+    )
+    if raised:
+        text += "The output budget was increased for this attempt. "
+    text += (
+        "Re-issue the tool call in full now, or answer directly if the "
+        "previous tool results already suffice.)"
+    )
+    return text
+
+
 @dataclass
 class RunResult:
     """Result of one run: verdict, steps, timing, metrics."""
@@ -109,6 +124,20 @@ class AgentLoop:
             "llm_rate_limited",
             {"seconds": round(seconds, 1), "waited": round(waited, 1)},
         )
+
+    def _raise_token_budget(self) -> bool:
+        """Ask the client to grow its output budget; False when unsupported.
+
+        The scripted test client has no such knob, so the fallback keeps
+        the bounded-retry behavior for hosts without a live client.
+        """
+        bump = getattr(self.llm, "raise_token_budget", None)
+        if bump is None:
+            return False
+        try:
+            return bool(bump())
+        except Exception:
+            return False
 
     def run(self, task: dict[str, Any]) -> RunResult:
         task_id = str(task.get("task_id", "unnamed"))
@@ -212,18 +241,12 @@ class AgentLoop:
                             "writing the tool call. Raise max_tokens or lower "
                             "reasoning_effort in the llm config, then retry."
                         ) from exc
-                    # Transient: nudge once and let the model re-issue the
-                    # call. Retrying with identical context would reproduce
-                    # the same cut, so the nudge is what makes it recover.
-                    context.append(
-                        {
-                            "role": "user",
-                            "content": "(Your previous response was cut off mid-tool-call - "
-                            "the output budget probably ran out while writing the tool call. "
-                            "Re-issue the tool call in full now, or answer directly if the "
-                            "previous tool results already suffice.)",
-                        }
-                    )
+                    # Grow the output budget so the next attempt can finish
+                    # the call, then nudge the model to re-issue it. A
+                    # retry with identical context and budget would just
+                    # reproduce the same cut.
+                    raised = self._raise_token_budget()
+                    context.append({"role": "user", "content": _truncation_nudge(raised)})
                     continue
                 # Response must be LLMResponse-like.
                 if response is None or not hasattr(response, "is_final"):
@@ -232,10 +255,22 @@ class AgentLoop:
 
                 if getattr(response, "finish_reason", None) == "length":
                     if response.tool_calls:
-                        raise LLMError(
-                            "the model stopped mid-tool-call at its output token limit; "
-                            "raise max_tokens or lower reasoning_effort and retry"
-                        )
+                        truncated_calls += 1
+                        if truncated_calls > max_truncated_calls:
+                            try:
+                                tool = response.tool_calls[0].name or ""
+                            except Exception:
+                                tool = ""
+                            raise LLMError(
+                                "the model response was cut off mid-tool-call"
+                                + (f" ({tool})" if tool else "")
+                                + " three times: the output budget was exhausted while "
+                                "writing the tool call. Raise max_tokens or lower "
+                                "reasoning_effort in the llm config, then retry."
+                            )
+                        raised = self._raise_token_budget()
+                        context.append({"role": "user", "content": _truncation_nudge(raised)})
+                        continue
                     fragment = response.content if isinstance(response.content, str) else ""
                     if fragment:
                         partial_final_parts.append(fragment)

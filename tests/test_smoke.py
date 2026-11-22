@@ -33,6 +33,7 @@ from core.scripted import (
     final_response,
     tool_call_response,
 )
+from core.types import LLMResponse, ToolCall
 from core.logs import JsonlLogger
 from core.sandbox import LocalSandbox
 from core.registry import build_tools
@@ -273,6 +274,106 @@ class TruncatedToolCallTest(unittest.TestCase):
         result = loop.run(TASK)
         self.assertEqual(result.stopped_reason, "final")
         self.assertEqual(result.steps_used, 3)  # 1 cut + 1 tool step + 1 final
+        self.assertIn("read the file", result.final_message)
+
+
+class _BudgetBumpFlaky(ScriptedLLMClient):
+    """Raises like a cut-off tool call until its budget is bumped enough."""
+
+    def __init__(self, script: list, fail_times: int = 99) -> None:
+        super().__init__(script)
+        self.fail_times = fail_times
+        self.bumps: list[int] = []
+
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise LLMError(
+                "the response ended mid-tool-call (write_file): "
+                "Expecting value: line 1 column 2 (char 1)"
+            )
+        return super().chat(messages, tools=tools, on_delta=on_delta)
+
+    def raise_token_budget(self) -> bool:
+        budget = getattr(self, "_budget", 4096)
+        self.bumps.append(budget)
+        self._budget = budget * 2
+        return True
+
+
+class _LengthCutFlaky(ScriptedLLMClient):
+    """Returns a length-truncated tool call, then plays its script."""
+
+    def __init__(self, script: list, cut_times: int = 1) -> None:
+        super().__init__(script)
+        self.cut_times = cut_times
+        self.bumps: list[int] = []
+
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
+        if self.cut_times > 0:
+            self.cut_times -= 1
+            return LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_1", name="write_file", arguments={"path": "x"})
+                ],
+                finish_reason="length",
+            )
+        return super().chat(messages, tools=tools, on_delta=on_delta)
+
+    def raise_token_budget(self) -> bool:
+        budget = getattr(self, "_budget", 4096)
+        self.bumps.append(budget)
+        self._budget = budget * 2
+        return True
+
+
+class BudgetEscalationTest(unittest.TestCase):
+    """A cut-off tool call must grow the output budget before retrying."""
+
+    def test_truncation_raises_budget_before_giving_up(self):
+        workspace = make_workspace()
+        llm = _BudgetBumpFlaky([final_response("never reached")], fail_times=99)
+        loop = build_loop(llm, workspace, os.path.join(workspace, "run.jsonl"))
+        loop.max_steps = 30  # override the default so the retry budget governs
+        result = loop.run(TASK)
+        self.assertEqual(result.stopped_reason, "error")
+        # 1 initial attempt + 2 nudged retries, each with a budget bump.
+        self.assertEqual(result.steps_used, 3)
+        self.assertEqual(llm.bumps, [4096, 8192])
+        self.assertIn("cut off mid-tool-call (write_file)", result.final_message)
+        self.assertIn("max_tokens", result.final_message)
+
+    def test_truncation_escalation_recovers_with_larger_budget(self):
+        workspace = make_workspace()
+        llm = _BudgetBumpFlaky(
+            [
+                tool_call_response("read_file", {"path": "greet.py"}),
+                final_response("done: read the file"),
+            ],
+            fail_times=2,
+        )
+        loop = build_loop(llm, workspace, os.path.join(workspace, "run.jsonl"))
+        loop.max_steps = 30
+        result = loop.run(TASK)
+        self.assertEqual(result.stopped_reason, "final")
+        self.assertEqual(llm.bumps, [4096, 8192])
+        self.assertIn("read the file", result.final_message)
+
+    def test_length_finish_truncation_retries_with_budget_bump(self):
+        workspace = make_workspace()
+        llm = _LengthCutFlaky(
+            [
+                tool_call_response("read_file", {"path": "greet.py"}),
+                final_response("done: read the file"),
+            ],
+            cut_times=2,
+        )
+        loop = build_loop(llm, workspace, os.path.join(workspace, "run.jsonl"))
+        loop.max_steps = 30
+        result = loop.run(TASK)
+        self.assertEqual(result.stopped_reason, "final")
+        self.assertEqual(llm.bumps, [4096, 8192])
         self.assertIn("read the file", result.final_message)
 
 
