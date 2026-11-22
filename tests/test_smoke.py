@@ -377,6 +377,49 @@ class BudgetEscalationTest(unittest.TestCase):
         self.assertIn("read the file", result.final_message)
 
 
+class _StreamPauseFlaky(ScriptedLLMClient):
+    """Raises like a read-timeout pause after partial output, then plays its script."""
+
+    def __init__(self, script: list, fail_times: int = 1) -> None:
+        super().__init__(script)
+        self.fail_times = fail_times
+        self.bumps: list[int] = []
+
+    def chat(self, messages, tools=None, on_delta=None, **kwargs):
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            err = LLMError("stream paused after partial output (read timeout): boom")
+            err.retryable_truncation = True
+            raise err
+        return super().chat(messages, tools=tools, on_delta=on_delta)
+
+    def raise_token_budget(self) -> bool:
+        budget = getattr(self, "_budget", 4096)
+        self.bumps.append(budget)
+        self._budget = budget * 2
+        return True
+
+
+class StreamPauseRecoveryTest(unittest.TestCase):
+    """A read-timeout pause recovers via the loop's nudge + budget bump."""
+
+    def test_stream_pause_timeout_recovers(self):
+        workspace = make_workspace()
+        llm = _StreamPauseFlaky(
+            [
+                tool_call_response("read_file", {"path": "greet.py"}),
+                final_response("done: read the file"),
+            ],
+            fail_times=2,
+        )
+        loop = build_loop(llm, workspace, os.path.join(workspace, "run.jsonl"))
+        loop.max_steps = 30
+        result = loop.run(TASK)
+        self.assertEqual(result.stopped_reason, "final")
+        self.assertEqual(llm.bumps, [4096, 8192])
+        self.assertIn("read the file", result.final_message)
+
+
 class ChatLivenessEventTest(unittest.TestCase):
     """llm_chat_start/end events make long generations observable."""
 

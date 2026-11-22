@@ -358,6 +358,14 @@ def parse_retry_after(value: str | None) -> float | None:
     return max(0.0, min(delta, _RETRY_AFTER_MAX))
 
 
+def _is_read_timeout(exc: BaseException) -> bool:
+    """True for a socket read timeout (silent peer), not a hard drop."""
+    if isinstance(exc, TimeoutError):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, TimeoutError)
+
+
 def sleep_abortable(seconds: float, should_abort: Callable[[], bool] | None) -> None:
     """Sleep in small slices, raising LLMError when the run is aborted.
 
@@ -386,7 +394,7 @@ class OpenAICompatClient(LLMClient):
         api_key_env: str = "OPENAI_API_KEY",
         temperature: float = 0.2,
         max_tokens: int = 4096,
-        timeout: float = 120.0,
+        timeout: float = 300.0,
         max_retries: int = 3,
         rate_limit_wait: float = 600.0,
         stream: bool = True,
@@ -600,6 +608,16 @@ class OpenAICompatClient(LLMClient):
                     time.sleep(min(2**attempt, 8))
             except (urllib.error.URLError, TimeoutError, OSError, IncompleteRead) as exc:
                 if use_stream and emitted["delta"]:
+                    if _is_read_timeout(exc):
+                        # A silent reasoning stretch outlasted the read
+                        # timeout, not a broken connection: the loop can
+                        # recover with a budget bump and a nudge, so mark
+                        # it retryable instead of ending the turn.
+                        err = LLMError(
+                            f"stream paused after partial output (read timeout): {exc}"
+                        )
+                        err.retryable_truncation = True
+                        raise err from exc
                     # Fragments already streamed: a retry would duplicate
                     # them on screen, so fail the turn instead.
                     raise LLMError(f"stream interrupted after partial output: {exc}") from exc

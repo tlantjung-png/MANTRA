@@ -66,6 +66,22 @@ class MidStreamDropTest(unittest.TestCase):
             self._run(client, drops_after_output)
         self.assertIn("partial output", str(ctx.exception))
 
+    def test_read_timeout_after_partial_output_is_retryable(self):
+        from core.agent.exceptions import LLMError
+
+        client = self._client(max_retries=3)
+
+        def times_out_after_output(body, on_delta):
+            on_delta("partial answer ")
+            raise TimeoutError("The read operation timed out")
+
+        with self.assertRaises(LLMError) as ctx:
+            self._run(client, times_out_after_output)
+        # A silent reasoning stretch is recoverable: the loop nudges and
+        # bumps the budget instead of failing the turn.
+        self.assertTrue(getattr(ctx.exception, "retryable_truncation", False))
+        self.assertIn("read timeout", str(ctx.exception))
+
     def test_stream_missing_done_sentinel_raises(self):
         from core.agent.exceptions import LLMError
         from core.llm import parse_sse_stream
