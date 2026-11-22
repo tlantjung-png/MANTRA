@@ -656,13 +656,22 @@ class ConsoleSession(
         elif name == "llm_chat_start":
             # A chat request can take minutes (reasoning models stream
             # little until the end), so say it started and at what budget
-            # instead of leaving the screen looking frozen.
+            # instead of leaving the screen looking frozen. In the TUI
+            # the busy chip pulses the animated ENCHANTER word instead.
             model = payload.get("model") or ""
             budget = payload.get("max_tokens")
-            label = f"chatting ({model})" if model else "chatting"
-            if budget:
-                label += f" · max {budget} tokens"
-            self._note(label)
+            layout = getattr(self, "layout", None)
+            if layout is not None and getattr(layout, "active", False) and hasattr(layout, "set_chat_state"):
+                layout.set_chat_state(True, model=model, budget=budget)
+            else:
+                label = f"chatting ({model})" if model else "chatting"
+                if budget:
+                    label += f" · max {budget} tokens"
+                self._note(label)
+        elif name == "llm_chat_end":
+            layout = getattr(self, "layout", None)
+            if layout is not None and hasattr(layout, "set_chat_state"):
+                layout.set_chat_state(False)
         elif name == "run_error":
             self._print(f"  {self.style._wrap(theme.EMBER, '!! ' + str(payload.get('error')))}")
         elif name == "tool_result":
