@@ -226,7 +226,10 @@ class AgentLoop:
                     )
                     self._emit(
                         "llm_chat_end",
-                        {"elapsed_seconds": round(time.monotonic() - started_chat, 1)},
+                        {
+                            "elapsed_seconds": round(time.monotonic() - started_chat, 1),
+                            "tool_calls": len(response.tool_calls or []),
+                        },
                     )
                 except LLMError as exc:
                     message = str(exc)

@@ -449,6 +449,7 @@ class ChatLivenessEventTest(unittest.TestCase):
         self.assertIn("max_tokens", start)
         end = next(p for n, p in seen if n == "llm_chat_end")
         self.assertIn("elapsed_seconds", end)
+        self.assertIn("tool_calls", end)
 
 
 class SmokeAliasTest(unittest.TestCase):

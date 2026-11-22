@@ -90,11 +90,7 @@ def _redact_model_line_keys(text: str) -> str:
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
 
-# The themed label shown in the busy chip while a chat request is in
-# flight. One fixed MANTRA-flavored word for "thinking" — the spinner
-# and the elapsed counter keep the chip animated, so the label itself
-# stays stable.
-_CHAT_THEME_WORD = "Enchanting"
+
 RESIZE_DEBOUNCE = 0.016
 
 # "↓ bottom" chip timings: accent pulse on turn-end and on output
@@ -234,9 +230,9 @@ class LayoutBridge:
     def draw_chrome(self) -> None:
         self.app.mark_dirty()
 
-    def set_chat_state(self, busy: bool, model: str = "", budget=None) -> None:
-        """Forward the chat-thinking indicator to the app's busy chip."""
-        self.app.set_chat_state(busy, model=model, budget=budget)
+    def set_activity(self, activity: str, detail: str = "") -> None:
+        """Forward the themed activity word to the app's busy chip."""
+        self.app.set_activity(activity, detail)
 
     def draw_prompt(self, body: str = "") -> None:
         # The composer owns the prompt row; only the live token counter
@@ -274,23 +270,18 @@ class LayoutBridge:
 
 
 class TuiApp:
-    def set_chat_state(self, busy: bool, model: str = "", budget=None) -> None:
-        """Show or clear the themed thinking indicator.
+    def set_activity(self, activity: str, detail: str = "") -> None:
+        """Show the themed activity word on the busy chip.
 
-        Called by the console when a chat request starts or ends. When
-        busy, the chip label shows the fixed MANTRA-themed word
-        (Enchanting) so a silent reasoning stretch reads as alive
-        without the label itself changing.
+        Called by the console when a chat starts (Channeling), a tool
+        runs (Scrying, Inscribing, Casting, ...), a wait happens
+        (Pondering), or the final answer streams (Manifesting). Empty
+        activity falls back to the default busy label. The spinner and
+        elapsed counter carry the motion; the word itself stays stable.
         """
         with self.lock:
-            self.chat_busy = bool(busy)
-            if busy:
-                self.chat_model = model or ""
-                self.chat_budget = budget
-                self._chat_pulse_i = 0
-            else:
-                self.chat_model = ""
-                self.chat_budget = None
+            self.activity = activity
+            self.activity_detail = detail
             self.mark_dirty()
 
     def __init__(self, session, backend: Backend | None = None) -> None:
@@ -352,13 +343,11 @@ class TuiApp:
         self.busy = False
         self.busy_label = "Channeling"
         self._spinner_i = 0
-        # Chat-in-flight indicator: while a chat request runs (thinking),
-        # the busy chip shows the fixed MANTRA-themed word (Enchanting)
-        # instead of the plain label; the spinner and elapsed counter keep
-        # it animated.
-        self.chat_busy = False
-        self.chat_model = ""
-        self.chat_budget: int | None = None
+        # Activity indicator: the busy chip shows a themed word for what
+        # the agent is doing right now (Channeling, Scrying, Inscribing,
+        # Casting, Manifesting, ...); empty means the default label.
+        self.activity = ""
+        self.activity_detail = ""
         self.status_text = ""
         self.counter_text = ""
         self.toast = ""
@@ -696,9 +685,8 @@ class TuiApp:
             # busy (queued) or as idle (started a fresh turn) — never lost.
             with self.lock:
                 self.busy = False
-                self.chat_busy = False
-                self.chat_model = ""
-                self.chat_budget = None
+                self.activity = ""
+                self.activity_detail = ""
                 queued = self.queued
                 self.queued = ""
             self.status_text = ""
@@ -1902,11 +1890,13 @@ class TuiApp:
             else:
                 elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
             label = self.busy_label if elapsed >= 1 else "Channeling"
-            if self.chat_busy:
-                # A fixed themed word for "thinking"; the spinner frame and
-                # elapsed counter carry the motion, and the label stays
-                # short enough that the live token counter remains visible.
-                label = _CHAT_THEME_WORD
+            if self.activity:
+                # The themed word for the current activity; the spinner
+                # frame and elapsed counter carry the motion, and the
+                # label stays short enough that the counter stays visible.
+                label = self.activity
+                if self.activity_detail:
+                    label += f" · {self.activity_detail}"
             parts = [f"{frame} {label} {elapsed_str}"]
             if self.counter_text:
                 parts.append(self.counter_text)

@@ -27,31 +27,33 @@ class AppIntegrationTest(unittest.TestCase):
             shutil.rmtree(ws, ignore_errors=True)
         _TEMP_WORKSPACES.clear()
 
-    def test_chat_state_shows_fixed_theme_word(self):
+    def test_activity_word_is_stable_and_clears(self):
         import re as _re
-
-        from core.tui.app import _CHAT_THEME_WORD
 
         app, session, backend = _make_app([])
         app.busy = True
         app._turn_started = time.monotonic()
-        app.set_chat_state(True, model="LongCat-2.5", budget=16384)
-        self.assertEqual(app.chat_model, "LongCat-2.5")
-        self.assertEqual(app.chat_budget, 16384)
+        app.set_activity("Scrying")
         borders = []
-        for i in range(20):
+        for i in range(10):
             if i > 0:
                 app.tick_animation()
             borders.append(_re.sub(r"\033\[[0-9;]*m", "", app._border_text()))
         # One stable themed word the whole time — no cycling, no ENCHANTER.
         for b in borders:
-            self.assertIn(_CHAT_THEME_WORD, b)
+            self.assertIn("Scrying", b)
             self.assertNotIn("ENCHANTER", b)
         self.assertEqual(len({b.split(" ")[1] for b in borders}), 1)
-        app.set_chat_state(False)
-        self.assertEqual(app.chat_model, "")
+        # Detail rides along when supplied.
+        app.set_activity("Inscribing", "max 16384 tokens")
+        border_detail = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
+        self.assertIn("Inscribing", border_detail)
+        self.assertIn("max 16384 tokens", border_detail)
+        # Clearing falls back to the default busy label.
+        app.set_activity("")
         border_after = _re.sub(r"\033\[[0-9;]*m", "", app._border_text())
-        self.assertNotIn(_CHAT_THEME_WORD, border_after)
+        self.assertNotIn("Scrying", border_after)
+        self.assertNotIn("Inscribing", border_after)
 
     def test_live_token_estimate_uses_total_text_not_fragment_count(self):
         app, session, backend = _make_app([])

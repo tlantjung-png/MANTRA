@@ -30,14 +30,18 @@ class AnsiToHtmlTest(unittest.TestCase):
 class ChipSnapshotTest(unittest.TestCase):
     def test_chip_rows_cover_state_variants(self):
         labels = [label for label, _ in chip_rows()]
-        self.assertEqual(len(labels), 3)
+        self.assertEqual(len(labels), 6)
         self.assertIn("idle", labels[0])
         self.assertIn("busy", labels[1])
-        self.assertIn("chat", labels[2])
+        self.assertIn("thinking", labels[2])
+        self.assertIn("reading", labels[3])
+        self.assertIn("writing", labels[4])
+        self.assertIn("presenting", labels[5])
 
-    def test_render_page_contains_themed_chat_chip(self):
+    def test_render_page_contains_themed_activity_chips(self):
         page = render_page()
-        self.assertIn("Enchanting", page)  # the fixed MANTRA-themed word
+        for word in ("Channeling", "Scrying", "Inscribing", "Manifesting"):
+            self.assertIn(word, page)
         self.assertNotIn("ENCHANTER", page)
         self.assertIn("tok ·", page)        # live token counter survives
         self.assertIn('class="chip"', page)

@@ -18,7 +18,7 @@ import sys
 import time
 from html import escape as _esc
 
-from core.tui.app import _CHAT_THEME_WORD, TuiApp
+from core.tui.app import TuiApp
 
 _ANSI_SPLIT = re.compile(r"(\033\[[0-9;]*m)")
 
@@ -89,9 +89,8 @@ def _chip_app(**attrs):
     app.busy = False
     app.busy_label = "Channeling"
     app._spinner_i = 0
-    app.chat_busy = False
-    app.chat_model = ""
-    app.chat_budget = None
+    app.activity = ""
+    app.activity_detail = ""
     app.status_text = ""
     app.counter_text = ""
     app.queued = ""
@@ -102,23 +101,29 @@ def _chip_app(**attrs):
 
 
 def chip_rows() -> list[tuple[str, str]]:
-    """Return (label, ansi_text) rows for the chip states."""
+    """Return (label, ansi_text) rows for the themed chip states."""
     now = time.monotonic()
+    border = TuiApp._border_text
     idle = _chip_app()
     busy = _chip_app(busy=True, busy_label="Chanting", _turn_started=now - 12)
-    chat = _chip_app(
+    thinking = _chip_app(busy=True, activity="Channeling", _turn_started=now - 8)
+    reading = _chip_app(busy=True, activity="Scrying", _turn_started=now - 3)
+    writing = _chip_app(
+        busy=True, activity="Inscribing", _turn_started=now - 45
+    )
+    presenting = _chip_app(
         busy=True,
-        chat_busy=True,
-        chat_model="LongCat-2.5",
-        chat_budget=16384,
-        _turn_started=now - 45,
+        activity="Manifesting",
+        _turn_started=now - 30,
         counter_text="1234 tok · 42.1 tok/s",
     )
-    border = TuiApp._border_text
     return [
         ("idle (no turn)", border(idle)),
         ("busy turn", border(busy)),
-        ("chat · %s" % _CHAT_THEME_WORD, border(chat)),
+        ("thinking · Channeling", border(thinking)),
+        ("reading · Scrying", border(reading)),
+        ("writing · Inscribing", border(writing)),
+        ("presenting · Manifesting", border(presenting)),
     ]
 
 

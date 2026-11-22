@@ -20,7 +20,9 @@ class HarnessRenderTest(unittest.TestCase):
         # The whole screen is painted: top bar, transcript, chip, prompt.
         self.assertIn("WORKSPACE:", grid)
         self.assertIn("MANTRA >", grid)
-        self.assertIn("Enchanting", grid)
+        # "Channeling" comes from the activity word, not the default busy
+        # label (which the harness sets to "Chanting").
+        self.assertIn("Channeling", grid)
         self.assertIn("1234 tok", grid)
         self.assertNotIn("ENCHANTER", grid)
 
@@ -29,7 +31,7 @@ class HarnessRenderTest(unittest.TestCase):
         self.app.render_frame()
         ansi = grid_ansi(self.app)
         self.assertIn("\033[", ansi)
-        self.assertIn("Enchanting", ansi)
+        self.assertIn("Channeling", ansi)
 
     def test_render_page_produces_browser_html(self):
         chat_state(self.app)
@@ -40,7 +42,7 @@ class HarnessRenderTest(unittest.TestCase):
             "note",
         )
         self.assertIn("<!doctype html>", page)
-        self.assertIn("Enchanting", page)
+        self.assertIn("Channeling", page)
         self.assertIn('<div class="screen">', page)
 
     def test_cli_writes_preview_and_grid(self):
@@ -52,7 +54,7 @@ class HarnessRenderTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(preview))
             self.assertTrue(os.path.isfile(grid))
             with open(preview, encoding="utf-8") as handle:
-                self.assertIn("Enchanting", handle.read())
+                self.assertIn("Channeling", handle.read())
             with open(grid, encoding="utf-8") as handle:
                 self.assertIn("MANTRA >", handle.read())
 

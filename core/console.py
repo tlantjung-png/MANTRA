@@ -21,6 +21,32 @@ from typing import Any
 
 from core import theme
 from core.config import REASONING_EFFORTS, load_config
+
+# Themed chip words by activity, kept inside MANTRA's spell vocabulary.
+# One word per activity; the busy chip shows the word for what the agent
+# is doing right now (the spinner and elapsed counter animate it).
+_TOOL_ACTIVITY: dict[str, str] = {
+    "read_file": "Scrying",
+    "list_dir": "Scrying",
+    "find_file": "Divining",
+    "search_code": "Divining",
+    "write_file": "Inscribing",
+    "edit_file": "Refining",
+    "run_command": "Casting",
+    "shell_output": "Casting",
+    "kill_shell": "Casting",
+    "git_diff": "Chronicling",
+    "git_reset": "Chronicling",
+    "extract_document": "Unveiling",
+    "web_fetch": "Summoning",
+}
+_CHAT_ACTIVITY = "Channeling"
+_MANIFEST_ACTIVITY = "Manifesting"
+_PONDER_ACTIVITY = "Pondering"
+
+
+def _activity_for_tool(tool: str) -> str:
+    return _TOOL_ACTIVITY.get(tool, "Enchanting")
 from core.agent.loop import DEFAULT_SYSTEM_PROMPT, AgentLoop, RunResult
 from core.agent.approvals import MODES, ApprovalPolicy
 from core.agent.context import ContextManager
@@ -596,11 +622,18 @@ class ConsoleSession(
     def _note(self, text: str) -> None:
         self._print(f"  {self.style.dim(text)}")
 
+    def _set_activity(self, activity: str, detail: str = "") -> None:
+        """Show the themed chip word for the current activity (TUI only)."""
+        layout = getattr(self, "layout", None)
+        if layout is not None and hasattr(layout, "set_activity"):
+            layout.set_activity(activity, detail)
+
     def _on_event(self, name: str, payload: dict) -> None:
         """Route one event-bus notification (tool_call, tool_result, denial, error) to the transcript."""
         if name == "tool_call":
             step = payload.get("step")
             tool = payload.get("tool")
+            self._set_activity(_activity_for_tool(tool))
             args = payload.get("args") or {}
             # Show file path for file-operation tools so the operator can
             # follow along without waiting for the full reply.
@@ -649,29 +682,33 @@ class ConsoleSession(
             # this wait is and how long the turn has waited in total.
             seconds = payload.get("seconds")
             waited = payload.get("waited")
+            self._set_activity(_PONDER_ACTIVITY, f"waiting {seconds}s" if seconds else "")
             self._note(
                 f"rate limited - waiting {seconds}s"
                 + (f" (waited {waited}s so far)" if waited else "")
             )
         elif name == "llm_chat_start":
             # A chat request can take minutes (reasoning models stream
-            # little until the end), so say it started and at what budget
-            # instead of leaving the screen looking frozen. In the TUI
-            # the busy chip pulses the animated ENCHANTER word instead.
+            # little until the end). The TUI chip says Channeling; the
+            # plain mode gets a note instead.
             model = payload.get("model") or ""
             budget = payload.get("max_tokens")
             layout = getattr(self, "layout", None)
-            if layout is not None and getattr(layout, "active", False) and hasattr(layout, "set_chat_state"):
-                layout.set_chat_state(True, model=model, budget=budget)
+            if layout is not None and getattr(layout, "active", False) and hasattr(layout, "set_activity"):
+                self._set_activity(_CHAT_ACTIVITY)
             else:
                 label = f"chatting ({model})" if model else "chatting"
                 if budget:
                     label += f" · max {budget} tokens"
                 self._note(label)
         elif name == "llm_chat_end":
-            layout = getattr(self, "layout", None)
-            if layout is not None and hasattr(layout, "set_chat_state"):
-                layout.set_chat_state(False)
+            # If the chat ends with tool calls pending, the next tool_call
+            # event will take over the chip word; otherwise the agent is
+            # presenting the final answer — Manifesting.
+            if payload.get("tool_calls"):
+                pass
+            else:
+                self._set_activity(_MANIFEST_ACTIVITY)
         elif name == "run_error":
             self._print(f"  {self.style._wrap(theme.EMBER, '!! ' + str(payload.get('error')))}")
         elif name == "tool_result":

@@ -124,14 +124,12 @@ def render_page(grid: str, title: str, note: str) -> str:
 
 
 def chat_state(app, model: str = "LongCat-2.5", budget: int = 16384) -> None:
-    """Put the app into the chat-in-flight visual state."""
+    """Put the app into the chat-in-flight visual state (Channeling)."""
     with app.lock:
         app.busy = True
         app.busy_label = "Chanting"
         app._turn_started = time.monotonic() - 45
-        app.chat_busy = True
-        app.chat_model = model
-        app.chat_budget = budget
+        app.set_activity("Channeling")
         app.counter_text = "1234 tok · 42.1 tok/s"
     app.mark_dirty()
 
