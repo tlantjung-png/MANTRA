@@ -21,7 +21,7 @@ _OVERRIDE_ENV = "MANTRA_SETTINGS"
 DEFAULT_FILE = {
     "version": _VERSION,
     "endpoints": {},
-    "active": {"endpoint": "", "model": "", "reasoning_effort": None},
+    "active": {"endpoint": "", "model": "", "reasoning_effort": None, "max_tokens": None},
     "skills": {
         # Skill auto-attach lives here, not in the run config: it is a
         # one-time operator preference, and the run config is never written
@@ -351,6 +351,7 @@ def set_active(
     endpoint: str | None = None,
     model: str | None = None,
     reasoning_effort: Any = _UNSET,
+    max_tokens: Any = _UNSET,
 ) -> bool:
     """Record the current choice. Arguments left as-is when not given."""
     data = load()
@@ -360,6 +361,8 @@ def set_active(
         data["active"]["model"] = (model or "").strip()
     if reasoning_effort is not _UNSET:
         data["active"]["reasoning_effort"] = reasoning_effort
+    if max_tokens is not _UNSET:
+        data["active"]["max_tokens"] = max_tokens
     return _write(data)
 
 

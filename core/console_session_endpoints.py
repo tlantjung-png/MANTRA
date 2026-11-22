@@ -81,6 +81,33 @@ class EndpointsMixin:
             except Exception:
                 pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
 
+    def set_max_tokens(self: "ConsoleSession", value: int | None, quiet: bool = False) -> None:
+        """Set the output token budget for the current model.
+
+        None clears the choice so the launch config's llm.max_tokens (or
+        the client default) applies again.
+        """
+        llm = self.config.setdefault("llm", {})
+        if value is None:
+            llm.pop("max_tokens", None)
+        else:
+            llm["max_tokens"] = value
+        try:
+            self.llm = build_llm(llm)
+        except HarnessError as exc:
+            self._print(self.style.ember(f"  could not set max_tokens: {exc}"))
+            return
+        set_active(max_tokens=value)
+        if not quiet:
+            label = str(value) if value is not None else "config default"
+            self._print(self.style.dim(f"  max output tokens is now {label}"))
+        self.refresh_title()
+        if self.layout is not None and getattr(self.layout, "active", False):
+            try:
+                self.layout.draw_chrome()
+            except Exception:
+                pass  # duck-typed bridge: chrome redraw is cosmetic, never fatal
+
     @property
     def endpoint_name(self: "ConsoleSession") -> str:
         """Which saved endpoint the current base URL belongs to, if any."""

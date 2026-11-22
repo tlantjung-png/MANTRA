@@ -645,5 +645,67 @@ class WiringTest(unittest.TestCase):
             fake.assert_called_once_with(session, "mybox")
 
 
+class ModelTokensCommandTest(unittest.TestCase):
+    """/model tokens <n> sets the active max output-token budget."""
+
+    class _StubSession:
+        def __init__(self):
+            self.max_tokens_calls = []
+            self.lines = []
+
+        def set_max_tokens(self, value):
+            self.max_tokens_calls.append(value)
+
+        def _print(self, text):
+            self.lines.append(text)
+
+        class style:
+            @staticmethod
+            def dim(text):
+                return f"dim: {text}"
+
+            @staticmethod
+            def warn(text):
+                return f"warn: {text}"
+
+            @staticmethod
+            def ember(text):
+                return f"ember: {text}"
+
+    def setUp(self):
+        self.session = self._StubSession()
+
+    def test_sets_valid_budget(self):
+        from core.console_model import _model_command
+
+        self.assertTrue(_model_command(self.session, ["tokens", "16384"]))
+        self.assertEqual(self.session.max_tokens_calls, [16384])
+
+    def test_resets_to_config_default(self):
+        from core.console_model import _model_command
+
+        self.assertTrue(_model_command(self.session, ["tokens", "default"]))
+        self.assertEqual(self.session.max_tokens_calls, [None])
+
+    def test_alias_maxtokens(self):
+        from core.console_model import _model_command
+
+        self.assertTrue(_model_command(self.session, ["maxtokens", "32768"]))
+        self.assertEqual(self.session.max_tokens_calls, [32768])
+
+    def test_rejects_non_numeric(self):
+        from core.console_model import _model_command
+
+        self.assertFalse(_model_command(self.session, ["tokens", "abc"]))
+        self.assertEqual(self.session.max_tokens_calls, [])
+
+    def test_rejects_out_of_range(self):
+        from core.console_model import _model_command
+
+        self.assertFalse(_model_command(self.session, ["tokens", "0"]))
+        self.assertFalse(_model_command(self.session, ["tokens", "999999999"]))
+        self.assertEqual(self.session.max_tokens_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

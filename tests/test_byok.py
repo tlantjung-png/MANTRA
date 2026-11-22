@@ -229,8 +229,25 @@ class EndpointStoreTest(TempStorage, unittest.TestCase):
     def test_active_choice_round_trips(self):
         set_active(endpoint="mybox", model="m1", reasoning_effort="high")
         self.assertEqual(
-            active(), {"endpoint": "mybox", "model": "m1", "reasoning_effort": "high"}
+            active(),
+            {
+                "endpoint": "mybox",
+                "model": "m1",
+                "reasoning_effort": "high",
+                "max_tokens": None,
+            },
         )
+
+    def test_active_max_tokens_round_trips(self):
+        set_active(max_tokens=16384)
+        self.assertEqual(active()["max_tokens"], 16384)
+        set_active(max_tokens=None)
+        self.assertIsNone(active()["max_tokens"])
+
+    def test_active_max_tokens_left_alone_when_not_given(self):
+        set_active(endpoint="mybox", model="m1", max_tokens=16384)
+        set_active(model="m2")
+        self.assertEqual(active()["max_tokens"], 16384)
 
     def test_active_fields_are_left_alone_when_not_given(self):
         set_active(endpoint="mybox", model="m1", reasoning_effort="high")

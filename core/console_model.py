@@ -44,6 +44,13 @@ if TYPE_CHECKING:
     # forward reference in signatures.
     from core.console import ConsoleSession
 
+# Output-token budget bounds for the /model tokens surface. The top of
+# the range is intentionally generous (most providers cap lower); the
+# bottom just rejects nonsense.
+MAX_TOKENS_MIN = 1
+MAX_TOKENS_MAX = 131072
+
+
 def _effort_options(current: str | None) -> list[Option]:
     """Thinking levels, with the one in force marked.
 
@@ -587,6 +594,7 @@ def _model_help(session: "ConsoleSession") -> None:
     session._print("    /model                          - menu: add a provider, pick a model")
     session._print("    /model <name>                   - switch to a model directly")
     session._print("    /model <name> <effort>          - switch and set reasoning")
+    session._print("    /model tokens <n>                - set max output tokens (or 'default')")
     session._print("    /model <url> [key] [model]      - add a provider, then pick a model")
     session._print("    /model <endpoint-name>          - switch provider")
     session._print("    /model list                     - show saved providers")
@@ -594,6 +602,35 @@ def _model_help(session: "ConsoleSession") -> None:
     session._print("    /model key [name]               - replace a stored key")
     session._print(s.dim("  effort: off | minimal | low | medium | high | xhigh"))
     session._print(s.dim("  examples: /model gpt-4o ; /model gpt-5 high ; /model https://api.openai.com/v1"))
+
+
+def _set_tokens_command(session: "ConsoleSession", rest: list[str]) -> bool:
+    """/model tokens <n|default> — set the output token budget."""
+    if not rest:
+        session._print(
+            session.style.dim("  usage: /model tokens <n> (e.g. 16384) | /model tokens default")
+        )
+        return True
+    raw = rest[0].strip().lower()
+    if raw in ("default", "off", "clear", "reset"):
+        session.set_max_tokens(None)
+        return True
+    try:
+        n = int(raw)
+    except ValueError:
+        session._print(
+            session.style.warn(f"  max_tokens must be a whole number, got '{rest[0]}'")
+        )
+        return False
+    if n < MAX_TOKENS_MIN or n > MAX_TOKENS_MAX:
+        session._print(
+            session.style.warn(
+                f"  max_tokens must be between {MAX_TOKENS_MIN} and {MAX_TOKENS_MAX}"
+            )
+        )
+        return False
+    session.set_max_tokens(n)
+    return True
 
 
 def _model_master(session: "ConsoleSession") -> bool:
@@ -615,6 +652,7 @@ def _model_master(session: "ConsoleSession") -> bool:
         llm = session.config.get("llm", {})
         session._print(f"model      {llm.get('model', '?')}")
         session._print(f"endpoint   {llm.get('base_url', '?')}")
+        session._print(f"tokens     {llm.get('max_tokens', 'config default')}")
         return False
     if choice == ADD_ENDPOINT:
         _connect_new(session)
@@ -663,6 +701,8 @@ def _model_command(session: "ConsoleSession", parts: list[str]) -> bool:
     if first in ("help", "-h", "--help", "?", "h"):
         _model_help(session)
         return True
+    if first in ("tokens", "maxtokens"):
+        return _set_tokens_command(session, parts[1:])
     # Endpoint management and the <url> [key] [model] add-form reuse the
     # internal _c._connect flow; only a URL (or a management subcommand)
     # belongs there.

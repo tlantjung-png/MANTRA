@@ -1370,6 +1370,8 @@ def main(argv: list[str] | None = None) -> int:
                     llm_cfg["model"] = act["model"]
                 if not args.reasoning and "reasoning_effort" in act:
                     llm_cfg["reasoning_effort"] = act["reasoning_effort"]
+                if "max_tokens" in act and act.get("max_tokens") is not None:
+                    llm_cfg["max_tokens"] = act["max_tokens"]
     except Exception:
         pass  # saved-pick restore is advisory; explicit flags still apply
     if args.endpoint:
