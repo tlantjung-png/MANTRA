@@ -29,6 +29,8 @@ from core.tools.files import (
 from core.tools.search import FindFileTool, SearchCodeTool
 from core.tools.extract import ExtractDocumentTool
 from core.tools.prose_audit import ProseAuditTool
+from core.tools.claim_audit import ClaimAuditTool
+from core.tools.page_audit import PageAuditTool
 from core.tools.web import WebFetchTool
 from core.types import Evaluator
 from core.types import LLMClient
@@ -69,6 +71,8 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         FindFileTool,
         ExtractDocumentTool,
         ProseAuditTool,
+        ClaimAuditTool,
+        PageAuditTool,
         GitDiffTool,
         GitResetTool,
         WebFetchTool,

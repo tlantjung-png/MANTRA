@@ -36,6 +36,7 @@
 | `known-failures` | Maintain and re-probe the known-failure registry (knowledge/known-failures.md, injected into the session prompt) so previously fixed incident classes cannot silently return in sibling paths. |
 | `maintenance` | Run the periodic health pass - test suite, git state, known-failure probing, session log review - and write one dated report. |
 | `mine-sessions` | Mine recent session traces and console logs, reduce cross-session patterns into weighted candidates, and route durable knowledge, repeated workflows, failure trends, and operational candidates without copying secrets. |
+| `on-page-audit` | Audit web pages for on-page search-visibility signals (title, meta description, canonical, viewport, robots, heading structure, image alt, links, content length) and compare any two pages side by side, with evidence. |
 | `performance-audit` | Find measurable performance bottlenecks, blocking work, repeated scans, unbounded growth, and memory or I/O waste without micro-optimizing unmeasured paths. |
 | `plan` | Produce a self-contained, actionable implementation plan with architecture, exact paths, bite-sized test-first tasks, risks, and final verification without implementing it. |
 | `pr` | Manage the full pull-request lifecycle through the repository's approved GitHub integration, including review comments, CI, synchronization, stacked PRs, and explicit merge approval. |
@@ -44,6 +45,7 @@
 | `security-audit` | Perform an evidence-backed vulnerability review covering secrets, injection, authorization, unsafe defaults, deserialization, sensitive output, and visible dependency risk. |
 | `simplify` | Reduce complexity and duplication without changing observable behavior by classifying consumers, proving each candidate with evidence, and making a minimal verified change. |
 | `slides` | Build a coherent presentation with one message per slide, speaker notes, consistent visual hierarchy, and a final audience-oriented inspection. |
+| `source-hygiene` | Scan documents for claims without supporting evidence (unsourced superlatives, statistics without citation, proxy authority, placeholders, broken local references), verify each finding, and replace it with a verified fact or mark it needs-evidence. |
 | `spike` | Test an uncertain idea with a disposable, isolated feasibility experiment and record evidence, limitations, comparisons, and a clear verdict. |
 | `subagent-dev` | Implement a multi-step plan one task at a time, with review and verification before advancing, keeping each task's changes isolated until accepted. |
 | `swarm` | Orchestrate independent subagents for task fan-out, decision panels, or comprehensive category-and-area audits, then reduce and reconcile every result into one verified deliverable. |

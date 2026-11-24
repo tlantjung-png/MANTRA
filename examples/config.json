@@ -21,7 +21,9 @@
     "search_code",
     "find_file",
     "git_diff",
-    "prose_audit"
+    "prose_audit",
+    "claim_audit",
+    "page_audit"
   ],
   "evaluator": {
     "type": "command",
