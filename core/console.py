@@ -1235,6 +1235,8 @@ class ConsoleSession(
             status = "no automatic grading"
             if result.stopped_reason != "final":
                 status += f"; turn stopped: {result.stopped_reason}"
+                if result.stopped_reason == "max_steps" and result.final_message:
+                    status += " (answer summarised at step limit)"
             self._print(f"  {self.style.dim('verification: ' + status)}")
 
     # ---- inspection commands ---------------------------------------------

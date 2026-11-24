@@ -15,7 +15,7 @@ REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 DEFAULTS = {
     "system_prompt": None,  # falls back to the loop default
-    "max_steps": 30,
+    "max_steps": 60,
     # Message limits (not tokens) live under "context".
     "llm": {
         "provider": "openai",

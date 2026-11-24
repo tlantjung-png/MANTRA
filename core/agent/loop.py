@@ -48,6 +48,16 @@ def _truncation_nudge(raised: bool) -> str:
     return text
 
 
+# Wrapping up at the step limit is a single tool-free call: it must turn the
+# evidence already in context into a reply, not start another round of work.
+_BUDGET_FINAL_NUDGE = (
+    "The step budget for this turn is now exhausted. Do not call any tools. "
+    "Give your final answer from the evidence already gathered: report what "
+    "you found and changed, and state plainly what is still uncertain or "
+    "unfinished. Do not claim checks you did not run."
+)
+
+
 @dataclass
 class RunResult:
     """Result of one run: verdict, steps, timing, metrics."""
@@ -138,6 +148,46 @@ class AgentLoop:
             return bool(bump())
         except Exception:
             return False
+
+    def _final_answer_at_budget(
+        self,
+        context: ContextManager,
+        steps: int,
+        metrics: dict[str, float],
+    ) -> str:
+        """Turn a budget-exhausted run into a reply with one tool-free call.
+
+        Running out of steps used to leave final_message empty, so the
+        operator got a footer but no answer and had to spend a whole extra
+        turn asking for the findings. The wrap-up is bounded: one attempt,
+        no tools offered, no tool execution, and no exception escaping into
+        the result - a failure falls back to a short honest notice in run().
+        """
+        if self.aborted:
+            return ""
+        context.append({"role": "user", "content": _BUDGET_FINAL_NUDGE})
+        self._emit("budget_final_start", {"step": steps})
+        try:
+            response = self.llm.chat(
+                context.request_messages(),
+                tools=None,
+                on_delta=self.on_delta,
+                should_abort=lambda: self.aborted,
+                on_wait=self._on_rate_limit_wait,
+            )
+        except Exception as exc:  # noqa: BLE001 - wrap-up must never fail the run
+            self._emit("budget_final_error", {"error": _safe_error_text(exc)})
+            return ""
+        if response is None or not hasattr(response, "is_final"):
+            return ""
+        self._absorb_usage(response, metrics)
+        raw = response.content
+        text = raw.strip() if isinstance(raw, str) else ""
+        if not text:
+            self._emit("budget_final_empty", {})
+            return ""
+        self._emit("budget_final_end", {"chars": len(text)})
+        return text
 
     def run(self, task: dict[str, Any]) -> RunResult:
         task_id = str(task.get("task_id", "unnamed"))
@@ -433,6 +483,24 @@ class AgentLoop:
                 self._emit("run_error", {"task_id": task_id, "error": detail})
             except Exception:
                 pass
+        else:
+            # A step limit bounds tool turns, not the duty to answer. When
+            # the model never emitted a final, spend one tool-free call to
+            # summarise the work so the turn ends with a usable reply.
+            if stopped_reason == "max_steps" and not self.aborted:
+                wrapped = self._final_answer_at_budget(context, steps, metrics)
+                final_message = wrapped or (
+                    f"(step budget reached after {steps} steps; no final answer "
+                    "could be generated - see the work above)"
+                )
+                if not wrapped and self.on_delta:
+                    # Earlier fragments may already have taken the streaming
+                    # path, which will not reprint final_message. Push the
+                    # fallback through the same channel so it is visible.
+                    try:
+                        self.on_delta(final_message)
+                    except Exception:
+                        pass
         finally:
             if aborted or stopped_reason == "aborted":
                 evaluation = EvaluationResult(

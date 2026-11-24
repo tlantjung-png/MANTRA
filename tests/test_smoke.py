@@ -183,7 +183,9 @@ class SmokeTest(unittest.TestCase):
         loop.max_steps = 3
         result = loop.run(TASK)
         self.assertEqual(result.stopped_reason, "max_steps")
-        self.assertEqual(len(llm.script), 17)  # exactly max_steps calls consumed
+        # max_steps tool calls plus one tool-free wrap-up call at the limit.
+        self.assertEqual(len(llm.script), 16)
+        self.assertIn("step budget reached", result.final_message)
 
     def test_empty_final_retries_bounded_then_fails(self):
         """A persistently-empty model fails fast after bounded retries.

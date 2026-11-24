@@ -192,6 +192,45 @@ def test_max_steps_stops_loop(tmp_path) -> None:
     result = loop.run(_task())
     assert result.stopped_reason == "max_steps"
     assert result.steps_used == 3
+    # A budget stop always owes the operator a reply, even if the wrap-up
+    # itself could not produce one: here the client keeps returning tools.
+    assert result.final_message
+    assert "step budget reached" in result.final_message
+    sandbox.cleanup()
+
+
+def test_max_steps_forces_a_final_answer(tmp_path) -> None:
+    from core.types import LLMResponse, ToolCall
+
+    class _WrapUpClient(_ScriptedBase):
+        """Tool calls first, then a usable answer when the budget runs out."""
+
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    LLMResponse(tool_calls=[
+                        ToolCall(id=f"c{i}", name="list_dir", arguments={"path": "."})
+                    ])
+                    for i in range(2)
+                ]
+                + [final_response("ringkasan dari bukti yang terkumpul")]
+            )
+            self.tools_seen = []
+
+        def chat(self, messages, tools=None, on_delta=None, **kwargs):
+            self.tools_seen.append(tools)
+            return super().chat(messages, tools=tools, on_delta=on_delta, **kwargs)
+
+    client = _WrapUpClient()
+    loop, sandbox = _loop(client, tmp_path, max_steps=2)
+    result = loop.run(_task())
+    assert result.stopped_reason == "max_steps"
+    assert result.steps_used == 2
+    assert result.final_message == "ringkasan dari bukti yang terkumpul"
+    # The wrap-up reuses the gathered context, offers no tools, and asks for
+    # a summary rather than starting another round of investigation.
+    assert client.tools_seen[-1] in (None, [])
+    assert "step budget" in client.received_messages[-1][-1]["content"].lower()
     sandbox.cleanup()
 
 
