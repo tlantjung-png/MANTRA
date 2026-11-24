@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from collections import deque
 import signal
 import subprocess
 import sys
@@ -340,6 +341,10 @@ class ConsoleSession(
         self.layout: Any = None
         self._splash_visible = True
         self._abort = threading.Event()
+        # Prompts sent while a turn is running. The active loop drains them
+        # between steps; anything left at turn end is handed to the UI queue.
+        self._injected: deque[str] = deque()
+        self._injected_lock = threading.Lock()
         self._prev_sigint = None
         # Keys the turn-scoped scroll reader buffered while a task streamed
         # (non-scroll input). The prompt editor drains these before touching
@@ -420,6 +425,21 @@ class ConsoleSession(
         """Tell the terminal application a turn is running (spinner state)."""
         if self.ui is not None:
             self.ui.set_busy(on, label="Chanting")
+
+    def inject_message(self, text: str) -> bool:
+        """Queue a prompt for the active loop; False when there is no text."""
+        if not text or not text.strip():
+            return False
+        with self._injected_lock:
+            self._injected.append(text.strip())
+        return True
+
+    def take_injected_messages(self) -> list[str]:
+        """Drain prompts for the loop to append before its next request."""
+        with self._injected_lock:
+            drained = list(self._injected)
+            self._injected.clear()
+        return drained
 
     # Tool-output boxes are budgeted in viewport rows so wrapped lines cannot
     # flood the screen: about one screenful shows and the rest is queued,
@@ -1108,6 +1128,7 @@ class ConsoleSession(
             observation_max_chars=self._observation_max_chars(),
             digest=bool((self.config.get("context") or {}).get("digest", True)),
             digest_max_chars=int((self.config.get("context") or {}).get("digest_max_chars", 4000) or 0),
+            user_message_source=self.take_injected_messages,
         )
         self._streamed_this_run = False
         self._stream_header_done = False
@@ -1191,6 +1212,12 @@ class ConsoleSession(
                 self.last_reply = result.final_message or ""
         finally:
             self._restore_sigint()
+            # Prompts injected too late for this loop still belong to the
+            # operator, so hand them to the UI queue before the turn worker
+            # tears down and drains it.
+            for leftover in self.take_injected_messages():
+                if self.ui is not None:
+                    self.ui.queue_prompt(leftover)
             # The terminal application owns the busy flag and clears it in
             # its turn worker. Clearing it here races that teardown and lets
             # a prompt submitted near turn end bypass the queue.

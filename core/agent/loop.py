@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from core.agent.context import ContextManager
 from core.agent.events import EventBus
@@ -103,6 +103,7 @@ class AgentLoop:
         observation_max_chars: int = DEFAULT_MAX_CHARS,
         digest: bool = True,
         digest_max_chars: int = DEFAULT_DIGEST_MAX_CHARS,
+        user_message_source: Callable[[], list[str]] | None = None,
     ) -> None:
         self.llm = llm
         self.sandbox = sandbox
@@ -129,6 +130,10 @@ class AgentLoop:
         # output, file contents) without putting that content into event
         # payloads or the run log.
         self.on_tool_result = on_tool_result
+        # Optional drain for prompts the operator sent while this run was
+        # active. Each one is appended to the context at the next step so
+        # the model sees it without waiting for the turn to finish.
+        self.user_message_source = user_message_source
 
     @property
     def aborted(self) -> bool:
@@ -256,6 +261,15 @@ class AgentLoop:
                 # digest before the next request, so eviction is not a silent
                 # loss; no-op until the first eviction actually happens.
                 self._fold_evicted(context, metrics)
+
+                # Prompts sent while the turn was running join the context
+                # now, before the next request, so the operator does not
+                # have to abort the turn to be heard.
+                if self.user_message_source is not None:
+                    for incoming in self.user_message_source():
+                        if incoming and isinstance(incoming, str):
+                            context.append({"role": "user", "content": incoming})
+                            self._emit("user_message_injected", {"chars": len(incoming)})
 
                 try:
                     started_chat = time.monotonic()

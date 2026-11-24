@@ -266,6 +266,9 @@ class Renderer:
                     self._front_styles[j] = buf.styles[j]
         if self._cursor is not None:
             cx, cy = self._cursor
+            # A modal frame can hide the caret with ?25l; moving it alone
+            # would leave it invisible. Show it again on every cursor frame.
+            out.append("\033[?25h")
             out.append(f"\033[{cy + 1};{cx + 1}H")
         else:
             out.append("\033[?25l")

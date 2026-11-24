@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from core import console as console_module
-from core.scripted import final_response
+from core.scripted import final_response, tool_call_response
 from tests._helpers import make_session
 from tests.tui_harness import _make_app
 
@@ -32,6 +32,9 @@ class QueuedPromptDeliveryTest(unittest.TestCase):
         self.addCleanup(lambda: setattr(console_module, "dispatch", self._saved_dispatch))
         self._saved_dispatch = console_module.dispatch
         console_module.dispatch = dispatch_fn
+        # Exercise the UI queue fallback directly; immediate injection has
+        # its own test below.
+        app.session.inject_message = lambda text: False
         spawned = []
         app.run_detached = lambda fn: spawned.append(fn)
         return app, spawned
@@ -76,6 +79,48 @@ class QueuedPromptDeliveryTest(unittest.TestCase):
         self.assertEqual(len(spawned), 1)
         spawned.pop(0)()
         self.assertEqual(seen, ["B"])
+
+    def test_mid_turn_prompt_is_sent_to_the_running_loop(self):
+        app, _, _ = _make_app([])
+        app.busy = True
+        app.submit("follow up")
+        self.assertEqual(list(app.session.take_injected_messages()), ["follow up"])
+        self.assertEqual(app.queued, "")
+        self.assertIn("sent", app.toast)
+
+    def test_injected_prompt_reaches_the_model_before_the_next_step(self):
+        workdir = tempfile.mkdtemp(prefix="mantra-inject-test-")
+        self.addCleanup(shutil.rmtree, workdir, True)
+        session = make_session(
+            workdir,
+            [tool_call_response("list_dir", {}), final_response("done")],
+        )
+        original_chat = session.llm.chat
+
+        def chat(messages, tools=None, on_delta=None, **kwargs):
+            if not session.llm.received_messages:
+                session.inject_message("late prompt")
+            return original_chat(messages, tools=tools, on_delta=on_delta, **kwargs)
+
+        session.llm.chat = chat
+        session.handle("start")
+        delivered = [m for call in session.llm.received_messages for m in call]
+        self.assertTrue(any(m.get("content") == "late prompt" for m in delivered))
+
+    def test_caret_is_reshown_after_a_modal_frame_hides_it(self):
+        app, _, backend = _make_app([])
+        renderer = app.renderer
+        backend.writes.clear()
+        renderer.reset_cursor()
+        renderer.flush()
+        self.assertIn("\033[?25l", "".join(backend.writes))
+
+        backend.writes.clear()
+        renderer.set_cursor(3, 20)
+        renderer.flush()
+        shown = "".join(backend.writes)
+        self.assertIn("\033[?25h", shown)
+        self.assertIn("H", shown)
 
     def test_session_handle_does_not_clear_the_app_busy_flag(self):
         calls = []

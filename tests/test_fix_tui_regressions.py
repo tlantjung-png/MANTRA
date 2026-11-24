@@ -190,6 +190,7 @@ class Medium11HistoryLockTest(unittest.TestCase):
 
     def test_busy_submission_still_queues_and_records_history(self):
         app, _, _ = self._spy_app()
+        app.session.inject_message = lambda text: False
         app.busy = True
         app.submit("queued prompt")
         self.assertEqual(app.queued, "queued prompt")

@@ -391,6 +391,14 @@ class TuiApp:
         if text:
             self._prompt_queue.append(text)
 
+    def queue_prompt(self, text: str) -> None:
+        """Append a prompt for a later turn, used for late injections."""
+        if not text:
+            return
+        with self.lock:
+            self._prompt_queue.append(text)
+            self.mark_dirty()
+
     # ── lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
@@ -530,13 +538,14 @@ class TuiApp:
                 self._history.append(display_text)
             self._history_idx = len(self._history)
             if self.busy:
-                self._prompt_queue.append(text)
-                count = len(self._prompt_queue)
-                self.toast_message(
-                    "queued — runs when the current turn ends"
-                    if count == 1
-                    else f"queued ({count}) — each runs after the current turn"
-                )
+                # Send it to the running loop first so the model can read it
+                # at the next step. The UI queue is only a fallback for a
+                # session that has no active loop to inject into.
+                if self.session.inject_message(text):
+                    self.toast_message("sent — the model will read it this turn")
+                else:
+                    self._prompt_queue.append(text)
+                    self.toast_message("queued — runs when the current turn ends")
                 self.mark_dirty()
                 return
             self.busy = True
@@ -580,9 +589,8 @@ class TuiApp:
             self._turn_had_error = True
             self.feed_output(f"\033[38;5;167m  !! {exc}\033[0m\n")
         finally:
-            # Hand the oldest queued prompt to a fresh turn inside the same
-            # lock that submit() uses, so no prompt can be overwritten or
-            # dropped by an unexpected exception from the turn body.
+            # Drain under the lock so an unexpected turn error cannot drop
+            # a queued prompt, then start the next turn outside the lock.
             with self.lock:
                 self.busy = False
                 self.activity = ""
@@ -590,9 +598,10 @@ class TuiApp:
                 handoff = self._prompt_queue.popleft() if self._prompt_queue else ""
                 self._last_turn_tool_text = self.take_turn_tool_text()
                 self.status_text = ""
+                self.counter_text = ""
                 self.mark_dirty()
-                if handoff and self.running:
-                    self.submit(handoff)
+            if handoff and self.running:
+                self.submit(handoff)
 
     # ── blocking interactive helpers (worker-thread side) ─────
 
