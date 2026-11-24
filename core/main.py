@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         llm = build_llm(config["llm"])
         sandbox = build_sandbox(config["sandbox"])
-        tools = build_tools(config["tools"])
+        tools = build_tools(config["tools"], config)
         # External MCP tools join the same list; a server that cannot start
         # is reported and skipped rather than failing the run outright.
         mcp_tools, mcp_clients = build_mcp_tools(

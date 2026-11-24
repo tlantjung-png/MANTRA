@@ -70,11 +70,13 @@ Web retrieval validates every redirect hop, refuses private and internal address
 
 ## Workspace Reading Tools
 
-Beyond file and command tools, the harness has two bounded helpers. Literal text search and filename search share one bounded walk that honours ignore files, avoids ignored or symlinked-out directories, skips oversized and non-text files, and reports when result or scan ceilings are reached. Document extraction reads one structured file and returns a bounded plain-text form for markup, structured data, tabular data, markdown, and ini-like configuration; formats it cannot render are reported as a note, and malformed structured files fall back to a short raw snippet.
+Beyond file and command tools, the harness has two bounded helpers. Literal text search and filename search share one bounded walk that honours ignore files, avoids ignored or symlinked-out directories, skips oversized and non-text files, and reports when result or scan ceilings are reached. Document extraction reads one structured file and returns a bounded plain-text form for markup, structured data, tabular data, markdown, and ini-like configuration; formats it cannot render are reported as a note, and malformed structured files fall back to a short raw snippet. A main-content option drops navigation, footers, sidebars, and forms so only article text reaches the conversation.
+
+Web search is an opt-in tool. It stays disabled until an operator supplies an endpoint in the configuration section named for it. When enabled it returns a bounded list of titles, links, and snippets through the same validated transport and address screening as the fetch tool, and its credential is named by an environment variable rather than stored in the configuration. Three bundled procedures cover producing a sourced brief from web material, watching a page for meaningful changes against a saved snapshot, and integrating a web data endpoint into project code.
 
 ## Verification
 
-The offline test suite needs no network access or credentials. It covers the agent loop, context budgeting and truncation, configuration validation and unknown-key rejection, file-tool safety, approval classification, session persistence, the streaming parser, model discovery, the terminal input layer, and the search, extraction, and tree-query tools. Live probes for end-to-end verification with real credentials are available under the test directory. Container-sandbox tests require a container runtime on the host.
+The offline test suite needs no network access or credentials. It covers the agent loop, context budgeting and truncation, configuration validation and unknown-key rejection, file-tool safety, approval classification, session persistence, the streaming parser, model discovery, the terminal input layer, and the search, extraction, and web tools. Live probes for end-to-end verification with real credentials are available under the test directory. Container-sandbox tests require a container runtime on the host.
 
 ## Repository Documentation
 

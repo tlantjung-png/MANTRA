@@ -38,6 +38,7 @@
 | `maintenance` | Run the periodic health pass - test suite, git state, known-failure probing, session log review - and write one dated report. |
 | `mine-sessions` | Mine recent session traces and console logs, reduce cross-session patterns into weighted candidates, and route durable knowledge, repeated workflows, failure trends, and operational candidates without copying secrets. |
 | `on-page-audit` | Audit web pages for on-page search-visibility signals (title, meta description, canonical, viewport, robots, heading structure, image alt, links, content length) and compare any two pages side by side, with evidence. |
+| `page-change-watch` | Compare a web page against a saved workspace snapshot: fetch, extract main content, store bounded snapshots, and report only meaningful differences, or "no previous snapshot" on first run. |
 | `performance-audit` | Find measurable performance bottlenecks, blocking work, repeated scans, unbounded growth, and memory or I/O waste without micro-optimizing unmeasured paths. |
 | `plan` | Produce a self-contained, actionable implementation plan with architecture, exact paths, bite-sized test-first tasks, risks, and final verification without implementing it. |
 | `pr` | Manage the full pull-request lifecycle through the repository's approved GitHub integration, including review comments, CI, synchronization, stacked PRs, and explicit merge approval. |
@@ -57,6 +58,8 @@
 | `update-memory` | Preserve verified facts that will matter in later sessions in the workspace memory ledger, without duplicating or retaining stale entries. |
 | `update-taste` | Maintain concise durable coding and documentation conventions in the repo (knowledge/known-failures.md and AGENTS.md) without inventing one-off preferences. |
 | `vault` | Check whether a workspace has an external integrity verifier and report its scope; this MANTRA build does not ship vault tooling. |
+| `web-api-integration` | Integrate a web data endpoint into project code: inspect the project, find configuration and client layer, define minimal request and response shapes, add validation and bounds, and write offline tests with a fake transport before running the relevant test command. |
+| `web-research-brief` | Write a short sourced brief on a topic: find candidate pages with the web search tool or operator-supplied URLs, fetch and extract readable text, audit claims, and end with a plain-language summary listing sources. |
 | `workflow` | Choose the relevant installed skill or ordered skill bundle for an ambiguous request, using the catalog and the user's actual goal. |
 | `write-docs` | Write precise technical documentation for current code, APIs, workflows, or features by tracing behavior, applying placement and detail hierarchy, and cross-checking every claim. |
 | `write-migration` | Design a safe reversible database migration by following existing conventions and assessing data loss, defaults, indexes, locks, downtime, and rollback. |

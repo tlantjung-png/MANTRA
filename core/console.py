@@ -257,7 +257,7 @@ class ConsoleSession(
             instructions_path=self.instructions_path,
             environment=env,
         )
-        self.tools = build_tools(config["tools"])
+        self.tools = build_tools(config["tools"], config)
         # MCP tools join the ordinary tool list; no special case is needed
         # downstream. A server that fails to start is reported and skipped
         # instead of blocking startup.

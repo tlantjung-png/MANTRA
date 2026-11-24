@@ -20,6 +20,8 @@ Configuration is supplied as a structured document. The primary format is suppor
 
 Required sections must be objects, at least one tool must be listed, and every tool entry must be a non-empty name. Approval mode and reasoning effort are checked against allowed sets. The context section, when present, must be an object with integer limits that meet documented minima. Unknown keys at any level are rejected. The loader caps the raw file size before parsing, and a component section that changes its discriminator starts from the operator's values so the previous component's keys cannot leak into the new constructor.
 
+Web search is optional. It remains disabled until an endpoint is supplied in the web search section and the tool name is added to the tool list. The credential for that endpoint is named by an environment variable, so it is never written into the configuration document. With no endpoint, the tool is absent from the model's tool list and no network request is made.
+
 Secrets are not stored in the run configuration. The language-model section names a lookup key that is resolved at runtime first from the process environment and then from a restricted credential store. The store is created with owner-only permissions where the platform enforces them and is never written to the main settings file. Platforms that do not enforce permission bits produce a one-time warning. Only masked forms are displayed.
 
 User-wide endpoint selections live in a hand-editable document in the home directory. An environment variable overrides its location for tests. The same mechanism can redirect the credential store, the session directory, the skill roots, the workflow definitions file, and the command-rules file.

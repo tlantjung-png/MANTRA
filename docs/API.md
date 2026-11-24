@@ -24,11 +24,13 @@ Command tools execute a shell command with a timeout and abort support, read out
 
 Search tools perform literal text matching and filename matching under ceilings for results, scanned files, size, and line length.
 
-Document extraction returns bounded plain text from one structured file, covering markup, structured data, tabular data, markdown, and ini-like configuration. Unrenderable formats are reported as a note and malformed structured files fall back to a short raw snippet.
+Document extraction returns bounded plain text from one structured file, covering markup, structured data, tabular data, markdown, and ini-like configuration. An optional main-content mode drops navigation, footers, sidebars, and forms. Unrenderable formats are reported as a note and malformed structured files fall back to a short raw snippet.
 
 The version-control tool displays changes. A reset tool exists for opt-in configurations and is classified as destructive and confirmed.
 
 The retrieval tool fetches a bounded address, extracts visible text, and blocks private networks.
+
+A web search tool is available only when named in the tool list and given an endpoint. It queries that endpoint with a text query and a bounded result count, validates every returned address through the same screening as the retrieval tool, redacts credential-shaped values, and returns a short list of titles, links, and snippets as plain text. Its credential is named by an environment variable. It is read-only and is not part of the default tool list.
 
 ## File References
 
@@ -40,7 +42,7 @@ The configuration document is divided into sections.
 
 The language-model section identifies the provider, model, endpoint address, credential lookup name, sampling temperature, token limit, reasoning effort, streaming preference, timeout, retry count, and the rate-limit wait budget. A rate-limited response is treated as a queue rather than a failure: the client waits out the limit, honouring a server-supplied wait hint when present and otherwise backing off up to thirty seconds, and keeps retrying without spending its ordinary retries until the wait budget is exhausted or the run is aborted. Each wait is announced to the console.
 
-The sandbox section selects the isolation provider and its resource limits, including an image name, memory limit, and working directory for the container option. The tools section lists the tool names exposed to the model, with alias normalization and deduplication. The evaluator section selects the grading strategy, test command, and timeout, with per-task override support. The logging section selects the sink and file path, with relative paths anchored to the project root. The approvals section selects one of four default policies. The context section limits retained message count and character count with validated minima. The external tool server section names servers to launch and bridge into the tool list, each with a launch command, optional working directory, optional environment additions, an enabled flag, and an optional timeout.
+The sandbox section selects the isolation provider and its resource limits, including an image name, memory limit, and working directory for the container option. The web search section names an endpoint address, the environment variable holding its credential, a default result count, and a timeout. With no endpoint the tool is disabled. The tools section lists the tool names exposed to the model, with alias normalization and deduplication. The evaluator section selects the grading strategy, test command, and timeout, with per-task override support. The logging section selects the sink and file path, with relative paths anchored to the project root. The approvals section selects one of four default policies. The context section limits retained message count and character count with validated minima. The external tool server section names servers to launch and bridge into the tool list, each with a launch command, optional working directory, optional environment additions, an enabled flag, and an optional timeout.
 
 Top-level keys set the maximum steps per task, the base system prompt, the token threshold for automatic summarization, verbosity, the external servers to bridge in, and skill-routing preferences. Unknown top-level or section keys are rejected.
 

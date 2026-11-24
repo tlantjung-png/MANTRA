@@ -40,6 +40,8 @@ Commands are invoked with a leading slash, and the help command lists the full s
 
 The session keeps a checklist that the agent grows and drains from inside the conversation. The checklist is rebuilt into the effective system prompt every turn. The agent reports new work and finished items in its reply, and those reports are applied live as the reply streams: the raw protocol line never reaches the screen, only a quiet checkbox note does, and reports are de-duplicated at turn end. The checklist travels with the saved conversation so a resumed session keeps its remaining work. It is work state rather than conversation, so clearing the conversation keeps it.
 
+The bundled procedures include three for web work: one produces a short sourced brief from fetched pages, one compares a page against a saved snapshot to report meaningful changes, and one guides integrating a web data endpoint into project code. They rely on the ordinary tools and do not add dependencies.
+
 Skill attachment appends procedure text to the prompt for the current turn. Automatic routing can attach a matching skill without being asked, subject to confidence and margin thresholds and to flags that disable automatic attachment or bundle launching. Automatically attached skills are detached when their turn ends. Bundles launch as ordered steps, attaching each skill in turn and restoring the previous attachment afterward; they are the one sequencing primitive.
 
 Automatic compaction summarizes the conversation through the language-model client when the token threshold is exceeded, replacing the body with a summary while preserving the system prompt.

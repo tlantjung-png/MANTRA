@@ -33,6 +33,7 @@ from core.tools.claim_audit import ClaimAuditTool
 from core.tools.page_audit import PageAuditTool
 from core.tools.design_audit import DesignAuditTool
 from core.tools.web import WebFetchTool
+from core.tools.web_search import WebSearchTool, configure_web_search
 from core.types import Evaluator
 from core.types import LLMClient
 from core.types import Logger
@@ -78,6 +79,7 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         GitDiffTool,
         GitResetTool,
         WebFetchTool,
+        WebSearchTool,
     )
 }
 # Normalize incoming names (case/dashes) and map "webfetch" -> "web_fetch"
@@ -151,10 +153,16 @@ def build_logger(config: dict) -> Logger:
     return _construct(cls, config, extra_keys=frozenset({"type"}))
 
 
-def build_tools(names: list[str]) -> list[Tool]:
-    """Create tools by name; share one EditLedger; dedupe aliases."""
+def build_tools(names: list[str], config: dict | None = None) -> list[Tool]:
+    """Create tools by name; share one EditLedger; dedupe aliases.
+
+    The optional config carries endpoint settings for tools that need them.
+    Callers passing only names keep the previous behaviour.
+    """
     from core.tools.ledger import EditLedger
 
+    if config is not None:
+        configure_web_search(config.get("web_search") or {})
     ledger = EditLedger()
     seen_classes: set[type[Tool]] = set()
     tools = []

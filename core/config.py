@@ -25,6 +25,14 @@ DEFAULTS = {
         "reasoning_effort": None,
     },
     "sandbox": {"provider": "local"},
+    # Opt-in web search. No endpoint by default, so the tool stays out of
+    # the default tool list until an operator names one here.
+    "web_search": {
+        "base_url": "",
+        "api_key_env": "",
+        "limit": 5,
+        "timeout": 15,
+    },
     # External MCP servers bridged into the tool list. Empty by default:
     # nothing is launched unless the operator names a server here.
     "mcp": {"servers": {}},
@@ -183,6 +191,7 @@ _SECTION_KEYS = {
     "observations": {"reshape", "max_chars"},
     "skills": {"auto", "auto_bundle"},
     "mcp": {"servers"},
+    "web_search": {"base_url", "api_key_env", "limit", "timeout"},
 }
 
 # Keys accepted inside one MCP server definition.
@@ -221,6 +230,12 @@ _COMPONENT_VALUE_TYPES = {
     },
     "logging": {
         "path": (str,),
+    },
+    "web_search": {
+        "base_url": (str,),
+        "api_key_env": (str,),
+        "limit": (int,),
+        "timeout": (int, float),
     },
 }
 

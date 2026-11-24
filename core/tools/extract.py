@@ -75,7 +75,8 @@ class ExtractDocumentTool(Tool):
         "XML, renders CSV rows, strips common markup from markdown, and gives "
         "a concise note for binary/archive formats it cannot render. Use it to "
         "read structured documents without streaming huge raw bodies into the "
-        "conversation."
+        "conversation. For HTML, main_only can restrict the text to the "
+        "article area."
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -85,11 +86,21 @@ class ExtractDocumentTool(Tool):
                 "type": "integer",
                 "description": "Maximum returned characters (default 80000)",
             },
+            "main_only": {
+                "type": "boolean",
+                "description": "For HTML, keep only main article text (default false)",
+            },
         },
         "required": ["path"],
     }
 
-    def execute(self, sandbox: Sandbox, path: str, max_chars: int = 80000) -> str:
+    def execute(
+        self,
+        sandbox: Sandbox,
+        path: str,
+        max_chars: int = 80000,
+        main_only: bool = False,
+    ) -> str:
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: path contains invalid characters"
         if len(path) > 1000:
@@ -101,7 +112,7 @@ class ExtractDocumentTool(Tool):
 
         root = getattr(sandbox, "root", None)
         if root is None:
-            return self._shell_extract(sandbox, path, budget)
+            return self._shell_extract(sandbox, path, budget, main_only)
 
         full = os.path.join(root, path)
         try:
@@ -136,7 +147,7 @@ class ExtractDocumentTool(Tool):
         if not text:
             return f"Note: {path!r} is empty"
 
-        rendered = self._render(path, text)
+        rendered = self._render(path, text, main_only)
         if len(rendered) > budget:
             rendered = rendered[:budget].rstrip() + "\n... [truncated]"
         header = f"{path!r} ({size} bytes)"
@@ -146,7 +157,9 @@ class ExtractDocumentTool(Tool):
     # Shell fallback for sandboxes without a direct file view
     # ------------------------------------------------------------------
 
-    def _shell_extract(self, sandbox: Sandbox, path: str, budget: int) -> str:
+    def _shell_extract(
+        self, sandbox: Sandbox, path: str, budget: int, main_only: bool = False
+    ) -> str:
         # Tiny bounded extraction for sandboxes with no file view.
         # Only the literal-path case is supported; globs are refused here.
         if any(c in path for c in ("*", "?", "[")):
@@ -178,7 +191,7 @@ class ExtractDocumentTool(Tool):
         text = self._decode(raw)
         if not text:
             return f"Note: {path!r} is empty"
-        rendered = self._render(path, text)
+        rendered = self._render(path, text, main_only)
         if len(rendered) > budget:
             rendered = rendered[:budget].rstrip() + "\n... [truncated]"
         header = f"{path!r} ({size} bytes)"
@@ -206,10 +219,10 @@ class ExtractDocumentTool(Tool):
         return f"Note: {path!r} is {ext} ({size} bytes) — not extracted by this tool"
 
     @staticmethod
-    def _render(path: str, text: str) -> str:
+    def _render(path: str, text: str, main_only: bool = False) -> str:
         ext = os.path.splitext(path)[1].lower()
         if ext in (".html", ".htm"):
-            return _html_to_text(text)
+            return _html_to_text(text, main_only)
         if ext == ".json":
             return _pretty_json(text)
         if ext in (".xml", ".svg"):
@@ -226,10 +239,10 @@ class ExtractDocumentTool(Tool):
         return text.rstrip() or "(empty)"
 
 
-def _html_to_text(html: str) -> str:
+def _html_to_text(html: str, main_only: bool = False) -> str:
     # Thin local alias over the shared reader so both extraction paths
     # cannot drift apart.
-    return _shared_html_to_text(html)
+    return _shared_html_to_text(html, main_only)
 
 
 def _pretty_json(text: str) -> str:

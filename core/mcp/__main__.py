@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         sandbox_config["workspace_root"] = workspace
     try:
         sandbox = build_sandbox(sandbox_config)
-        tools = build_tools(config.get("tools") or [])
+        tools = build_tools(config.get("tools") or [], config)
     except (ConfigError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
