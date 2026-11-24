@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mantra"
-version = "0.1.0"
+version = "3.1.3"
 description = "Modular harness for coding agents"
 readme = "README.MD"
 requires-python = ">=3.10"
