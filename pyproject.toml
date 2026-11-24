@@ -46,6 +46,7 @@ include-package-data = true
 "skills/create-skill" = ["skills/create-skill/SKILL.md"]
 "skills/create-workflow" = ["skills/create-workflow/SKILL.md"]
 "skills/debug" = ["skills/debug/SKILL.md"]
+"skills/design-audit" = ["skills/design-audit/SKILL.md"]
 "skills/dependency-upgrade" = ["skills/dependency-upgrade/SKILL.md"]
 "skills/deploy-parity" = ["skills/deploy-parity/SKILL.md"]
 "skills/design" = ["skills/design/SKILL.md"]

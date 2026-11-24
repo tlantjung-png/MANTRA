@@ -22,7 +22,8 @@
     "git_diff",
     "prose_audit",
     "claim_audit",
-    "page_audit"
+    "page_audit",
+    "design_audit"
   ],
   "evaluator": {
     "type": "command",

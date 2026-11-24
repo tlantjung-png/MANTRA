@@ -17,6 +17,7 @@
 | `create-skill` | Create and register a new workflow skill with valid metadata, a focused procedure, catalog and routing entries, and verification coverage. |
 | `create-workflow` | Define an ordered skill bundle in a skills root using installed skill names, then verify it with the supported /skills bundle commands. |
 | `debug` | Reproduce a bug or failure, identify its root cause from the actual path, make the smallest safe correction, and prove the regression is gone. |
+| `design-audit` | Audit a web page's design signals: structure (linked stylesheets, inline CSS, image dimensions) and, when a headless browser is installed, a rendered screenshot analyzed for blank renders, dark pages, and overall contrast, with evidence. |
 | `dependency-upgrade` | Upgrade one dependency while researching compatibility, handling breaking changes, preserving scope, and proving the result with project checks. |
 | `deploy-parity` | Copy changed assets (skills, rules, scripts, knowledge) to a target directory or backup backup-first, with SHA-256 parity proof and a recorded rollback path. |
 | `design` | Design accessible responsive web interfaces with distinct visual directions, a coherent system, and checked interaction states rather than generic layouts. |
