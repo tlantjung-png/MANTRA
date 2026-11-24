@@ -63,10 +63,9 @@ Ctrl+C once stops the current run; twice leaves the console.
 Escape also stops the current run while it is streaming."""
 
 
-# @name mentions: a bare word, path, or glob. The lookbehind keeps
-# "user@example.com" and "a@b" from being read as file references.
-# Trailing punctuation like .,;:!?) is stripped later so "@src/app.py." at
-# the end of a sentence still resolves to the file.
+# @name mentions: a bare word, path, or glob. The lookbehind excludes
+# email-style uses; trailing punctuation is stripped later so a sentence
+# ending in "@src/app.py." still resolves.
 MENTION_RE = re.compile(r"(?<![\w])@([\w.\-][\w.:/\\\-*]*)")
 # Characters that are often trailing punctuation after a mention and
 # should not be considered part of the path.

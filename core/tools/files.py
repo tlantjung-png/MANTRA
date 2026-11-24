@@ -21,6 +21,8 @@ from core.types import Tool
 from core.tools.search import iter_workspace_files
 
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
+# One drive-prefix pattern for every path branch (glob, shell listing, ...).
+_DRIVE_PREFIX_RE = re.compile(r"^[a-zA-Z]:[\\/]")
 
 _MAX_READ_CHARS = 20000  # legacy cap for callers that read without a window
 _MAX_WRITE_CHARS = 1_000_000
@@ -209,10 +211,8 @@ class ReadFileTool(Tool):
         # Handle bulk via glob or comma list (merged read_file)
         # If path contains glob chars, expand — guard traversal in pattern
         if any(c in path for c in ["*", "?", "[", "**"]):
-            # A genuine file whose name happens to contain a metacharacter
-            # ("foo[1].txt") must win over pattern reading: check for the
-            # literal file first and fall through to the glob only when no
-            # such file exists.
+            # A literal filename with glob characters (e.g. "foo[1].txt")
+            # wins over pattern reading; glob only when no such file exists.
             root_ = getattr(sandbox, "root", None)
             if root_ is not None:
                 try:
@@ -220,8 +220,14 @@ class ReadFileTool(Tool):
                         return self._execute_single(sandbox, path, offset, limit)
                 except OSError:
                     pass
-            # Block patterns that could escape workspace (e.g. ../../etc/passwd)
-            if ".." in path.replace("\\", "/").split("/") or path.startswith("/") or ":\\" in path:
+            # Block patterns that could escape workspace (e.g. ../../etc/passwd).
+            # Reuse the same drive-prefix pattern as the directory listing so
+            # a C:/... glob cannot slip past the ":\\"-only check.
+            if (
+                ".." in path.replace("\\", "/").split("/")
+                or path.startswith("/")
+                or _DRIVE_PREFIX_RE.match(path)
+            ):
                 return f"ERROR: refusing to read pattern {path!r}: traversal blocked"
             if _is_blocked_path_harness(path) or _is_blocked_device(path):
                 return f"ERROR: refusing to read pattern {path!r}: blocked"
@@ -258,10 +264,9 @@ class ReadFileTool(Tool):
             pat = pattern.replace("\\", "/").lstrip("/")
             # Ensure root is str for glob, handle Windows
             root_str = str(pathlib.Path(root))
-            # iglob keeps memory and runtime bounded: a recursive glob on a
-            # huge tree is never materialized in full. Walking stops at the
-            # scan ceiling; the 20-file display cap still applies so the
-            # per-file read loop below stays bounded too.
+            # iglob streams matches so a huge recursive glob is never fully
+            # materialized; the scan ceiling and 20-file display cap keep
+            # the per-file read loop bounded.
             files = []
             scan_ceiling = 3000
             scan_overflow = False
@@ -370,11 +375,8 @@ class ReadFileTool(Tool):
             # Not found — did-you-mean
             if root is not None:
                 try:
-                    # substring match + levenshtein 2. The shared walk keeps
-                    # the suggestion inside the same confinement rules as
-                    # every other workspace scan (skip-dirs, ignore files,
-                    # symlink escapes) so a hint can never name a file the
-                    # read tools would refuse.
+                    # Suggestions come from the shared confined walk, so a
+                    # hint never names a file the read tools would refuse.
                     base = os.path.basename(path)
                     base_lower = base.lower()
                     candidates = []
@@ -493,10 +495,9 @@ class ReadFileTool(Tool):
             if root is not None and len(result) <= _DEDUP_CACHE_MAX_CHARS:
                 full = os.path.join(root, path)
                 st = os.stat(full)
-                # Delete before insert so a re-read (file changed since the
-                # cached entry) moves the key to the end of the dict: the
-                # eviction below pops the first key, which is then the least
-                # recently used rather than merely the first ever inserted.
+                # Delete before insert so a re-read moves the key to the end;
+                # eviction below pops the first key, making it least-recently
+                # used rather than first-ever inserted.
                 self._dedup.pop(dedup_key, None)
                 self._dedup[dedup_key] = (st.st_mtime_ns, st.st_size, result)
                 # Prune cache: pop the least recently used entry.
@@ -613,10 +614,8 @@ class EditFileTool(Tool):
                 "file in sections."
             )
         if "\ufffd" in content:
-            # The sandbox read decodes with errors="replace", so any byte
-            # that is not valid UTF-8 arrives as U+FFFD and a write-back
-            # would silently destroy it across the whole file, not just at
-            # the edited region. Refuse rather than corrupt.
+            # The sandbox replaces undecodable bytes with U+FFFD; a write-back
+            # would silently corrupt them across the whole file. Refuse.
             return (
                 f"ERROR: {path} contains bytes that are not valid UTF-8 (or "
                 "literal U+FFFD), so edit_file would corrupt them. Use "
@@ -646,9 +645,8 @@ class EditFileTool(Tool):
             return f"ERROR: old_string not found in {path}"
         occurrences = content.count(old_string)
         if occurrences > 1:
-            # An ambiguous needle silently edits whichever occurrence comes
-            # first — usually not the one the model meant. Refuse instead
-            # and make the model narrow the needle.
+            # An ambiguous needle edits whichever occurrence comes first,
+            # usually not the intended one; refuse and require a narrower match.
             return (
                 f"ERROR: old_string occurs {occurrences} times in {path} - "
                 "refusing an ambiguous edit. Extend old_string with "
@@ -657,6 +655,19 @@ class EditFileTool(Tool):
         new_content = content.replace(old_string, new_string, 1)
         if len(new_content) > _MAX_WRITE_CHARS:
             return f"ERROR: result too large ({len(new_content)} > {_MAX_WRITE_CHARS})"
+        # Re-read immediately before the whole-file replacement: another
+        # writer may have landed between the ledger hash check and here.
+        # Without this compare the clobbering bytes would also be laundered
+        # into the ledger by the remember() below.
+        try:
+            current = sandbox.read_file(path)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: cannot re-read {path} before edit: {exc}"
+        if current != content:
+            return (
+                f"ERROR: {path} changed on disk since your last read - "
+                "read it again, then retry the edit"
+            )
         try:
             sandbox.write_file(path, new_content)
         except Exception as exc:  # noqa: BLE001
@@ -690,7 +701,7 @@ class ListDirTool(Tool):
             # paths are refused before they reach the container shell.
             if any(c == ".." for c in path.replace("\\", "/").split("/")):
                 return "ERROR: path must stay inside the workspace"
-            if path.startswith("/") or re.match(r"^[a-zA-Z]:[\\/]", path):
+            if path.startswith("/") or _DRIVE_PREFIX_RE.match(path):
                 return "ERROR: path must stay inside the workspace"
             if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
                 return "ERROR: path contains unsupported characters for shell listing"

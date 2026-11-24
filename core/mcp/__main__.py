@@ -54,10 +54,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # An external client gets the same gate the local path applies. With no
-    # interactive terminal there is no one to answer a prompt, so "default"
-    # and "auto" resolve mutations without asking, exactly as the headless
-    # runner does; yolo allows everything and plan refuses mutations.
+    # External clients get the local gate; with no terminal to answer a
+    # prompt, "default"/"auto" resolve mutations as the headless runner
+    # does, yolo allows all, plan refuses mutations.
     policy = ApprovalPolicy(mode=config.get("approvals", "yolo"), note=_note)
 
     server = MCPServer(tools=tools, sandbox=sandbox, approvals=policy, note=_note)

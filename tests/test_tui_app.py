@@ -454,10 +454,8 @@ class AppIntegrationTest(unittest.TestCase):
         self.assertEqual(app.transcript.missed, 0, "wheeling to the tail did not reset the counter")
 
     def test_empty_composer_arrow_keys_do_not_scroll_without_history(self):
-        # Plain up/down on an empty composer recall prompt history (see
-        # test_empty_composer_up_down_cycles_prompt_history); with no
-        # history they fall through instead of scrolling - scrolling
-        # lives on ctrl+up/down, wheel and PageUp.
+        # On an empty composer, plain up/down recall history; with none
+        # they do nothing. Scrolling lives on ctrl+up/down, wheel, PageUp/Home.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(60):
@@ -643,10 +641,9 @@ class AppIntegrationTest(unittest.TestCase):
         wait_until(lambda: not app.busy, 10)
 
     def test_turn_end_does_not_yank_a_detached_scroll(self):
-        # Regression: handle()'s tail force-scrolled the transcript to
-        # the bottom at the end of every turn, so scrolling up while or
-        # just after a task ran looked broken. A detached scroll must
-        # survive the turn's end.
+        # Regression: handle() force-scrolled to the tail at every turn,
+        # breaking scroll-up during or just after a run. A detached view
+        # must survive the turn's end.
         from core.scripted import final_response
 
         app, session, backend = _make_app([final_response("done")])
@@ -725,7 +722,7 @@ class AppIntegrationTest(unittest.TestCase):
         alpha_y = next(i for i, r in enumerate(grid) if "alpha" in r and top <= i < top + height)
         beta_y = next(i for i, r in enumerate(grid) if "beta" in r and top <= i < top + height)
         captured = []
-        app_module.copy_text = lambda t: captured.append(t)
+        app_module.copy_text = lambda t, *args: captured.append(t)
         app.handle_event(Mouse("press", 0, 0, alpha_y, frozenset()))
         app.handle_event(Mouse("drag", 0, 10, beta_y, frozenset()))
         app.render_frame()

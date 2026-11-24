@@ -157,12 +157,9 @@ class StreamingRenderer:
     def render_piece(self, piece: str) -> str:
         """Render a text fragment with inline markdown."""
         self._buf += _sanitize_output(piece)
-        # Bound single-line growth without newlines to avoid unbounded
-        # memory. Render the head chunk without injecting a line break
-        # (a forced break could split an inline-code span or a fence
-        # opener and desync the fence state machine), and drop the
-        # oldest tail explicitly - with a visible note - when the
-        # buffer still exceeds 50k chars.
+        # Cap a newline-free buffer: emit the head without inserting a break
+        # (that could split a fence or code span), then drop the oldest tail
+        # with a visible note if it still exceeds 50k chars.
         if len(self._buf) > 30000 and "\n" not in self._buf:
             chunk = self._buf[:20000]
             self._buf = self._buf[20000:]

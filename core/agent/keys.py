@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -107,12 +108,9 @@ def _save(data: dict[str, Any]) -> None:
         try:
             tmp.replace(path)
         except OSError:
-            # One short retry: transient failures (an antivirus scan, a
-            # briefly held lock) usually clear. There is deliberately no
-            # direct-write fallback: a non-atomic write to the target
-            # path could follow a planted symlink, so a still-failing
-            # replace must surface to the caller instead of silently
-            # weakening the atomic-write guarantee.
+            # One short retry lets transient failures clear. No direct-write
+            # fallback: a non-atomic write could follow a planted symlink,
+            # so a failed replace surfaces rather than weakening the guarantee.
             time.sleep(0.05)
             tmp.replace(path)
     except OSError:
@@ -199,12 +197,9 @@ def warn_insecure_transport(base_url: str, has_key: bool) -> None:
     )
 
 
-# Cached store read, keyed by (mtime_ns, size) plus a process-local
-# generation counter. Redaction and resolution hot paths otherwise re-read
-# and re-parse the file on every call. The generation guards against
-# two blind spots of the stat key: a same-size write within one timestamp
-# tick on a coarse-timestamp filesystem, and concurrent in-process writers
-# racing the cache update.
+# Store cache keyed by (mtime_ns, size) plus a generation counter; without
+# it, redaction and resolution re-parse the file on every call. The counter
+# covers same-size writes within one clock tick and in-process write races.
 _STORED_KEYS_CACHE: tuple[tuple[tuple[int, int] | None, int], dict[str, str]] | None = None
 _STORED_KEYS_GENERATION = 0
 
@@ -236,6 +231,7 @@ def _bump_keys_generation() -> None:
 
 
 _CRED_LOCK = threading.Lock()
+_LOCK_DEGRADED_WARNED = False
 
 
 @contextlib.contextmanager
@@ -266,7 +262,15 @@ def _store_locked():
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         except (OSError, ImportError):  # noqa: BLE001 - degrade to unlocked
             # The advisory lock is an optimization; the atomic replace
-            # already keeps the store intact without it.
+            # already keeps the store intact without it. Report the
+            # degraded write once instead of losing updates silently.
+            global _LOCK_DEGRADED_WARNED
+            if not _LOCK_DEGRADED_WARNED:
+                _LOCK_DEGRADED_WARNED = True
+                print(
+                    "[keys] store lock unavailable; concurrent writes may lose updates",
+                    file=sys.stderr,
+                )
             if handle is not None:
                 try:
                     handle.close()
@@ -346,9 +350,10 @@ def has_stored(api_key_env: str | None) -> bool:
 
 
 def mask(key: str | None) -> str:
-    """A form safe to print: enough to recognise, not enough to use."""
+    """A form safe to print: no key characters, only a short fingerprint."""
     if not key:
         return "(none)"
-    if len(key) <= 12:
-        return "****"
-    return f"{key[:4]}…{key[-4:]}"
+    import hashlib
+
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"****[{digest}]"

@@ -28,9 +28,8 @@ class StoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        # Restore whatever the harness had set (e.g. the conftest's
-        # redirect) rather than popping: deleting the variable would
-        # silently send later tests back to the real store. Pop first
+        # Restore the harness's redirect rather than popping: removing the
+        # variable would send later tests back to the real store. Pop first
         # (LIFO), then put the prior value back when there was one.
         prior = os.environ.get(sessions._OVERRIDE_ENV)
         if prior is not None:

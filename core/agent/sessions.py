@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -61,11 +62,9 @@ def derive_name(workspace: str = "", model: str = "") -> str:
 
 
 def _path(name: str) -> Path:
-    # Sanitize name to prevent path traversal (e.g. ../../etc/passwd)
-    # Include hash of original name in fallback to avoid collisions where
-    # distinct unsafe names previously mapped to same generic slug.
-    # Lowercase up front: Foo and foo must not become case-distinct
-    # files that collide on a case-insensitive filesystem.
+    # Sanitize against traversal; the hash keeps distinct unsafe names
+    # from collapsing to one slug. Lowercase up front so Foo and foo do
+    # not collide on a case-insensitive filesystem.
     import hashlib
     name_lower = (name or "").lower()
     safe = re.sub(r"[^a-z0-9._-]", "-", name_lower).strip("-._")
@@ -80,10 +79,9 @@ def _path(name: str) -> Path:
     return sessions_dir() / f"{safe}.json"
 
 
-# A transcript is rewritten after every turn, so without a ceiling both
-# the file and the cost of a turn grow with the length of the session.
-# Long tool output is trimmed rather than the message dropped, because a
-# dropped message can orphan the tool call it answers.
+# Cap each message: without a ceiling the transcript and per-turn cost
+# grow with session length. Trim long output rather than drop the message,
+# which could orphan the tool call it answers.
 _MAX_MESSAGE_CHARS = 20_000
 
 # Sessions over this size are unusable as context and too costly to parse
@@ -95,6 +93,46 @@ _MAX_SESSION_BYTES = 10_000_000
 # the settings and workflow stores.
 _LOCK_STALE_SECONDS = 5.0
 _LOCK_WAIT = 0.5
+
+# Observable autosave state. A single warning is easy to miss in a long
+# session, so failures re-warn at a bounded interval and recovery is announced.
+_save_failures = 0
+_last_save_ok = True
+_last_save_warning = 0.0
+_REWARN_SECONDS = 120.0
+
+
+def _note_save_result(ok: bool) -> None:
+    """Track save outcome and warn on transition and on a long failure run."""
+    global _save_failures, _last_save_ok, _last_save_warning
+    if ok:
+        if not _last_save_ok:
+            print("[sessions] autosave recovered", file=sys.stderr)
+        _save_failures = 0
+        _last_save_ok = True
+        return
+    _last_save_ok = False
+    _save_failures += 1
+    now = time.monotonic()
+    if _save_failures == 1 or now - _last_save_warning >= _REWARN_SECONDS:
+        _last_save_warning = now
+        print(
+            "[sessions] autosave failed; the session will not be saved until writes recover",
+            file=sys.stderr,
+        )
+
+
+def save_health() -> dict[str, Any]:
+    """Current autosave state, for a status row or diagnostics."""
+    return {"ok": _last_save_ok, "consecutive_failures": _save_failures}
+
+
+def _release(lock_path: Path, lock_fd: int | None) -> None:
+    """Release a held lock without masking the save result (Low-23)."""
+    try:
+        release_lock(lock_path, lock_fd)
+    except OSError:
+        pass
 
 
 def _trim_messages(messages: list[Any]) -> list[Any]:
@@ -150,14 +188,13 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             pass
     except OSError:
         pass
-    # Inter-process lock: two consoles autosaving the same session name
-    # must not interleave. If the lock cannot be taken in time, skip the
-    # save rather than write a half-written transcript over a good one.
-    # The lock is held across the whole build-and-write so no other
-    # writer can slip a save in between read and replace.
+    # Hold the inter-process lock across build-and-write so two autosaves
+    # cannot interleave; if it cannot be taken, skip the save rather than
+    # overwrite a good transcript with a half-written one.
     lock_path = target.with_suffix(target.suffix + ".lock")
     lock_fd = acquire_lock(lock_path, _LOCK_WAIT, _LOCK_STALE_SECONDS)
     if lock_fd is None:
+        _note_save_result(False)
         return None
     import tempfile
 
@@ -179,6 +216,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             # A payload value json cannot encode must not raise out of save():
             # the caller autosaves every turn, and one bad value is not worth
             # losing the session over; skip the write instead.
+            _note_save_result(False)
             return None
         # Unique temp name: no fixed path for a planted symlink, no shared
         # file for two writers to interleave into.
@@ -193,12 +231,12 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
             pass
         os.replace(tmp_name, target)
         tmp_name = None
+        _note_save_result(True)
         return str(target)
     except OSError:
-        # No direct-write fallback: a non-atomic write to the target path
-        # could follow a planted symlink. The transcript is still in
-        # memory; the next autosave retries, and nothing on disk is
-        # half-overwritten.
+        # No direct-write fallback (could follow a symlink); the in-memory
+        # transcript retries on the next autosave and the target stays whole.
+        _note_save_result(False)
         return None
     finally:
         # Clean up a staged temp file that never got promoted, if any.
@@ -207,7 +245,7 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
                 os.unlink(tmp_name)
             except OSError:
                 pass
-        release_lock(lock_path, lock_fd)
+        _release(lock_path, lock_fd)
 
 
 def _legacy_path(name: str) -> Path:

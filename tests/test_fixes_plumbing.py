@@ -12,6 +12,7 @@ MANTRA_SCRIPT ConfigError wrap (B-M3).
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -70,11 +71,17 @@ class SafeWriteTest(unittest.TestCase):
         class _Broken:
             encoding = "utf-8"
 
+            def __init__(self):
+                self.writes = []
+
             def write(self, text):
+                self.writes.append(text)
                 raise BrokenPipeError("closed")
 
-        with mock.patch.object(term.sys, "stdout", _Broken()):
+        broken = _Broken()
+        with mock.patch.object(term.sys, "stdout", broken):
             term.safe_write("hello")  # must not raise
+        assert broken.writes == ["hello"], "write was not attempted or duplicated"
 
     def test_unencodable_fallback_writes_only_the_remainder(self):
         from core import term
@@ -332,7 +339,9 @@ class MantraScriptConfigErrorTest(unittest.TestCase):
     """B-M3: a broken MANTRA_SCRIPT file surfaces as ConfigError."""
 
     def test_missing_script_file_raises_config_error(self):
-        bad_path = os.path.join(tempfile.mkdtemp(prefix="mantra-plumb-"), "missing.json")
+        tempdir = tempfile.mkdtemp(prefix="mantra-plumb-")
+        self.addCleanup(shutil.rmtree, tempdir, True)
+        bad_path = os.path.join(tempdir, "missing.json")
         cfg = {"provider": "openai", "model": "m"}
         with mock.patch.dict(os.environ, {"MANTRA_SCRIPT": bad_path}):
             with self.assertRaises(ConfigError):

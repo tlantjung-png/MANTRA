@@ -130,13 +130,17 @@ class KeyStoreTest(TempStorage, unittest.TestCase):
         self.assertIsNone(resolve(None))
 
     def test_mask_never_reveals_the_middle(self):
-        self.assertEqual(mask("sk-abcdefgh1234"), "sk-a…1234")
-        self.assertNotIn("abcdefgh", mask("sk-abcdefgh1234"))
+        shown = mask("sk-abcdefgh1234")
+        self.assertTrue(shown.startswith("****["))
+        self.assertNotIn("abcdefgh", shown)
+        self.assertNotIn("sk-a", shown)
+        self.assertNotIn("1234", shown)
 
     def test_mask_handles_short_and_empty(self):
         self.assertEqual(mask(""), "(none)")
         self.assertEqual(mask(None), "(none)")
-        self.assertEqual(mask("tiny"), "****")
+        self.assertTrue(mask("tiny").startswith("****["))
+        self.assertNotIn("tiny", mask("tiny"))
 
     def test_corrupt_file_does_not_raise(self):
         with open(credentials_path(), "w", encoding="utf-8") as handle:
@@ -484,9 +488,8 @@ class ReasoningEffortTest(unittest.TestCase):
                 self.assertEqual(merged["llm"]["reasoning_effort"], level)
 
     def test_a_session_cannot_rewrite_the_module_defaults(self):
-        # merge_defaults used to shallow-copy, leaving the nested sections
-        # shared with DEFAULTS. One session picking a model then rewrote the
-        # defaults for every config loaded after it in the same process.
+        # merge_defaults used to shallow-copy, so one session's edits to
+        # nested sections leaked into every later config in the process.
         one = merge_defaults({})
         one["llm"]["model"] = "some-other-model"
         one["skills"]["auto"] = False
@@ -705,11 +708,8 @@ class ModelMenuTest(TempStorage, unittest.TestCase):
         self.assertIsNone(llm["reasoning_effort"])
 
     def test_every_model_is_offered_an_effort(self):
-        # Effort used to be gated on the name looking like a reasoning
-        # model, which made the choice vanish for most catalogues. It is
-        # part of picking a model now, so it is always asked - and for a
-        # model that ignores the field, "off" is the right answer rather
-        # than a missing one.
+        # Effort is part of picking a model now, so it is always asked;
+        # "off" is the right answer when the model ignores the field.
         with mock.patch.object(console, "fetch_models", return_value=["gpt-4o"]), \
              mock.patch.object(console, "_menu", side_effect=["gpt-4o", "high"]) as menu:
             console._choose_model(self.session)

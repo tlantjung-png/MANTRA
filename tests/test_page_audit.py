@@ -112,7 +112,8 @@ def test_healthy_metrics_are_reported() -> None:
     assert "h2: 1" in out
     assert "canonical: https://example.com/releases" in out
     assert "viewport: yes" in out
-    assert "1 missing alt" in out or "0 missing alt" in out
+    # The healthy fixture has one image and it carries alt text.
+    assert "images: 1 (0 missing alt)" in out
 
 
 # --- rule detection -------------------------------------------------------

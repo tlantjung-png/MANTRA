@@ -277,17 +277,18 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     os.replace(tmp_path, memory_path)
                     return True
                 except OSError:
-                    # No direct-write fallback: a non-atomic write to the
-                    # target path could follow a planted symlink. The
-                    # entry is dropped this turn; nothing on disk is
-                    # half-overwritten.
+                    # No direct-write fallback (could follow a symlink);
+                    # drop the entry rather than half-overwrite the target.
                     try:
                         os.unlink(tmp_path)
                     except OSError:
                         pass
                     return False
         finally:
-            release_lock(lock_path, lock_handle)
+            try:
+                release_lock(lock_path, lock_handle)
+            except OSError:
+                pass
     return False
 
 
@@ -300,10 +301,9 @@ def _read_file(path: str) -> str:
 
 
 # ------------------------------------------------------------ memory entries
-# Durable entries carry trailing lifecycle metadata:
+# Durable entries carry trailing metadata:
 #   "- 2026-09-06 12:00 | task-id | reason: text | status=active"
-# The dedupe/supersede writer and the filtered reads below share this
-# shape (adapted from the OKF search-before-write / status / stale ideas).
+# The dedupe/supersede writer and the filtered reads below share this shape.
 
 _STOP_WORDS = frozenset({
     "a", "an", "the", "and", "or", "but", "for", "with", "from", "this",
@@ -485,47 +485,53 @@ def rewrite_memory(memory_path: str | None, body: str, new_entry: str | None = N
     """
     if not memory_path:
         return False
-    combined = body.strip() + "\n" + (new_entry.strip() + "\n" if new_entry else "")
-    combined = _cap_body(combined, cap)
+    # The file lock is inter-process only; take the same in-process lock
+    # append_memory uses so two threads in one process cannot clobber lines.
+    with _memory_lock:
+        combined = body.strip() + "\n" + (new_entry.strip() + "\n" if new_entry else "")
+        combined = _cap_body(combined, cap)
 
-    parent = os.path.dirname(memory_path)
-    if parent:
-        try:
-            os.makedirs(parent, exist_ok=True)
+        parent = os.path.dirname(memory_path)
+        if parent:
             try:
-                os.chmod(parent, 0o700)
+                os.makedirs(parent, exist_ok=True)
+                try:
+                    os.chmod(parent, 0o700)
+                except OSError:
+                    pass
             except OSError:
                 pass
-        except OSError:
-            pass
-    lock_path = memory_path + ".lock"
-    try:
-        lock_handle = acquire_lock(lock_path, _LOCK_WAIT_SECONDS, _LOCK_STALE_SECONDS)
-        if lock_handle is None:
-            return False
+        lock_path = memory_path + ".lock"
         try:
-            fd_tmp, tmp_path = tempfile.mkstemp(
-                dir=os.path.dirname(memory_path) or ".",
-                prefix=os.path.basename(memory_path) + ".",
-                suffix=".tmp",
-            )
-        except OSError:
-            return False
-        try:
-            with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(combined)
+            lock_handle = acquire_lock(lock_path, _LOCK_WAIT_SECONDS, _LOCK_STALE_SECONDS)
+            if lock_handle is None:
+                return False
             try:
-                os.chmod(tmp_path, 0o600)
+                fd_tmp, tmp_path = tempfile.mkstemp(
+                    dir=os.path.dirname(memory_path) or ".",
+                    prefix=os.path.basename(memory_path) + ".",
+                    suffix=".tmp",
+                )
+            except OSError:
+                return False
+            try:
+                with os.fdopen(fd_tmp, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(combined)
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
+                    pass
+                os.replace(tmp_path, memory_path)
+                return True
+            except OSError:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return False
+        finally:
+            try:
+                release_lock(lock_path, lock_handle)
             except OSError:
                 pass
-            os.replace(tmp_path, memory_path)
-            return True
-        except OSError:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return False
-    finally:
-        release_lock(lock_path, lock_handle)
     return False

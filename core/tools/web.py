@@ -28,9 +28,10 @@ from core.tools._htmltext import html_to_text
 from core.types import Sandbox
 from core.types import Tool
 
-# Cap compressed and inflated size to bound memory.
+# Cap compressed, inflated and header-block size to bound memory.
 _MAX_BYTES = 2_000_000
 _MAX_INFLATED = 4_000_000
+_MAX_HEADER_BYTES = 64 * 1024
 
 _BLOCKED_HOSTS = frozenset(
     {
@@ -54,6 +55,21 @@ _TEXTUAL = ("text/", "application/json", "application/xml", "application/javascr
 _DNS_CACHE: dict[str, tuple[float, bool]] = {}
 _DNS_LOCK = threading.Lock()
 _DNS_TTL = 300.0
+
+
+def _header_block_size(headers: Any) -> int:
+    """Best-effort size of the response header block, for a ceiling check.
+
+    Real HTTPMessage exposes raw_items(); test doubles may only expose
+    items(). When neither is present the check is simply skipped.
+    """
+    try:
+        items_fn = getattr(headers, "raw_items", None) or getattr(headers, "items", None)
+        if not callable(items_fn):
+            return 0
+        return sum(len(str(key)) + len(str(value)) + 4 for key, value in items_fn())
+    except Exception:  # noqa: BLE001 - a headers object we cannot inspect is not a reason to fail
+        return 0
 
 
 def _decode(raw: bytes, encoding: str | None, note: list[str]) -> str:
@@ -222,10 +238,9 @@ def _parse_alternative_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
     return None
 
 
-# Shared, bounded DNS resolver pool: stalled lookups occupy a worker
-# instead of abandoning a daemon thread per fetch.
-# Non-daemon workers are intentional: daemon threads would be killed
-# mid-lookup at interpreter exit. Use atexit to join idle workers cleanly.
+# Shared, bounded DNS pool: a stalled lookup costs one worker, not a
+# daemon thread per fetch. Non-daemon workers survive until interpreter
+# exit; atexit shuts the pool down without waiting on blocked lookups.
 _RESOLVER_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="mantra-dns"
 )
@@ -301,13 +316,9 @@ def _is_private_hostname(hostname: str | None, resolve: bool = True) -> bool:
             result = False
             infos = _resolve_limited(host, 2.0)
             if infos is None:
-                # A stalled resolution is not a rebinding primitive:
-                # rebinding needs a *successful* public answer here and
-                # a private one at connect time. Blocking every slow or
-                # unresolvable host would deny legitimate fetches, so
-                # the fetch proceeds and fails naturally on a bad name;
-                # the per-hop redirect checks and the final-URL re-check
-                # below remain the gate for actual private targets.
+                # A stalled lookup cannot rebind: rebinding needs a
+                # successful public answer here and a private one later.
+                # The pinned connect and per-hop checks remain the gate.
                 return False
             for _family, _, _, _, sockaddr in infos:
                 addr = sockaddr[0]
@@ -576,8 +587,7 @@ try:
     # just the URL the chain happens to end on. Tests rebind this name.
     urlopen = _make_opener().open
 except Exception:  # pragma: no cover - fail closed, never fetch unvalidated
-    # Fail closed: retain redirect and DNS pinning guarantees rather than
-    # fetching through an unvalidated opener.
+    # Fail closed: keep redirect/DNS checks instead of an unvalidated opener.
     def urlopen(request, timeout=None):  # type: ignore[no-redef]
         raise URLError("fetch unavailable: secure opener failed to initialise")
 
@@ -648,12 +658,14 @@ class WebFetchTool(Tool):
 
         try:
             request = Request(url, headers={"User-Agent": _USER_AGENT})  # noqa: S310 - validating opener, scheme checked above
-            # Through the validating opener, so a redirect to an internal
-            # host is refused at that hop instead of being followed and
-            # only noticed once the final URL is inspected.
-            # Validating opener: scheme, private hosts and redirects are
-            # checked per hop; final URL re-checked below.
+            # The validating opener checks scheme, private hosts and
+            # redirects per hop; the final URL is re-checked below.
             with urlopen(request, timeout=self.timeout) as response:
+                if _header_block_size(response.headers) > _MAX_HEADER_BYTES:
+                    return (
+                        f"fetch failed: response headers too large "
+                        f"(cap {_MAX_HEADER_BYTES} bytes) for {_safe_url(url)}"
+                    )
                 raw = response.read(_MAX_BYTES + 1)
                 final_url = response.geturl()
                 content_type = response.headers.get("Content-Type", "")

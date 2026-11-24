@@ -45,6 +45,7 @@ class WorkspacePersistenceTest(unittest.TestCase):
 
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="mantra-ws-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
 
     def test_sandbox_root_survives_cleanup(self):
         sandbox = LocalSandbox(self.workspace)
@@ -79,6 +80,7 @@ class ConversationContinuityTest(unittest.TestCase):
 
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="mantra-conv-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
 
     def test_second_turn_receives_first_turn_history(self):
         session = make_session(
@@ -346,6 +348,7 @@ class ConsoleEncodingTest(unittest.TestCase):
 class AbortTest(unittest.TestCase):
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="mantra-abort-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
 
     def _loop(self, llm, abort):
         return AgentLoop(
@@ -380,6 +383,7 @@ class AbortTest(unittest.TestCase):
 class DeniedToolTest(unittest.TestCase):
     def test_denied_call_returns_observation_and_runs_nothing(self):
         workspace = tempfile.mkdtemp(prefix="mantra-deny-")
+        self.addCleanup(shutil.rmtree, workspace, True)
         calls = []
 
         class Spy:
@@ -420,6 +424,7 @@ class MentionTest(unittest.TestCase):
 
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="mantra-mention-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
         with open(os.path.join(self.workspace, "app.py"), "w", encoding="utf-8") as handle:
             handle.write("def add(a, b):\n    return a + b\n")
         os.makedirs(os.path.join(self.workspace, "src"), exist_ok=True)
@@ -508,6 +513,7 @@ class ReplTest(unittest.TestCase):
 
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="mantra-repl-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
         self._real_input = builtins.input
 
     def tearDown(self):
@@ -672,6 +678,7 @@ class ReplyRenderingTest(unittest.TestCase):
 
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="mantra-reply-")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
 
     def _framed_output(self, script):
         """Run one turn, return everything drawn (compact, no frame)."""
@@ -685,10 +692,8 @@ class ReplyRenderingTest(unittest.TestCase):
         return buffer.getvalue()
 
     def test_a_streamed_reply_is_not_printed_twice(self):
-        # A genuinely streamed reply is rendered once (inline markdown
-        # consumed, so the raw markers never appear); handle() must not
-        # print a second copy below it. The exact rendered line appears
-        # exactly once.
+        # A streamed reply renders once with markdown consumed; handle()
+        # must not print a second copy below it.
         from core.scripted import streaming_client
 
         out = self._framed_output([streaming_client("**Hello** there, how can I help?")])

@@ -202,17 +202,20 @@ class ContextManager:
         self.pending_evicted = []
         return pending
 
+    def restore_pending_evicted(self, turns: list[dict[str, Any]]) -> None:
+        """Put detached turns back after a failed summary, oldest first."""
+        if turns:
+            self.pending_evicted[:0] = [m for m in turns if isinstance(m, dict)]
+
     def _retain_evicted(self, removed: list[dict[str, Any]]) -> None:
         """Hold evicted turns for the digest instead of dropping them."""
         kept = [m for m in removed if isinstance(m, dict)]
         if not kept:
             return
         self.pending_evicted.extend(kept)
-        # Bounded by characters, not messages: a small eviction is kept so
-        # it can be folded together with the next one, and the ceiling only
-        # bites on a run whose loop never drains the queue at all. The
-        # oldest turns go first, and are counted so the loss is visible
-        # rather than silent.
+        # Bound by characters, not messages, so small evictions can fold
+        # into the next batch. The oldest go first and are counted, making
+        # any loss visible rather than silent.
         ceiling = max(4_000, self.max_chars // 2)
         while self.pending_evicted and self._pending_chars() > ceiling:
             self.pending_evicted.pop(0)
@@ -246,10 +249,8 @@ class ContextManager:
         # Drop oldest turns until within message count
         while self._over_budget() and self._drop_oldest_turn():
             pass
-        # Still over budget: repeatedly truncate largest messages until within
-        # character budget or only system+one exchange remain.
-        # Previously this recursed only once, leaving many-large-output cases
-        # over budget.
+        # Still over budget: repeatedly truncate the largest messages until
+        # within the character budget or only system + one exchange remain.
         iterations = 0
         while self._over_budget() and len(self.messages) > 2 and iterations < 10:
             iterations += 1
@@ -273,11 +274,9 @@ class ContextManager:
             # If truncation didn't help, drop another turn
             if not self._drop_oldest_turn():
                 break
-        # The halving loop is capped, so a pathological history — many
-        # mid-size messages, or oversized tool-call payloads the content
-        # branch cannot shrink — could still be over budget here. Guarantee
-        # the budget with unconditional oldest-turn eviction; the pinned
-        # system+one-exchange floor is the only stopping point.
+        # The capped halving loop can still leave pathological histories
+        # over budget, so evict oldest turns unconditionally down to the
+        # pinned system + one-exchange floor.
         while self._over_budget() and len(self.messages) > 2:
             if not self._drop_oldest_turn():
                 break

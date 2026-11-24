@@ -29,11 +29,9 @@ _MAX_SSE_EVENT_CHARS = 1_000_000
 DeltaCallback = Callable[[str], None]
 WaitCallback = Callable[[float, float], None]
 
-# A rate limit is a queue, not a failure: the client waits it out instead
-# of spending its retries inside the limited window (which only deepens
-# the limit). Each wait honours the server's Retry-After when it sends
-# one, otherwise backs off exponentially up to the cap; the total time
-# spent waiting is bounded so a permanent limit still ends the turn.
+# A rate limit is a queue: wait it out rather than burning retries inside
+# the window. Honour Retry-After, else exponential backoff to the cap;
+# total wait is bounded so a permanent limit still ends the turn.
 _RATE_LIMIT_BACKOFF_CAP = 30.0
 _RATE_LIMIT_BACKOFF_FIRST = 2.0
 _RETRY_AFTER_MAX = 300.0
@@ -286,11 +284,9 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             _flush_event()
     _flush_event()
 
-    # The stream must end with the DONE sentinel. Without it the response
-    # was truncated mid-answer; treating that as success would let the
-    # agent act on a half-written tool call. Reuse the same error prefix
-    # so the retry logic in chat() treats a no-output truncation as
-    # transient and a partial-output truncation as a failed turn.
+    # Require the DONE sentinel: without it the response was truncated and
+    # the agent could act on a half-written tool call. Reuse the error prefix
+    # so chat() treats a no-output truncation as transient, partial as failed.
     if not seen_done:
         raise LLMError("stream ended without DONE")
     tool_calls = []
@@ -594,10 +590,9 @@ class OpenAICompatClient(LLMClient):
                     ) from exc
                 last_error = f"HTTP {exc.code}: {detail}"
                 if exc.code == 429:
-                    # A rate limit is a queue, not a failure: wait it out
-                    # here instead of spending the remaining retries inside
-                    # the limited window, where every attempt both fails
-                    # and deepens the limit.
+                    # A rate limit is a queue: wait it out here rather than
+                    # spending remaining retries in the limited window, where
+                    # each attempt fails and deepens the limit.
                     response = self._wait_out_rate_limit(
                         exc, detail, body, use_stream, stream_cb, should_abort, on_wait
                     )
@@ -609,10 +604,9 @@ class OpenAICompatClient(LLMClient):
             except (urllib.error.URLError, TimeoutError, OSError, IncompleteRead) as exc:
                 if use_stream and emitted["delta"]:
                     if _is_read_timeout(exc):
-                        # A silent reasoning stretch outlasted the read
-                        # timeout, not a broken connection: the loop can
-                        # recover with a budget bump and a nudge, so mark
-                        # it retryable instead of ending the turn.
+                        # A silent reasoning stretch outlasted the read timeout,
+                        # not a broken connection: the loop can recover with a
+                        # budget bump, so mark it retryable, not a failed turn.
                         err = LLMError(
                             f"stream paused after partial output (read timeout): {exc}"
                         )
@@ -965,16 +959,13 @@ class OpenAICompatClient(LLMClient):
             with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - scheme validated in __init__
 
                 def _line_iter():
-                    # Prefer readline for real HTTPResponse; fall back to
-                    # iteration for mocks. Read errors must propagate: a
-                    # mid-stream network drop that ends the generator here
-                    # would surface a silently truncated response as a
-                    # successful one.
+                    # Prefer readline for real HTTPResponse, iteration for mocks.
+                    # Read errors must propagate: a mid-stream drop ending the
+                    # generator would surface a truncated response as success.
                     if hasattr(response, "readline"):
-                        # readline() returns whole lines, but a line longer
-                        # than http.client's _MAXLINE is delivered in pieces,
-                        # which can split a multi-byte UTF-8 character across
-                        # reads. Carry the incomplete tail between reads.
+                        # readline() splits lines longer than _MAXLINE into
+                        # pieces, which can split a multi-byte UTF-8 character;
+                        # carry the incomplete tail between reads.
                         carry = b""
                         while True:
                             raw = response.readline()

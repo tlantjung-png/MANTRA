@@ -30,7 +30,9 @@ def is_safe_repo_url(url: str) -> bool:
     if url.startswith(_SAFE_REPO_SCHEMES):
         return True
     if url.startswith("file://"):
-        return bool(os.environ.get("MANTRA_ALLOW_FILE_URL"))
+        # Only an explicit opt-in enables local-path cloning; a stray value
+        # such as "false" must not silently widen repository acceptance.
+        return os.environ.get("MANTRA_ALLOW_FILE_URL", "").strip().lower() in ("1", "true")
     return False
 
 
@@ -38,10 +40,13 @@ def is_safe_commit(commit: str) -> bool:
     """Whether a commit-ish is safe to hand to ``git checkout``.
 
     Shell metacharacters are refused: the reference must never be able
-    to inject commands into the checkout invocation.
+    to inject commands into the checkout invocation. A leading dash is
+    refused too, so an option cannot be smuggled in as a revision.
     """
     commit = commit.strip()
     if not commit or len(commit) > 256 or "\n" in commit or "\r" in commit or "\x00" in commit:
+        return False
+    if commit.startswith("-"):
         return False
     if any(c in commit for c in _COMMIT_META_CHARS):
         return False

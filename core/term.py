@@ -7,11 +7,9 @@ import re
 import sys
 from contextlib import contextmanager
 
-# Bracketed (CSI) and OS-command (OSC) escape forms. An OSC with no
-# terminator strips to the end of the string, so unterminated
-# sequences cannot leak into the visible-width math either. The CSI
-# parameter class includes ':' for ISO-8613-6 colon-form SGR
-# sequences (\033[38:2::255:0:0m).
+# CSI and OSC escape forms for stripping: an unterminated OSC strips to
+# end of string so it cannot skew width math; the CSI parameter class
+# includes ':' for ISO-8613-6 colon-form SGR.
 _ANSI_RE = re.compile(r"\033\[[0-9;?:]*[ -/]*[@-~]|\033][^\x07\x1b]*(?:\x07|\x1b\\)?")
 
 

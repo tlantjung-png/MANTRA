@@ -8,17 +8,41 @@ import threading
 from typing import Any, Callable
 
 from core.agent.permissions import icacls_owner_only
-from core.agent.repairs import canonical_command
+from core.agent.repairs import ALIASES, canonical_command
 
 AskCallback = Callable[[str], str]  # returns "y" | "n" | "a"
 NoteCallback = Callable[[str], None]
 
 MUTATING_TOOLS = frozenset({"write_file", "edit_file", "run_command", "git_reset", "kill_shell"})
 
-# Tools whose work happens in another process (an MCP server). Their
-# effect cannot be screened by the local patterns, so they are confirmed
-# rather than classified normally. Names are registered when the adapter
-# is built.
+# Plan mode is a read-only boundary, so it works from an explicit allowlist
+# rather than a deny list: a newly registered or renamed tool is refused
+# until someone deliberately adds it here.
+READONLY_TOOLS = frozenset(
+    {
+        "read_file", "list_dir", "git_diff", "web_fetch",
+        "search_code", "find_file", "extract_document", "shell_output",
+    }
+)
+
+
+def _canonical_path(arguments: dict[str, Any]) -> str:
+    """Resolve the path under any alias the repair layer accepts.
+
+    Keeps the fenced-file check effective even when this policy is called
+    directly with raw tool arguments (the loop repairs before check()).
+    """
+    value = arguments.get("path")
+    if value:
+        return str(value)
+    for alias in ALIASES.get("path", ()):
+        if alias != "path" and arguments.get(alias):
+            return str(arguments[alias])
+    return ""
+
+# Remote tools (an MCP server) whose effect the local patterns cannot
+# screen are always confirmed, never auto-allowed. Names are registered
+# when the adapter is built.
 EXTERNAL_TOOLS: set[str] = set()
 
 
@@ -88,10 +112,9 @@ _SAFE_COMMANDS = (
 _DESTRUCTIVE_RE = re.compile("|".join(_DESTRUCTIVE), re.IGNORECASE)
 _SAFE_RE = re.compile("|".join(_SAFE_COMMANDS), re.IGNORECASE)
 
-# Mid-session AGENTS.md / MEMORY.md cache-invalidation fence. Both files
-# get the same fence on the run_command path: redirection and the
-# PowerShell content-setting commands are refused, and tool-level writes
-# (write_file/edit_file) to either file classify as confirm.
+# Mid-session fence for AGENTS.md / MEMORY.md: shell redirection and
+# PowerShell content setters are refused, and write_file/edit_file to
+# either file classifies as confirm.
 _FORBIDRE = [
     re.compile(r"(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md", re.IGNORECASE),
     re.compile(r"(>|>>)\s*[^|\r\n]*MEMORY\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md", re.IGNORECASE),
@@ -186,27 +209,58 @@ def _load_rules_locked() -> list[dict[str, Any]]:
             return _RULES_CACHE
         raise
 
+# Stored credentials cannot be checked when the store is unreadable. The
+# audit writer consults this so it never persists an entry it cannot prove
+# is secret-free.
+_REDACTION_OK = True
+_REDACTION_WARNED = False
+
+
+def _note_redaction_failure(exc: BaseException) -> None:
+    """Flag stored-key redaction as unavailable and warn once."""
+    global _REDACTION_OK, _REDACTION_WARNED
+    _REDACTION_OK = False
+    if _REDACTION_WARNED:
+        return
+    _REDACTION_WARNED = True
+    print(
+        f"[approvals] stored-credential redaction unavailable: {str(exc)[:120]}; "
+        "audit entries are skipped until it recovers",
+        file=sys.stderr,
+    )
+
+
+def redaction_ok() -> bool:
+    """Whether stored credentials could be checked for redaction."""
+    return _REDACTION_OK
+
+
 def _redact_sensitive(s: str) -> str:
     # Redact sensitive keys: known prefixes plus generic high-entropy tokens
     # that appear near assignment-like syntax or as bare values.
     s = re.sub(r"(?i)(?<![A-Za-z0-9])(sk-[a-zA-Z0-9_\-]{12,}|sk_[a-f0-9_\-]{12,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z_\-]{20,})(?![A-Za-z0-9])", "[REDACTED]", s)
     s = re.sub(r"(?i)(passw(or)?d|secret|token|apikey|api[-_]?key|authorization|bearer|credential)\s*[=:]\s*[\"']?(?:bearer\s+)?[^\"'\s,;]+", r"\1=[REDACTED]", s)
-    # Generic bare key assignments: values of 6+ chars are almost always
-    # credentials (key=abc123) rather than ordinary words (key=value),
-    # so the threshold is far below the 20-char high-entropy cutoff used
-    # for prefix-less tokens elsewhere.
+    # Generic key assignments: 6+ chars are almost always credentials
+    # (key=abc123), not words like key=value, so the threshold sits well
+    # below the prefix-less token cutoff elsewhere.
     s = re.sub(r"(?i)\b(key|secret|token)\s*=\s*[\"']?[A-Za-z0-9_\-]{6,}[\"']?", r"\1=[REDACTED]", s)
     # Bare bearer tokens (eyJ... JWT style) without prefix
     s = re.sub(r"\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b", "[REDACTED]", s)
     # Also redact any value that exactly matches a stored credential (exact match)
+    global _REDACTION_OK
     try:
         from core.agent.keys import stored_keys as _sk
-        for _v in _sk().values():
-            _v = (_v or "").strip()
-            if len(_v) >= 12 and _v in s:
-                s = s.replace(_v, "[REDACTED]")
-    except Exception:
-        pass
+        stored = _sk()
+    except (OSError, ValueError, TypeError, ImportError) as exc:
+        _note_redaction_failure(exc)
+    except Exception as exc:  # noqa: BLE001 - a redaction bug must not crash the caller
+        _note_redaction_failure(exc)
+    else:
+        _REDACTION_OK = True
+        for value in stored.values():
+            value = (value or "").strip()
+            if len(value) >= 12 and value in s:
+                s = s.replace(value, "[REDACTED]")
     return s
 
 def _is_escaped(text: str, idx: int) -> bool:
@@ -275,10 +329,9 @@ def _wrapper_oneliner(tokens: list[str]) -> bool:
 def _get_tokens(segment: str) -> list[str]:
     """Tokenize outside quotes, then expand wrappers to the inner command."""
     tokens = _tokenize(segment)
-    # Wrapper expansion: classify the inner command only, so the wrapper
-    # does not double-count the risk. The interpreter one-liner gate is
-    # preserved separately by _wrapper_oneliner, so bash/powershell/cmd
-    # -c one-liners still classify as confirm.
+    # Classify the inner command only so the wrapper is not double-counted;
+    # _wrapper_oneliner still gates bash/powershell/cmd -c one-liners, so
+    # those remain confirm.
     if len(tokens) >= 3:
         wrapper = tokens[0].lower().replace("\\", "/").split("/")[-1]
         switch = tokens[1].lower()
@@ -365,9 +418,8 @@ def _has_redirect(segment: str) -> bool:
     return False
 
 
-# Interpreters with inline code can execute arbitrary payloads the pattern
-# screen cannot see, so they are gated behind explicit confirmation in every
-# interactive mode. Wrapper interpreters (bash -c, cmd /c, powershell -c)
+# Inline-code interpreters run payloads the pattern screen cannot see, so
+# they always require confirmation. Wrappers (bash -c, cmd /c, powershell -c)
 # are caught by _wrapper_oneliner before expansion strips them.
 _INTERPRETER_TOKENS = frozenset(
     {
@@ -410,10 +462,9 @@ def _classify_segment(segment: str, sole_segment: bool = False) -> str:
     # Token-level destructive checks, including deletion-capable search
     # flags that no earlier pattern covers.
     for idx, tok in enumerate(tokens):
-        # A plain delete verb destroys work even without recursive flags
-        # (rm file.txt, del file, erase file, rd dir, Remove-Item file),
-        # so it must never ride through as an ordinary mutating command
-        # in auto mode.
+        # A plain delete verb (rm, del, erase, rd, Remove-Item) destroys
+        # work even without recursive flags, so it must never pass as an
+        # ordinary mutation in auto mode.
         if tok in ("rm", "del", "erase", "rmdir", "rd", "remove-item"):
             if sole_segment and tokens[0] == "echo" and not re.search(r"(\$\(|\$\{|`)", segment):
                 continue  # a lone echo prints these words; it does not run them
@@ -424,10 +475,9 @@ def _classify_segment(segment: str, sole_segment: bool = False) -> str:
                 return "destructive"
             if any(f in rest for f in ("-exec", "-execdir", "-ok", "-okdir")):
                 return "mutating"
-    # Wrapper interpreters (bash -c, cmd /c, powershell -c, pwsh -Command)
-    # are expanded to their inner command by _get_tokens, so the one-liner
-    # check below would never see the interpreter: detect the wrapper from
-    # the pre-expansion token head and gate it like any inline code.
+    # _get_tokens expands wrappers to the inner command, hiding the
+    # interpreter from the check below; detect it from the pre-expansion
+    # token head and gate it like any inline code.
     if _wrapper_oneliner(_tokenize(segment)):
         return "confirm"
     # Interpreter one-liners: the payload is invisible to every pattern
@@ -486,10 +536,9 @@ def classify_command(command: str) -> str:
     """Risk of a shell command: destructive, safe, or mutating. Worst segment wins."""
     if not command or not command.strip():
         return "safe"
-    # Rules file first: regex forbid rules match the whole command, so
-    # they catch shapes that span segments or wrappers. Token-sequence
-    # rules are applied per segment below, with the same worst-wins
-    # combination as the built-in classification.
+    # Regex forbid rules match the whole command first (spanning segments
+    # and wrappers); token rules are applied per segment below with the
+    # same worst-wins combination as the built-in classifier.
     try:
         rules = _load_rules()
         if rules:
@@ -512,11 +561,9 @@ def classify_command(command: str) -> str:
                 return "destructive"
         except Exception:
             pass
-    # Broad scan flags destructive text anywhere in the command. Quoted or
-    # plain text after a lone echo is data, not commands, so a sole echo
-    # segment is exempt; an expansion inside it still executes, and piping
-    # or chaining its output into another command makes the text executable
-    # (echo "rm -rf /" | bash), so those cases keep the destructive verdict.
+    # The broad scan flags destructive text anywhere. A lone echo is data,
+    # not commands, so it is exempt - but expansions, pipes or chains that
+    # execute its text (echo "rm -rf /" | bash) stay destructive.
     if _DESTRUCTIVE_RE.search(command):
         segments0 = _split_command(command)
         echo_only = (
@@ -536,10 +583,9 @@ def classify_command(command: str) -> str:
         for idx, seg in enumerate(segments):
             risk = _classify_segment(seg, sole_segment=sole_segment)
             risk = _apply_token_rules(rules if isinstance(rules, list) else [], seg, risk)
-            # A bare shell interpreter fed by a preceding segment (a pipe
-            # or chain) executes the incoming text as commands: escalate
-            # to confirm. Wrapper one-liners (bash -c ...) already classify
-            # as confirm via _wrapper_oneliner before expansion.
+            # A bare interpreter fed by a pipe/chain executes the incoming
+            # text as commands, so escalate to confirm. Wrapper one-liners
+            # already classify as confirm via _wrapper_oneliner.
             if idx > 0:
                 head = _get_tokens(seg)
                 if len(head) == 1:
@@ -570,7 +616,7 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
         return "safe", tool
 
     if tool in ("write_file", "edit_file"):
-        path = str(arguments.get("path", "?"))
+        path = _canonical_path(arguments) or "?"
         verb = "overwrite" if tool == "write_file" else "edit"
         # The shell-layer fence must also cover tool-level writes: a
         # direct write_file to AGENTS.md/MEMORY.md bypasses the run_command
@@ -605,21 +651,33 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
 _LOG_ACL_DONE = False
 
 # One-time stderr warning when the audit log cannot be written: a silent
-# fail-open would leave tool use unlogged.
+# fail-open would leave tool use unlogged. The health flag is persistent so
+# callers in modes above yolo can refuse an unrecordable mutation.
 _LOG_WRITE_WARNED = False
+_AUDIT_HEALTHY = True
 
 
-def _warn_audit_log_failure() -> None:
-    """Surface the first audit-log write failure to the operator."""
+def _warn_audit_log_failure(message: str | None = None) -> None:
+    """Surface the first audit-log failure to the operator."""
     global _LOG_WRITE_WARNED
     if _LOG_WRITE_WARNED:
         return
     _LOG_WRITE_WARNED = True
     print(
-        "[approvals] pre-tool-use audit log could not be written; "
-        "tool calls are running unlogged",
+        message
+        or "[approvals] pre-tool-use audit log could not be written; tool calls are running unlogged",
         file=sys.stderr,
     )
+
+
+def audit_log_healthy() -> bool:
+    """Persistent health of the pre-tool-use audit log."""
+    return _AUDIT_HEALTHY
+
+
+def _set_audit_health(healthy: bool) -> None:
+    global _AUDIT_HEALTHY
+    _AUDIT_HEALTHY = healthy
 
 
 def _rotate_audit_log(log_path: str) -> None:
@@ -708,6 +766,7 @@ class ApprovalPolicy:
 
     def check(self, tool: str, arguments: dict[str, Any]) -> bool:
         risk, detail = classify(tool, arguments)
+        audit_ok = True
         # Pre-tool-use logging (redacted)
         try:
             import os
@@ -720,12 +779,9 @@ class ApprovalPolicy:
                 os.path.join(os.path.expanduser("~"), ".mantra", "logs", "pre-tool-use.log"),
             )
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            # Rotate before appending so the audit log cannot grow unbounded.
-            # Size is sampled every 64th call; reading and rewriting the file
-            # on every tool call is filesystem churn on long sessions. The
-            # counter is a shared class attribute, so the increment is
-            # guarded: concurrent checks must not lose increments and skip
-            # a rotation forever.
+            # Rotate before appending so the log stays bounded, but sample
+            # size every 64th call to avoid churn. The shared counter is
+            # lock-guarded so concurrent checks cannot skip rotation.
             with _LOG_CHECK_LOCK:
                 ApprovalPolicy._log_check_counter = (
                     getattr(ApprovalPolicy, "_log_check_counter", 0) + 1
@@ -740,15 +796,30 @@ class ApprovalPolicy:
                 pass
             safe_detail = _redact_sensitive(detail)[:200]
             safe_tool = _redact_sensitive(tool)
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"tool={safe_tool} risk={risk} detail={safe_detail}\n")
-            # Owner-only ACL: os.chmod alone is a no-op on Windows.
-            _restrict_audit_log(log_path)
+            if not redaction_ok():
+                # Never persist an entry we cannot prove is secret-free.
+                audit_ok = False
+                _warn_audit_log_failure(
+                    "[approvals] stored-credential redaction unavailable; audit entry skipped"
+                )
+            else:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"tool={safe_tool} risk={risk} detail={safe_detail}\n")
+                # Owner-only ACL: os.chmod alone is a no-op on Windows.
+                _restrict_audit_log(log_path)
         except Exception:
+            audit_ok = False
             _warn_audit_log_failure()
+        _set_audit_health(audit_ok)
 
-        if self.mode == "plan" and tool in MUTATING_TOOLS:
+        if self.mode == "plan" and (tool in EXTERNAL_TOOLS or tool not in READONLY_TOOLS):
             self._note(f"plan mode: refused {tool} ({detail})")
+            return False
+
+        # A mode that enforces confirmation must not run a tool it cannot
+        # record. yolo is explicitly permissive and stays best-effort.
+        if not audit_ok and self.mode != "yolo" and risk != "safe":
+            self._note(f"refused {tool}: audit log unavailable, tool cannot be recorded")
             return False
 
         if risk == "safe":
@@ -757,11 +828,9 @@ class ApprovalPolicy:
         if self.mode == "yolo":
             return True
 
-        # "confirm" risk (interpreter one-liners and anything else whose
-        # payload the pattern screen cannot see) never rides through on
-        # the auto-mode mutating allowance: it always reaches the prompt
-        # here, and a session-level "always" for the exact command is the
-        # only way to stop being asked.
+        # "confirm" risk (hidden payloads, e.g. interpreter one-liners)
+        # never rides the auto-mode mutating allowance: it always prompts
+        # here, and only a session-level "always" for that key stops asking.
         if self.mode == "auto" and risk == "mutating":
             return True
         key = self._key(tool, arguments)
@@ -804,7 +873,7 @@ class ApprovalPolicy:
             return "run_command::"
         if tool in ("write_file", "edit_file"):
             # Preserve case; normalize separators for consistent keys.
-            p = str(arguments.get("path", "")).replace("\\", "/")
+            p = _canonical_path(arguments).replace("\\", "/")
             import posixpath
 
             # POSIX normalization governs Windows-style paths too, so both

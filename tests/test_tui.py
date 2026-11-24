@@ -89,13 +89,9 @@ class EndToEndConsoleTest(unittest.TestCase):
         seen = pty.type_and_wait_echo("z")
         self.assertIn("z", seen[len(base):], "typed key never echoed by the app")
 
-        # 3. Paced /help round-trip. The app reads stdin in chunks, so a
-        # newline in the same burst as the text can be delivered early;
-        # pacing text and Enter is what a fast human types anyway.
-        # Typing "/help" opens the completion popup (whose description
-        # also contains "show help"), so the first Enter accepts the
-        # completion and only the second one submits the command. The
-        # assertion token is a help row the popup can never render.
+        # 3. Paced /help round-trip: the app reads stdin in chunks, so a
+        # same-burst newline lands early, and the first Enter accepts the
+        # completion popup. The assertion token is a help row the popup cannot render.
         pty.type_text("\x7f" * 8)  # clear the probe character
         pty.type_and_wait_echo("/help")
         pty.enter()  # accept the completion

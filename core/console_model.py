@@ -401,16 +401,12 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     if stored:
         session._print(s.dim(f"  {name} is using {mask(stored)}"))
     try:
+        # Every credential prompt goes through the masked reader. A blank
+        # answer cancels; there is deliberately no echoing fallback.
         key = _c._read_secret(session, f"  new api key for {name} (hidden, enter confirms)> ").strip()
-        if not key:
-            # Fallback for tests that mock _c._read_choice instead of _c._read_secret
-            alt = _c._read_choice(session, f"  new api key for {name} (visible, blank cancels)> ").strip()
-            if alt:
-                key = alt
     except Exception:
-        # Hidden read failed (no TUI bridge, interrupted): fall back to the
-        # visible prompt so a key can still be entered at all.
-        key = _c._read_choice(session, f"  new api key for {name} (visible, blank cancels)> ").strip()
+        session._print(s.warn("  hidden key entry unavailable; cancelling instead of echoing it"))
+        return False
     if not key:
         session._print(s.dim("  cancelled"))
         return False
@@ -451,11 +447,11 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model:
             return False
         session._print(s.dim(f"  key stored ({mask(key)})"))
     elif _c.provider_needs_key(url, key_env):
-        # Always prompt for key in interactive add (visible), show existing
+        # Credentials are always read masked, never echoed into scrollback.
         existing = os.environ.get(key_env) or stored_keys().get(key_env, "")
         if existing:
             session._print(s.dim(f"  current key {mask(existing)} ({key_env}) - press enter to keep, or paste new"))
-        key = _c._read_choice(session, f"  api key for {name}> ").strip()
+        key = _c._read_secret(session, f"  api key for {name} (hidden)> ").strip()
         if key:
             if not _c._store_key(session, key_env, key):
                 return False

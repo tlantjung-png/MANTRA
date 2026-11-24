@@ -26,7 +26,7 @@ def _isolated_store(monkeypatch, tmp_path) -> None:
 
 def test_store_and_resolve_roundtrip(monkeypatch) -> None:
     keys.store("MY_KEY", "abc123")
-    # Environment wins over the store.
+    # Round-trip through the store; environment precedence has its own test.
     assert keys.resolve("MY_KEY") == "abc123"
     monkeypatch.delenv("MY_KEY", raising=False)
     assert keys.resolve("MY_KEY") == "abc123"
@@ -56,10 +56,14 @@ def test_env_overrides_store(monkeypatch) -> None:
 
 def test_mask_never_reveals_full_key() -> None:
     assert keys.mask(None) == "(none)"
-    assert keys.mask("short") == "****"
+    assert keys.mask("short").startswith("****[")
+    assert "short" not in keys.mask("short")
     masked = keys.mask("sk-abcdefghijklmnopqrst")
-    assert "sk-a" in masked and "qrst" in masked
+    assert masked.startswith("****[")
+    assert "sk-a" not in masked and "qrst" not in masked
     assert "sk-abcdefghijklmnopqrst" not in masked
+    assert masked == keys.mask("sk-abcdefghijklmnopqrst")
+    assert masked != keys.mask("sk-abcdefghijklmnopqrss")
 
 
 def test_corrupt_store_quarantined(monkeypatch, tmp_path) -> None:

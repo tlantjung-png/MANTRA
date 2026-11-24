@@ -56,10 +56,8 @@ class _IsolatedSessionTest(unittest.TestCase):
                 handle,
             )
         config = load_config(self.config_path)
-        # Build with an empty server map: construction would otherwise
-        # spawn (and fail on) the test stub commands. The specs are
-        # re-attached afterwards, exactly the state after a start where
-        # no server came up.
+        # Build with no server map: construction would spawn the stub
+        # commands. Re-attach the specs to model a start with no server up.
         self.server_specs = config["mcp"]["servers"]
         config["mcp"]["servers"] = {}
 
@@ -70,8 +68,9 @@ class _IsolatedSessionTest(unittest.TestCase):
         for client in getattr(self.session, "mcp_clients", []):
             try:
                 client.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Best effort, but a failed shutdown must not be invisible.
+                print(f"warning: mcp client close failed: {exc}", file=sys.stderr)
 
 
 class ConsoleSessionStub:

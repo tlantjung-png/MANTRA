@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,8 +34,8 @@ DEFAULT_FILE = {
     "ui": {
         # Approval mode carried across sessions: the operator's /approve
         # choice outlives the process, so a session never restarts in a
-        # mode nobody picked. yolo is the starting default.
-        "approvals": "yolo",
+        # mode nobody picked. The starting default is the confirming mode.
+        "approvals": "default",
     },
 }
 
@@ -59,6 +60,24 @@ _last_error: str | None = None
 # A lock this old belonged to a process that is gone.
 _LOCK_STALE_SECONDS = 5.0
 _LOCK_WAIT = 0.5
+_LOCK_WARNED = False
+
+
+def _warn_lock_unavailable() -> None:
+    """Report a skipped save once, so a long run does not stay silent."""
+    global _LOCK_WARNED
+    if _LOCK_WARNED:
+        return
+    _LOCK_WARNED = True
+    print("[settings] write lock unavailable; settings changes were not saved", file=sys.stderr)
+
+
+def _release(lock_path: Path, lock_fd: int | None) -> None:
+    """Release a held lock without masking the write result (Low-23)."""
+    try:
+        release_lock(lock_path, lock_fd)
+    except OSError:
+        pass
 
 
 def last_error() -> str | None:
@@ -81,11 +100,9 @@ def _read() -> dict[str, Any]:
     try:
         data = json.loads(file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError) as exc:
-        # ValueError covers JSONDecodeError and the UnicodeDecodeError of
-        # a file saved in an unexpected encoding. A file the user is
-        # editing by hand will be broken sometimes. Starting empty is
-        # fine; silently overwriting what we could not read is not, so
-        # the failure is remembered for _write.
+        # ValueError covers JSONDecodeError and bad-encoding reads; hand-
+        # edited files break sometimes. Start empty, but remember the
+        # failure so _write never overwrites a document we could not read.
         _last_error = f"{file} could not be parsed: {exc}"
         return {}
     except OSError as exc:
@@ -151,6 +168,7 @@ def _write(data: dict[str, Any]) -> bool:
     lock_fd = acquire_lock(lock_path, _LOCK_WAIT, _LOCK_STALE_SECONDS)
     if lock_fd is None:
         # Another process holds the lock: skip the write rather than race it.
+        _warn_lock_unavailable()
         return False
     # Unique temp name: no fixed path for a planted symlink to hijack and
     # no shared file for two writers to interleave into.
@@ -161,7 +179,7 @@ def _write(data: dict[str, Any]) -> bool:
     except OSError:
         # Temporary-file creation failed outside the guarded region below;
         # release the lock and report the failure per the bool contract.
-        release_lock(lock_path, lock_fd)
+        _release(lock_path, lock_fd)
         return False
     tmp = Path(tmp_name)
     try:
@@ -174,18 +192,16 @@ def _write(data: dict[str, Any]) -> bool:
         tmp.replace(file)
         return True
     except OSError:
-        # No direct-write fallback: a non-atomic write to the target path
-        # could follow a planted symlink, exactly the hazard the unique
-        # temp name exists to avoid. Report the failure instead — the
-        # caller decides whether to retry, and the previous document
-        # (if any) is untouched.
+        # No direct-write fallback (could follow a symlink); report the
+        # failure so the caller decides, leaving the previous document
+        # untouched.
         try:
             tmp.unlink()
         except OSError:
             pass
         return False
     finally:
-        release_lock(lock_path, lock_fd)
+        _release(lock_path, lock_fd)
 
 
 def load() -> dict[str, Any]:
@@ -209,9 +225,8 @@ def load() -> dict[str, Any]:
     if isinstance(endpoints, dict):
         for name, entry in endpoints.items():
             if isinstance(entry, dict) and entry.get("base_url"):
-                # Every lookup lower-cases (get_endpoint/models_for/
-                # remove_endpoint) and add_endpoint stores lower-case, so
-                # a hand-edited mixed-case name must be normalized here or
+                # Lookups lower-case and add_endpoint stores lower-case,
+                # so a hand-edited mixed-case name must be normalized or
                 # it becomes unreachable.
                 out["endpoints"][str(name).strip().lower()] = _clean_endpoint(entry)
     active = data.get("active")

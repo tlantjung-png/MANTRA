@@ -44,10 +44,10 @@ DEFAULTS = {
     ],
     "evaluator": {"type": "command", "test_cmd": "python -m pytest tests/ -q"},
     "logging": {"type": "jsonl", "path": "logs/mantra-run.jsonl"},
-    # Default approval is yolo: every tool call is allowed without a prompt.
-    # Only use this default in a disposable or otherwise trusted workspace;
-    # set "default", "auto", or "plan" to be prompted or to restrict writes.
-    "approvals": "yolo",  # yolo | default | auto | plan
+    # Confirming mode is the shipped default: mutating calls are allowed but
+    # destructive ones are refused. "yolo" auto-approves every risk level and
+    # must be selected explicitly, only in a trusted or disposable workspace.
+    "approvals": "default",  # yolo | default | auto | plan
     "context": {
         "max_messages": 200,
         "max_chars": 240000,
@@ -56,10 +56,9 @@ DEFAULTS = {
         "digest": True,
         "digest_max_chars": 4000,
     },
-    # Observation reshaping: tool output is densified before it enters the
-    # model's context. The operator still sees the raw output and /fix still
-    # captures it; only the model's copy is reshaped. max_chars is the
-    # ceiling for one observation (0 disables reshaping entirely).
+    # Observation reshaping densifies tool output for the model only;
+    # the operator still sees raw output and /fix still captures it.
+    # max_chars caps one observation (0 disables reshaping).
     "observations": {"reshape": True, "max_chars": 12000},
     "auto_compact_tokens": 60000,  # compact when history exceeds; 0 disables
     "verbose": False,  # echo truncated tool output live
@@ -189,11 +188,9 @@ _SECTION_KEYS = {
 # Keys accepted inside one MCP server definition.
 _MCP_SERVER_KEYS = {"command", "cwd", "env", "enabled", "timeout"}
 
-# The key inside each component section that names the concrete class. When
-# an operator switches component type (e.g. evaluator "command" -> "none"
-# or llm provider "openai" -> "scripted"), the section must not inherit the
-# previous type's default keys: the registry rejects unknown constructor
-# keys, so a leftover default "test_cmd" would break the switch.
+# Discriminator key per component section. On a type switch the section
+# must drop the old type's default keys (the registry rejects unknown keys),
+# or a leftover "test_cmd" would break an evaluator switch.
 _DISCRIMINATOR_KEYS = {
     "llm": "provider",
     "sandbox": "provider",
@@ -201,10 +198,9 @@ _DISCRIMINATOR_KEYS = {
     "logging": "type",
 }
 
-# Value types for the component sections. These sections are forwarded to
-# the registry, so a wrong type would only surface deep inside a
-# constructor (or at request time); validate here instead. Fields not
-# listed keep whatever the component constructor accepts.
+# Value types for component sections, validated here because the registry
+# would surface a wrong type deep inside a constructor (or at request time).
+# Unlisted fields keep whatever the component constructor accepts.
 _COMPONENT_VALUE_TYPES = {
     "llm": {
         "model": (str,),
@@ -288,8 +284,10 @@ def merge_defaults(data: dict) -> dict:
                 merged[key] = _deep_merge(merged[key], value)
         else:
             merged[key] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
-    # Validate required sections; defaults always supply keys.
-    required = ("llm", "sandbox", "evaluator")
+    # Validate required sections; defaults always supply keys. "logging" is
+    # included so a non-object value fails here, not later at .get() in the
+    # runner with a raw AttributeError.
+    required = ("llm", "sandbox", "evaluator", "logging")
     wrong_type = [
         key for key in required if not isinstance(merged.get(key), dict)
     ]
@@ -336,7 +334,7 @@ def merge_defaults(data: dict) -> dict:
     prompt = merged.get("system_prompt")
     if prompt is not None and not isinstance(prompt, str):
         raise ConfigError(f"config system_prompt must be a string or null, got {prompt!r}")
-    mode = merged.get("approvals", "yolo")
+    mode = merged.get("approvals", "default")
     if mode not in ("default", "auto", "yolo", "plan"):
         raise ConfigError(
             f"config approvals must be one of yolo/default/auto/plan, got '{mode}'"

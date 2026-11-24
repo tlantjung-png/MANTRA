@@ -46,10 +46,8 @@ class Presenter:
                 try:
                     self.app.handle_event(event)
                 except Exception as exc:
-                    # Deliberately broad, and the same bargain the frame
-                    # path makes: one malformed event must not take the
-                    # whole interface down. The failure is surfaced the
-                    # way a turn error is, so it is never silent.
+                    # Broad on purpose, like the frame path: one bad event
+                    # must not end the session, and the failure is surfaced.
                     self._report_event_failure(exc)
                 try:
                     event = self.app.next_event(0)

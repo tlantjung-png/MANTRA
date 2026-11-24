@@ -118,13 +118,9 @@ class BoxRenderingMixin:
 
     # ---- before/after diff panes ---------------------------------------
     #
-    # Structured unified diffs (agent edits, /diff, git-diff boxes) render
-    # as two stacked panes per hunk instead of a +/- line stream: first
-    # the before-state with removed lines in a soft dusty red, then the
-    # after-state with added lines in a soft sage green - text colour
-    # only, no backgrounds. A context line exists on both sides, so it is
-    # shown only once - in the pane whose change sits nearest - which
-    # keeps each pane anchored without doubling the code.
+    # Unified diffs render as two stacked panes per hunk: removals before,
+    # additions after, colours only. Shared context lines appear once, in
+    # the pane with the nearest change, so neither side is duplicated.
 
     def _pane_row(self: "ConsoleSession", body: str, code: str | None) -> str:
         """One '│ ' gutter row; *code* colours the changed text softly."""

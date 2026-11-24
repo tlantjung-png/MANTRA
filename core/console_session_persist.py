@@ -107,10 +107,8 @@ class PersistenceMixin:
             "show_tool_output": self._show_tool_output,
             "pending_pages": self._pending_pages_snapshot(),
         }
-        # Cap file size via payload size check. A failure here (e.g. the
-        # payload contains something json can't serialize) means the write
-        # below will fail the same way, so surface it now instead of
-        # silently skipping the check and hitting an uncaught error later.
+        # Check serializability and size before writing so a bad payload
+        # fails here instead of leaving a truncated session file behind.
         try:
             data = json.dumps(payload, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
@@ -347,6 +345,13 @@ class PersistenceMixin:
         summary = data.get("summary") or ""
         if summary:
             self._print(self.style.dim(f"  started with: {summary}"))
+        # A replay has no RunResult, so mirror the live closing summary in
+        # plain words: never leave the transcript ending on a tool box.
+        shown = sum(1 for msg in messages if isinstance(msg, dict))
+        self._print(
+            f"Summary: this saved transcript was replayed ({shown} messages shown); "
+            "no new result was produced. Next: keep typing to continue."
+        )
         # Flush viewport so history appears immediately — without this the
         # throttled writes in the terminal application stay buffered until flush.
         if self.layout is not None and getattr(self.layout, "active", False):

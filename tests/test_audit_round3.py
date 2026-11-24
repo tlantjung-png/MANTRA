@@ -11,12 +11,14 @@ the startup card cannot survive the first turn or a resize.
 
 from __future__ import annotations
 
+import atexit
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
-import time
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -47,7 +49,9 @@ from core.console import Style, _skills_launch  # noqa: E402
 
 
 def _workspace() -> str:
-    return tempfile.mkdtemp(prefix="mantra-r3-")
+    path = tempfile.mkdtemp(prefix="mantra-r3-")
+    atexit.register(shutil.rmtree, path, True)
+    return path
 
 
 def _logger():
@@ -61,6 +65,7 @@ class BundleKeepsRequestTest(unittest.TestCase):
 
     def test_first_bundle_step_receives_the_request(self):
         root = tempfile.mkdtemp(prefix="mantra-skills-")
+        self.addCleanup(shutil.rmtree, root, True)
         skill_dir = os.path.join(root, "alpha")
         os.makedirs(skill_dir)
         with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
@@ -100,6 +105,7 @@ class BundleKeepsRequestTest(unittest.TestCase):
 
     def test_later_steps_use_the_procedure_prompt(self):
         root = tempfile.mkdtemp(prefix="mantra-skills-")
+        self.addCleanup(shutil.rmtree, root, True)
         for name in ("alpha", "beta"):
             skill_dir = os.path.join(root, name)
             os.makedirs(skill_dir)
@@ -298,23 +304,40 @@ class TemperatureDowngradeTest(unittest.TestCase):
 class ResolveTimeoutTest(unittest.TestCase):
     """M-3: a stalled resolver costs the stated timeout, not the OS's."""
 
-    def test_timeout_returns_promptly(self):
+    def test_timeout_abandons_the_stalled_resolver(self):
         import socket as socket_module
 
+        entered = threading.Event()
+        finished = threading.Event()
+        release = threading.Event()
+
         def stalled(*args, **kwargs):
-            time.sleep(1.0)
+            entered.set()
+            release.wait(2.0)
+            finished.set()
             return []
 
         with mock.patch.object(socket_module, "getaddrinfo", stalled):
-            start = time.monotonic()
-            result = _resolve_limited("example.invalid", 0.05)
-            elapsed = time.monotonic() - start
+            try:
+                result = _resolve_limited("example.invalid", 0.05)
+                # The future is abandoned, not joined: the stub is still
+                # blocked when the bounded call has already returned.
+                entered.wait(1.0)
+                self.assertTrue(entered.is_set(), "resolver stub was never called")
+                self.assertFalse(finished.is_set(), "resolver thread was joined")
+            finally:
+                release.set()
         self.assertIsNone(result)
-        self.assertLess(elapsed, 0.5, "resolver thread was joined instead of abandoned")
 
     def test_healthy_resolution_returns_addresses(self):
-        infos = _resolve_limited("localhost", 2.0)
-        self.assertTrue(infos)
+        import socket as socket_module
+
+        infos = [
+            (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
+        ]
+        with mock.patch.object(socket_module, "getaddrinfo", return_value=infos):
+            result = _resolve_limited("example.invalid", 2.0)
+        self.assertEqual(result, infos)
 
     def test_pinned_resolution_refuses_loopback(self):
         self.assertIsNone(_resolve_and_pin("127.0.0.1"))

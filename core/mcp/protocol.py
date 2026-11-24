@@ -23,6 +23,10 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2024-11-05")
 SERVER_NAME = "mantra"
 SERVER_VERSION = "0.1.0"
 
+# One line is one JSON-RPC message. Both transports cap physical line reads
+# at this size, and loads() rejects overlong input as a second line of defence.
+MAX_LINE_CHARS = 1_000_000
+
 # JSON-RPC 2.0 error codes.
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -51,6 +55,8 @@ def dumps(message: dict[str, Any]) -> str:
 
 def loads(line: str) -> dict[str, Any]:
     """Parse one transport line into a message object."""
+    if len(line) > MAX_LINE_CHARS:
+        raise ProtocolError(INVALID_REQUEST, "protocol line too long")
     try:
         message = json.loads(line)
     except (json.JSONDecodeError, ValueError) as exc:

@@ -16,11 +16,9 @@ prompt|git push|Pushing to a remote changes shared state; logged
 allow|git diff|Safe read-only diff
 allow|git status|Safe read-only status
 allow|git log|Safe read-only log
-# Cache-prefix guards: AGENTS.md and the per-project MEMORY.md are loaded
-# into the provider prompt prefix, and rewriting either mid-session
-# invalidates the prompt prefix cache for subsequent turns (and the cost of a full re-bill).
-# Shell-layer writes are forbidden; deliberate updates go through the
-# instruction-audit / update-memory flows at session boundaries.
+# AGENTS.md and MEMORY.md are loaded into the provider prompt prefix;
+# mid-session edits invalidate it and force a full re-bill, so shell writes
+# are forbidden (use instruction-audit / update-memory at session boundaries).
 forbidre|(>|>>)\s*[^|\r\n]*AGENTS\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*AGENTS\.md|Mid-session AGENTS.md edits invalidate the provider prefix cache; defer to session boundaries
 forbidre|(>|>>)\s*[^|\r\n]*MEMORY\.md|(set-content|add-content|out-file|new-item|remove-item|move-item|rename-item)\b[^|\r\n]*MEMORY\.md|Mid-session native-memory fence edits invalidate the provider prefix cache; memory-mirror handles this at close
 

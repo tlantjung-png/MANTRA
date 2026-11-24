@@ -71,11 +71,9 @@ class BackendParseTest(unittest.TestCase):
         self.assertEqual((decoded[0].x, decoded[0].y), (10, 4))
 
     def test_sgr_wheel_with_modifiers_still_decodes_as_a_wheel(self):
-        # A wheel notch with shift/alt/ctrl held carries the modifier bits
-        # (64+4, 65+8, 65+16...). Those codes must still classify as a
-        # wheel: falling through to the press path turned the notch into
-        # a click wherever the cursor rested - which over the prompt box
-        # moved the caret instead of scrolling the conversation.
+        # Wheel notches with modifiers add bits (64+4, 65+8, 65+16...).
+        # They must still classify as wheels: the press path would turn
+        # the notch into a click that moves the caret over the prompt box.
         events = self._parse("\x1b[<68;11;5M\x1b[<73;11;5M\x1b[<81;11;5M")
         decoded = [events.get_nowait() for _ in range(events.qsize())]
         self.assertEqual([ev.kind for ev in decoded], ["wheel", "wheel", "wheel"])
@@ -88,11 +86,9 @@ class BackendParseTest(unittest.TestCase):
         self.assertEqual(events.qsize(), 0)
 
     def test_decomposed_wheel_flush_never_types_into_the_prompt(self):
-        # Regression: when ConPTY decomposes an SGR wheel report into key
-        # records that arrive too gappily to reassemble, the buffer is
-        # flushed through the shared escape parser - the complete report
-        # still becomes one wheel event, and a truncated one is dropped
-        # instead of typing "[<64;55;15" into the composer.
+        # Gappily-decomposed SGR reports are flushed through the shared
+        # escape parser: a complete report becomes one wheel event, a
+        # truncated one is dropped instead of typing into the composer.
         backend = Backend()
         events = backend._decode_win_sequence_buffer("\x1b[<64;55;15M")
         self.assertEqual(len(events), 1)
@@ -187,10 +183,9 @@ class BackendParseTest(unittest.TestCase):
             write.assert_called_once_with(Backend._MOUSE_ON)
 
     def test_windows_arrow_keys_decode_by_virtual_key(self):
-        # A real Windows KEY_EVENT for an arrow carries VK_UP etc. with a
-        # NUL uChar. The NUL used to be read as Ctrl+Space, which dropped
-        # every arrow key before the virtual-key lookup ran - so the
-        # completion popup could not be navigated with the keyboard.
+        # Windows arrow KEY_EVENTs carry VK_UP etc. with a NUL uChar. Reading
+        # that NUL as Ctrl+Space dropped arrows before the virtual-key
+        # lookup, so the completion popup could not be keyboard-navigated.
         from types import SimpleNamespace
 
         backend = Backend()
@@ -312,14 +307,16 @@ class PosixDecoderRegressionTest(unittest.TestCase):
 
     def test_unterminated_paste_is_cut_at_cap(self):
         # A paste whose end marker never arrives is cut off at the cap
-        # and delivered, instead of buffering without bound.
+        # and delivered, instead of buffering without bound. Only bytes
+        # through the cap are consumed: the rest of the read is decoded
+        # normally rather than silently discarded.
         from core.tui.backend import _PASTE_CAP
 
         seq = "\x1b[200~" + "x" * (_PASTE_CAP + 50)
         events = self._drain(self._parse(seq))
-        self.assertEqual(len(events), 1)
         self.assertIsInstance(events[0], Paste)
         self.assertEqual(events[0].text, "x" * _PASTE_CAP)
+        self.assertEqual([e.key for e in events[1:]], ["x"] * 50)
 
     def test_utf8_split_across_reads_becomes_one_character(self):
         # A multi-byte character split across two reads is reassembled by

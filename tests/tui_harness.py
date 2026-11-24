@@ -117,11 +117,9 @@ def _make_app(script, backend=None):
     return app, session, backend
 
 
-# Workspaces _make_app (and the popup test) create under TEMP; the atexit
-# hook removes them on process exit so cross-module _make_app users
-# (test_fix, test_review) never leave stray directories behind (each one
-# may contain a git repo). AppIntegrationTest.tearDown still clears them
-# eagerly within this module's own runs.
+# Workspaces created under TEMP are removed at exit so cross-module users
+# leave no stray directories (each may hold a git repo). Local suites also
+# clear them eagerly in tearDown.
 _TEMP_WORKSPACES: list[str] = []
 
 

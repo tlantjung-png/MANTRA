@@ -75,12 +75,16 @@ class SearchRichToolTest(TestCase):
         tool = FindFileTool()
         fake = mock.Mock()
         fake.root = None
-        fake.exec.return_value = mock.Mock(exit_code=0, stdout="a.py\nb.py\n")
+        # The shared normalizer keeps prefixed path:line markers and drops
+        # unprefixed lines, so feed both shapes and assert the result.
+        fake.exec.return_value = mock.Mock(
+            exit_code=0,
+            stdout="./a.py:1: match\n./b.py:2: match\n./unprefixed\n",
+        )
         out = tool.execute(fake, pattern="py")
-        # The `root is None` path quotes a glob and shells out to `find`,
-        # so this probe is mainly a sanity check on the code path, not a
-        # claim about the exact fallback output shape.
-        assert isinstance(out, str)
+        assert "./a.py:1: match" in out
+        assert "./b.py:2: match" in out
+        assert "./unprefixed" not in out
 
     def test_search_code_shell_fallback_normalizes_grep_style_output(self):
         tool = SearchCodeTool()

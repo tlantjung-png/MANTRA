@@ -46,10 +46,9 @@ class MentionsMixin:
             if not tokens:
                 return text, []
 
-        # Normalize: a root given with forward slashes compares unequal to
-        # normpath output on Windows, which made every mention "no match".
-        # Realpath (not just abspath) so the containment checks below and
-        # in _resolve_mention measure against the same canonical root.
+        # Realpath puts the root in the same canonical form the containment
+        # checks use; abspath alone left Windows slash forms unequal and made
+        # every mention look like "no match".
         root = os.path.realpath(os.path.abspath(self.sandbox.root))
         blocks: list[str] = []
         attached: list[str] = []

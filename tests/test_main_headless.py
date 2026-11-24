@@ -106,8 +106,6 @@ def test_headless_approver_maps_modes() -> None:
 
 
 def test_main_anchors_relative_log_path(tmp_path, monkeypatch) -> None:
-    import os
-
     import core.main as main_mod
 
     config = {
@@ -126,13 +124,13 @@ def test_main_anchors_relative_log_path(tmp_path, monkeypatch) -> None:
         return ScriptedLLMClient([final_response("ok")])
 
     main_mod.build_llm = _fake
+    # Anchor the runner to the temp tree so no log lands in the checkout.
+    monkeypatch.setattr(main_mod, "PROJECT_ROOT", str(tmp_path))
     try:
         code = main_mod.main(["--config", str(config_path), "--task", _write_task(tmp_path)])
     finally:
         main_mod.build_llm = original
     assert code == 0
-    # The relative log path is anchored to the project root.
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(main_mod.__file__)))
-    assert (tmp_path / "run.jsonl").exists() or os.path.isfile(
-        os.path.join(project_root, "logs", "relative-run.jsonl")
-    )
+    # The exact anchored file is the only passing condition; no stale file
+    # elsewhere can satisfy this assertion.
+    assert (tmp_path / "logs" / "relative-run.jsonl").is_file()

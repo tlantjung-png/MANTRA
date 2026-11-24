@@ -15,6 +15,25 @@ import time
 from pathlib import Path
 
 
+def _owner_token() -> str:
+    """Identify the current user for lock ownership checks."""
+    uid = getattr(os, "getuid", None)
+    if uid is not None:
+        return f"uid:{uid()}"
+    import getpass
+
+    return f"user:{getpass.getuser()}"
+
+
+def _lock_owner(lock_path: str | Path) -> str | None:
+    """Read the owner token from a lock file, if it carries one."""
+    try:
+        with open(lock_path, "r", encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except (OSError, UnicodeError):
+        return None
+
+
 def break_stale_lock(lock_path: str | Path, stale_seconds: float) -> bool:
     """Remove a lock whose holder is gone. True when removed.
 
@@ -30,6 +49,11 @@ def break_stale_lock(lock_path: str | Path, stale_seconds: float) -> bool:
         return False
     age = time.time() - stat.st_mtime
     if age < stale_seconds:
+        return False
+    # A lock carrying an explicit owner is only broken by that owner.
+    # Legacy locks without a token keep the old mtime-only behaviour.
+    owner = _lock_owner(lock_path)
+    if owner is not None and owner.startswith("owner:") and owner != f"owner:{_owner_token()}":
         return False
     # Verify mtime hasn't changed since we checked to avoid deleting
     # a lock that was just freshly created by another process.
@@ -56,7 +80,12 @@ def acquire_lock(lock_path: str | Path, wait: float, stale: float) -> int | None
     start = time.monotonic()
     while time.monotonic() - start < wait:
         try:
-            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, f"owner:{_owner_token()}\n".encode("utf-8"))
+            except OSError:
+                pass  # ownership is best effort; the lock itself still holds
+            return fd
         except FileExistsError:
             time.sleep(0.02)
             try:

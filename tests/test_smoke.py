@@ -4,13 +4,14 @@ Runs the full agent loop offline: a scripted LLM fixes a seeded bug through
 the real tools, the command evaluator grades the result, and edge behaviors
 (context truncation, unknown components) are checked alongside.
 Run from the project root with pytest (preferred):  python -m pytest tests/ -q
-(conftest.py redirects the session and audit-log stores per test; plain
-`python -m unittest discover -s tests -v` works too, but only gets the
-import-time redirection from tests/__init__.py, not the per-test re-assert.)
+The root conftest.py redirects the session, credential, settings, and
+audit-log stores per test. `python -m unittest discover -s tests -v` works
+too, but gets no store redirection: tests/__init__.py is empty.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
 import json
 import shutil
@@ -51,6 +52,7 @@ TEST_CMD = f'"{sys.executable}" -m unittest test_greet -v'
 
 def make_workspace() -> str:
     root = tempfile.mkdtemp(prefix="mantra-smoke-")
+    atexit.register(shutil.rmtree, root, True)
     with open(os.path.join(root, "greet.py"), "w", encoding="utf-8") as handle:
         handle.write(GREET_BUGGY)
     with open(os.path.join(root, "test_greet.py"), "w", encoding="utf-8") as handle:
@@ -998,7 +1000,10 @@ class TuiLoopSmokeTest(unittest.TestCase):
         class _StoppedApp:
             running = False
 
-        Presenter(_StoppedApp()).run()  # loop never enters: returns cleanly
+        presenter = Presenter(_StoppedApp())
+        with mock.patch.object(presenter, "_run", wraps=presenter._run) as run:
+            presenter.run()  # loop never enters: returns cleanly
+        run.assert_called_once_with()
 
 
 class SandboxSecurityTest(unittest.TestCase):

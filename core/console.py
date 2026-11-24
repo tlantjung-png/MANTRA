@@ -22,6 +22,12 @@ from typing import Any
 from core import theme
 from core.config import REASONING_EFFORTS, load_config
 
+if __name__ == "__main__":
+    # "python -m core.console" runs this file as __main__, while the command
+    # modules import "core.console" by name. Publish one module object so the
+    # trailing re-exports initialize once instead of re-entering this file.
+    sys.modules.setdefault("core.console", sys.modules["__main__"])
+
 # Themed chip words by activity, kept inside MANTRA's spell vocabulary.
 # One word per activity; the busy chip shows the word for what the agent
 # is doing right now (the spinner and elapsed counter animate it).
@@ -251,10 +257,9 @@ class ConsoleSession(
             environment=env,
         )
         self.tools = build_tools(config["tools"])
-        # External MCP tools join the same list, so the loop, the approval
-        # policy, and the schema sent to the model need no special case. A
-        # server that fails to start is reported and skipped rather than
-        # blocking the console.
+        # MCP tools join the ordinary tool list; no special case is needed
+        # downstream. A server that fails to start is reported and skipped
+        # instead of blocking startup.
         self.mcp_clients: list[Any] = []
         mcp_tools, self.mcp_clients = build_mcp_tools(
             config.get("mcp"), on_error=lambda message: self._note(f"MCP: {message}")
@@ -289,16 +294,12 @@ class ConsoleSession(
         self._task_counter = 0
         self.verbose = bool(config.get("verbose", False))
         self.max_steps = int(config.get("max_steps", 30))
-        # Set the first time autosave writes, so a session that never got
-        # anywhere leaves no file behind. Adopted by /sessions so picking a
-        # session up continues it instead of forking it.
+        # First autosave names the session, so untouched runs leave no file;
+        # /sessions reuses the name to continue rather than fork a transcript.
         self.session_name = ""
         self._autosave_warned = False
-        # The session todo checklist. Discrete items the agent adds and
-        # checks off from inside the conversation (TODO ADD / TODO DONE
-        # lines in its reply). Injected into every turn's system prompt,
-        # so an agent working over many turns can see what remains
-        # rather than losing the thread of a multi-part request.
+        # The agent-maintained checklist (TODO ADD / TODO DONE lines in its
+        # reply) is injected into every prompt so long tasks keep their state.
         self.todos: list[dict] = []  # [{"text": str, "done": bool}]
         # Reports the agent emitted on the turn in flight, already applied
         # inline as its reply streamed. The end-of-turn pass skips them so
@@ -420,11 +421,9 @@ class ConsoleSession(
         if self.ui is not None:
             self.ui.set_busy(on, label="Chanting")
 
-    # Tool-output boxes are budgeted in *viewport rows*, not raw lines: one
-    # long line can wrap to several screen rows, and a huge read or log dump
-    # must not flood the viewport mid-run. Roughly a screenful is shown and
-    # the rest is noted - never dropped silently. Reads that overflow are
-    # queued and can be paged through with an empty Enter at the prompt.
+    # Tool-output boxes are budgeted in viewport rows so wrapped lines cannot
+    # flood the screen: about one screenful shows and the rest is queued,
+    # with a note, for the empty-Enter pager instead of being dropped.
     _TOOL_OUTPUT_BUDGET_ROWS = 36
     _READ_PAGE_ROWS = 24
     _OUTPUT_COLS_FALLBACK = 80
@@ -434,6 +433,41 @@ class ConsoleSession(
         self._show_tool_output = not self._show_tool_output
         state = "on" if self._show_tool_output else "off"
         self._print(self.style.dim(f"  (tool output boxes {state} — ctrl+o to toggle)"))
+
+    def _collect_turn_tool_text(self, text: str) -> None:
+        """Append tool text to the TUI collector under the application lock."""
+        ui = getattr(self, "ui", None)
+        if ui is None:
+            return
+        collector = getattr(ui, "_turn_tool_text", None)
+        if not isinstance(collector, list):
+            return
+        lock = getattr(ui, "lock", None)
+        if lock is not None:
+            with lock:
+                collector.append(text)
+        else:
+            collector.append(text)
+
+    def take_turn_tool_text(self) -> list[str]:
+        """Drain and return the turn's tool text under the application lock.
+
+        The TUI calls this where follow-up chips are built, so the collector
+        has a reader and neither the worker append nor the drain races.
+        """
+        ui = getattr(self, "ui", None)
+        collector = getattr(ui, "_turn_tool_text", None)
+        if not isinstance(collector, list):
+            return []
+        lock = getattr(ui, "lock", None)
+        if lock is not None:
+            with lock:
+                items = list(collector)
+                collector.clear()
+                return items
+        items = list(collector)
+        collector.clear()
+        return items
 
     def _attention(self) -> None:
         """A soft terminal bell so a failed turn or a denial is noticed."""
@@ -464,11 +498,8 @@ class ConsoleSession(
         # Turn-scoped evidence for the TUI:
         # it names the tools that ran and the artifacts they touched, so
         # the next-step rows follow the work that actually happened.
-        ui = getattr(self, "ui", None)
-        if ui is not None and isinstance(observation, str) and observation.strip():
-            collector = getattr(ui, "_turn_tool_text", None)
-            if isinstance(collector, list):
-                collector.append(f"{tool}: {observation.strip()[:600]}")
+        if isinstance(observation, str) and observation.strip():
+            self._collect_turn_tool_text(f"{tool}: {observation.strip()[:600]}")
         if not self._show_tool_output:
             return
         if not isinstance(observation, str) or not observation.strip():
@@ -536,6 +567,11 @@ class ConsoleSession(
         task = _sanitize_output(getattr(self, "_last_shell_task", None) or "")
         title = f"shell_output {task}" if task else "shell_output"
         return self._render_paged_box(title, lines)
+
+    def _has_pending_pages(self) -> bool:
+        """Thread-safe pager-queue truth check for the turn hint."""
+        with self._pager_lock:
+            return bool(self._pending_pages)
 
     def _pending_pages_snapshot(self) -> list[list]:
         """JSON-safe copy of the pager queue (title + remaining lines).
@@ -756,12 +792,9 @@ class ConsoleSession(
             self._stream_tokens = max(1, (self._stream_chars + 3) // 4)
         rendered = self._stream_renderer.render_piece(piece)
         if self.layout is not None and self.layout.active:
-            # The terminal host owns the mouse during streaming: while a
-            # native click-drag selection is in progress (Windows, app
-            # -owned viewport), every repaint would disturb the drag, so
-            # defer the fragment and flush everything once the selection
-            # completes. The native-scrollback layout only ever repaints
-            # its bottom box, so selection is never at risk there.
+            # A native click-drag selection (app-owned viewport) would be
+            # disturbed by repaints, so defer fragments until the drag ends.
+            # Native-scrollback repaints only its bottom box: no deferral needed.
             if getattr(self.layout, "is_inline", False) is not True and selection_in_progress():
                 self._deferred_stream.append(rendered)
                 return
@@ -1128,11 +1161,9 @@ class ConsoleSession(
                     else:
                         _safe_stdout(tail)
                         sys.stdout.flush()
-                # Streamed in full, so the reply is already on screen - do
-                # not print it again. A second copy would sit below the
-                # first, and because the streaming path emits raw text
-                # while render_markdown would strip its marks, the two
-                # would disagree with each other line for line.
+                # The streamed reply is already on screen; printing the final
+                # message through render_markdown would add a second, differently
+                # formatted copy.
                 if self.layout is not None and self.layout.active:
                     self.layout.write("\n")
                     try:
@@ -1178,12 +1209,9 @@ class ConsoleSession(
             self._last_edit_path = None
             self._last_command = None
             self._last_shell_task = None
-            # Tell the operator capped output can be paged through with an
-            # empty Enter (the queue survives until the next turn). The
-            # hint only makes sense on the TUI path: the plain REPL has no
-            # empty-Enter paging, so an unconditional hint would lie and
-            # the queue would just grow until the next autosave.
-            if self._pending_pages and self.layout is not None and self.layout.active:
+            # Only the TUI can page through capped output with an empty
+            # Enter; the plain REPL has no such pager, so it gets no hint.
+            if self._has_pending_pages() and self.layout is not None and self.layout.active:
                 self._print(self.style.dim("  (capped output above — press Enter with an empty prompt to page through it)"))
             self._end_turn(result)
             # Non-streamed turns print their last lines inside the same
@@ -1215,11 +1243,48 @@ class ConsoleSession(
         self.autosave()
 
     def _end_turn(self, result: "RunResult | None") -> None:
-        """Print the usage footer for the turn that just ended."""
+        """Print usage and a plain-language closing summary, in that order."""
         # Clear the live token counter so the next prompt is clean.
         self._stream_tokens = 0
         if result is not None:
             self._print(f"  {self.style.dim(self._usage_line(result))}")
+        # The closing summary is the last thing written to the transcript,
+        # so a turn never ends on a raw tool-output box or a code snippet.
+        self._print(self._closing_summary(result))
+
+    def _closing_summary(self, result: "RunResult | None") -> str:
+        """One prose line stating what happened, the result, and the next step."""
+        s = self.style
+        if result is None:
+            return (
+                f"  {s.brand('Summary:')} The turn ended before a result was "
+                "produced; nothing was verified. Next: retry the request."
+            )
+        steps = result.steps_used
+        step_word = "step" if steps == 1 else "steps"
+        changed = len(getattr(self.sandbox, "changed", set()) or set())
+        changed_bit = f"{changed} file{'s' if changed != 1 else ''} changed"
+        reason = result.stopped_reason
+        if reason == "final":
+            status = "The request was answered"
+            nxt = "Next: review the changes above and run any checks you still need."
+        elif reason == "max_steps":
+            status = "The step limit was reached"
+            nxt = "Next: split the work into smaller requests or raise the step limit."
+        elif reason == "aborted":
+            status = "The turn was interrupted"
+            nxt = "Next: re-run the request when you are ready."
+        else:
+            status = "The turn stopped with an error"
+            nxt = "Next: read the error above and retry a narrower request."
+        detail = (result.evaluation_detail or "").strip()
+        verification = detail if detail else (
+            "no automatic result" if reason == "final" else f"incomplete ({reason})"
+        )
+        return (
+            f"  {s.brand('Summary:')} {status} in {steps} {step_word}; "
+            f"{changed_bit}. Verification: {verification}. {nxt}"
+        )
 
     def _report_verification(self, result: "RunResult") -> None:
         """Show observed command outcomes without claiming automatic grading."""
@@ -1463,6 +1528,12 @@ def main(argv: list[str] | None = None) -> int:
                 config["approvals"] = saved
         except Exception:
             pass  # unreadable preferences: the config default stands
+    if config.get("approvals") == "yolo":
+        print(
+            "warning: yolo approval mode auto-approves every tool call; "
+            "use it only in a trusted, disposable workspace",
+            file=sys.stderr,
+        )
 
     # Color follows the stream: a real terminal gets ANSI, a pipe or
     # redirect gets clean text unless the operator forces color.
@@ -1485,6 +1556,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = session.handle(args.once)
         finally:
+            _close_mcp(session)
             session.logger.close()
         # handle() returns None when the run was interrupted or failed
         # before producing a result: that is a failure, not a success.
@@ -1565,14 +1637,9 @@ def _run_terminal(session: ConsoleSession) -> int:
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
-# The command modules call back into this module (menus, readers, the
-# catalogue fetch) through its namespace, so the test suite's seam
-# patches keep working. Import them last: they read attributes at call
-# time, not import time.
+# Imported last to break the import cycle: command modules hold a
+# reference to this module and read its attributes only when called,
+# which also keeps the test suite's patch targets live.
 from core.console_skills import (  # noqa: E402,F401
     _skills,
     _skills_auto,
@@ -1631,3 +1698,10 @@ from core.console_model import (  # noqa: E402,F401
     _try_fetch,
     _type_a_model,
 )
+
+
+# Must stay last: under "python -m core.console" the guard runs main(), so
+# the re-export imports above have to execute first or dispatch sees names
+# that were never bound.
+if __name__ == "__main__":
+    sys.exit(main())

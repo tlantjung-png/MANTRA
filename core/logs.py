@@ -1,8 +1,9 @@
-"""JSONL logger: append-only, never raises, and never redacts.
+"""JSONL logger: append-only and never raises.
 
-Callers own redaction: a payload is written as given, so a caller that puts
-secrets in a payload puts them on disk. Records are dropped, and counted,
-when the inter-process lock cannot be taken or a write fails.
+Redaction is enforced at the sink: string values in every payload pass
+through the shared helper before serialization. Caller-side redaction stays
+as defence in depth. Records are dropped, and counted, when the
+inter-process lock cannot be taken or a write fails.
 """
 
 from __future__ import annotations
@@ -13,16 +14,27 @@ import threading
 import time
 from typing import Any
 
+from core.agent.approvals import _redact_sensitive
 from core.types import Logger
 
 # Rotate the log aside once it passes ~1 MB; the previous file is kept
 # at ``<path>.1`` and replaced on the next rotation.
 _ROTATE_BYTES = 1_000_000
 
-# Grace period before a lock may be probed for staleness, and the hard
-# ceiling past which it is removed even if the holder pid looks alive: no
-# legitimate write holds the inter-process lock anywhere near that long,
-# so an apparently-live holder is a pid-reuse or a wedged writer.
+
+def _redact_payload(value: Any) -> Any:
+    """Apply the shared redactor to string values at any nesting depth."""
+    if isinstance(value, str):
+        return _redact_sensitive(value)
+    if isinstance(value, dict):
+        return {key: _redact_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_payload(item) for item in value]
+    return value
+
+# Grace period before a lock is probed for staleness, and a hard ceiling
+# past which it is removed even if the holder looks alive (no write holds it
+# that long, so an alive pid there is pid-reuse or a wedged writer).
 _LOCK_GRACE_SECONDS = 5.0
 _LOCK_HARD_CEILING_SECONDS = 60.0
 
@@ -90,10 +102,9 @@ class JsonlLogger(Logger):
         # acquired in time, or a write failed. The logger never raises,
         # so this counter is the only visibility into silent loss.
         self._dropped = 0
-        # mtime of the inter-process lock this process holds, or None. A
-        # lock carrying our own pid is released within the write below; one
-        # still present with the same mtime past the grace period is a
-        # leftover from a crash and can be self-healed.
+        # mtime of the lock this process holds, or None. A lock with our pid
+        # is released within the write; one still present with the same mtime
+        # past the grace period is a crash leftover and can be self-healed.
         self._held_lock_mtime: float | None = None
 
     def _ensure_handle(self) -> Any:
@@ -140,14 +151,14 @@ class JsonlLogger(Logger):
             pass
 
     def log(self, event: str, payload: dict[str, Any]) -> None:
-        # Caller payload spreads first so ts/event cannot be spoofed;
+        # Redact at the sink so a caller that forgets cannot persist a
+        # credential. Payload spreads first so ts/event cannot be spoofed;
         # default=str stringifies values that JSON cannot serialize.
-        record = {**payload, "ts": round(time.time(), 3), "event": event}
+        record = {**_redact_payload(payload), "ts": round(time.time(), 3), "event": event}
         line = json.dumps(record, default=str) + "\n"
-        # Inter-process lock to avoid interleaved lines. Use atomic exclusive
-        # create as the arbiter; the holder's pid is embedded so a stale
-        # lock is only ever broken when its holder is gone — never while a
-        # live process merely paused past the mtime grace.
+        # Inter-process lock avoids interleaved lines: atomic exclusive create
+        # is the arbiter, with the holder's pid embedded so a stale lock is
+        # broken only when its holder is gone — not while a live process pauses.
         lock_path = self.path + ".lock"
 
         def _lock_holder_pid() -> int | None:
@@ -232,13 +243,9 @@ class JsonlLogger(Logger):
             except OSError:
                 break
         if not acquired:
-            # Another process holds the inter-process lock: skip this
-            # record rather than risk interleaved, corrupt lines, and
-            # count the loss so it is not invisible. A lock recording our
-            # own pid cannot be a live hold from this process — the
-            # holder removes it within the write below — so it must be a
-            # crash leftover; leaving it would drop every later record
-            # too.
+            # Another process holds the lock: skip and count the record rather
+            # than risk corrupt lines. A lock with our own pid is a crash
+            # leftover; leaving it drops all later records too.
             with self._lock:
                 self._dropped += 1
             try:

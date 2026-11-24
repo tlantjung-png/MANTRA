@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -18,24 +19,41 @@ from core.urlcheck import is_safe_commit as _is_safe_commit_impl
 from core.urlcheck import is_safe_repo_url as _is_safe_repo_url_impl
 from core.types import ExecResult, Sandbox
 
-# Heuristic patterns for shell traversal; best effort, not a boundary.
-# The host sandbox executes with shell=True so containment cannot be
-# guaranteed; this check is defence-in-depth only. Use the container
-# sandbox when strong isolation is required.
+# Shell-traversal heuristics: best effort, not a boundary. The host sandbox
+# uses shell=True so containment cannot be guaranteed; this is defence in
+# depth only. Use the container sandbox for strong isolation.
 _ABSOLUTE_WIN_RE = re.compile(r"[a-zA-Z]:[\\/]")
 _ENCODED_TRAVERSAL_RE = re.compile(r"(%2e%2e|%252e|\\u002e|\\x2e)", re.IGNORECASE)
 
 _MAX_READ_BYTES = 500_000
 _MAX_EXEC_BYTES = 1_000_000
 
-# Defense-in-depth: children of the host sandbox must not inherit the
-# harness's credential-shaped environment variables. Approvals remain the
-# real gate — this only stops a model-issued command from trivially
-# printing secrets. PATH/SystemRoot/HOME etc. are kept as-is.
+# Defence in depth: strip credential-shaped env vars from child processes.
+# Approvals are the real gate; this only stops trivial secret printing.
+# PATH/SystemRoot/HOME are kept as-is.
 _SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
 # MANTRA_* variables that hold secrets; the marker filter below already
 # catches most of these by name.
 _MANTRA_SECRET_ENV = frozenset({"MANTRA_CREDENTIALS"})
+
+# High-6 mitigation: the host sandbox is a heuristic screen, not a
+# containment boundary. Surface that limit at startup so operators do not
+# mistake the local provider for isolation when running untrusted work.
+_HOST_SANDBOX_WARNING = (
+    "warning: local (host) sandbox is a command screen, not a containment "
+    "boundary; model commands run with the host account's full authority. "
+    "Use the container sandbox (sandbox.provider = docker) for untrusted work."
+)
+_warned_host_sandbox = False
+
+
+def warn_host_sandbox_risk(stream=None) -> None:
+    """Emit a one-time operator warning about host-sandbox residual risk."""
+    global _warned_host_sandbox
+    if _warned_host_sandbox:
+        return
+    _warned_host_sandbox = True
+    print(_HOST_SANDBOX_WARNING, file=stream if stream is not None else sys.stderr)
 
 
 def _filtered_env(env: dict) -> dict:
@@ -139,19 +157,16 @@ def _scan_traversal_core(text: str) -> bool:
         tokens = target.split()
         if not tokens:
             continue
-        # The executable itself can also be a drive-letter absolute path
-        # (C:\tools\script.cmd ...) and must not bypass the screen. A bare
-        # leading slash as the first token stays exempt: it is cmd.exe
+        # A drive-letter path as the executable (C:\tools\script.cmd) must
+        # not bypass the screen; a bare leading slash stays exempt as cmd.exe
         # switch syntax (findstr /C:"...", dir /s /b), not a path.
         if _ABSOLUTE_WIN_RE.search(tokens[0]):
             return True
         if len(tokens) > 1:
             args_stripped = " ".join(tokens[1:])
-            # Windows absolute paths are drive-letter rooted (C:\...), so
-            # they are caught by _ABSOLUTE_WIN_RE above. A bare leading
-            # slash on Windows is cmd.exe switch syntax (findstr /C:"...",
-            # dir /s /b) and must not be mistaken for a POSIX absolute
-            # path; only POSIX shells resolve /etc/passwd style paths.
+            # Windows absolute paths are drive-letter rooted (caught above);
+            # a bare leading slash is cmd.exe switch syntax (findstr /C:"...",
+            # dir /s /b), not a POSIX path — only POSIX shells resolve /etc/passwd.
             if _ABSOLUTE_WIN_RE.search(args_stripped):
                 return True
             if os.name != "nt":
@@ -183,6 +198,7 @@ class LocalSandbox(Sandbox):
     """Runs commands in a scratch directory on the host."""
 
     def __init__(self, workspace_root: str | None = None) -> None:
+        warn_host_sandbox_risk()
         self._root = workspace_root
         self._owns_root = workspace_root is None
         self.changed: set[str] = set()  # paths written this session
@@ -208,8 +224,10 @@ class LocalSandbox(Sandbox):
             if commit:
                 if not self._is_safe_commit(str(commit)):
                     raise SandboxError(f"base_commit rejected: {commit!r}")
+                # Trailing "--" ends option parsing after the revision;
+                # is_safe_commit already refuses leading-dash values.
                 result = self._exec_no_shell(
-                    ["git", "checkout", str(commit)], timeout=60
+                    ["git", "checkout", str(commit), "--"], timeout=60
                 )
                 if result.exit_code != 0:
                     raise SandboxError(
@@ -397,10 +415,9 @@ class LocalSandbox(Sandbox):
             # Reject symlink target.
             if os.path.islink(full) or os.path.islink(parent):
                 raise SandboxError(f"path escapes sandbox workspace: {path}")
-        # Atomic tmp+replace with a unique temp name: a predictable
-        # "<file>.tmp" path is a check-then-open race an attacker can win
-        # by planting a file (or winning the replace) between the symlink
-        # check and the open.
+        # Atomic tmp+replace with a unique temp name: a predictable "<file>.tmp"
+        # is a check-then-open race (plant a file or win the replace between
+        # the symlink check and the open).
         import tempfile as _tempfile
 
         def _atomic_write(tmp_path: str) -> None:
@@ -483,9 +500,27 @@ class LocalSandbox(Sandbox):
                 except OSError:
                     pass
                 raise
+            fd = None
             try:
-                with open(full, "w", encoding="utf-8", newline="\n") as handle:
+                # No-follow open where the platform supports it; verify the
+                # opened inode matches the path so a final-component symlink
+                # planted between the check and the open cannot redirect it.
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(full, flags, 0o600)
+                opened = os.fstat(fd)
+                target = os.lstat(full)
+                if (opened.st_dev, opened.st_ino) != (target.st_dev, target.st_ino):
+                    raise SandboxError(f"path escapes sandbox workspace: {path}")
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    fd = -1  # fdopen owns the descriptor from here
                     handle.write(content)
+            except SandboxError:
+                try:
+                    if tmp and os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                raise
             except OSError as exc:
                 # Remove the staged temp before surfacing: a failed direct
                 # write must not leave litter in the workspace.
@@ -495,6 +530,12 @@ class LocalSandbox(Sandbox):
                 except OSError:
                     pass
                 raise SandboxError(str(exc)) from exc
+            finally:
+                if fd is not None and fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
             try:
                 if tmp and os.path.exists(tmp):
                     os.remove(tmp)

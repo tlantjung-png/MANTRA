@@ -23,6 +23,8 @@ from core.tools._htmltext import html_to_text as _shared_html_to_text
 _MAX_TEXT_BYTES = 500_000
 _MAX_TEXT_CHARS = 80_000
 _MAX_RESULTS = 50
+_SHELL_META_RE = re.compile(r"[;&|`$()<>]")
+_DRIVE_PREFIX_RE = re.compile(r"^[a-zA-Z]:[\\/]")
 
 EXTRACTABLE_MIME_HINTS = {
     ".htm": "html",
@@ -149,6 +151,16 @@ class ExtractDocumentTool(Tool):
         # Only the literal-path case is supported; globs are refused here.
         if any(c in path for c in ("*", "?", "[")):
             return "ERROR: extract_document does not support globs in this sandbox"
+        # The direct-view branch confines with realpath; the shell branch
+        # must refuse the same shapes itself, since the shell resolves ".."
+        # and absolute paths relative to its own working directory.
+        norm = path.replace("\\", "/")
+        if any(part == ".." for part in norm.split("/")):
+            return "ERROR: path escapes workspace"
+        if path.startswith("/") or _DRIVE_PREFIX_RE.match(path):
+            return "ERROR: path escapes workspace"
+        if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
+            return "ERROR: path contains unsupported characters for shell extraction"
         quoted = shlex.quote(path)
         res = sandbox.exec(f"test -f {quoted} && wc -c < {quoted}")
         if res.exit_code != 0:

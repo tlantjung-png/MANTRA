@@ -77,11 +77,9 @@ class CompletionPopupTest(_SurfaceTest):
     """The ``/`` and ``@`` dropdown: geometry, dismissal and the wheel."""
 
     def test_esc_dismisses_popup_and_wheel_scrolls_afterwards(self):
-        # Regression: the app-level ESC handler returned before the
-        # composer ever saw the key, so a '/'-completion popup could not
-        # be dismissed and its rect kept swallowing wheel events over
-        # the conversation. ESC must close the popup, and wheeling must
-        # scroll the transcript again afterwards.
+        # Regression: the app-level ESC handler swallowed the key before
+        # the composer, so a '/' popup stayed open and kept eating wheel
+        # events. ESC must close it and wheeling must scroll again.
         from core.console import ConsoleCompleter
         from core.scripted import final_response
 
@@ -111,12 +109,9 @@ class CompletionPopupTest(_SurfaceTest):
         )
 
     def test_wheel_scrolls_the_transcript_while_a_popup_is_open(self):
-        # Regression: the completion dropdown is a tall floating box over
-        # the lower half of the conversation, and it used to claim every
-        # wheel event landing inside its rect. Typing "/" or "@" then left
-        # the transcript unscrollable near the prompt - where the mouse
-        # usually sits. The wheel belongs to the conversation; the list is
-        # paged by keyboard or by clicking it.
+        # Regression: the dropdown used to claim every wheel inside its
+        # rect, leaving the transcript unscrollable near the prompt. The
+        # wheel belongs to the conversation; the list pages by key or click.
         from core.console import ConsoleCompleter
         from core.scripted import final_response
 
@@ -190,10 +185,9 @@ class CompletionPopupTest(_SurfaceTest):
         self.assertEqual(app.composer.buffer, "@notes.md")
 
     def test_completion_popup_grows_with_the_terminal_and_hangs_off_the_token(self):
-        # The dropdown used to be a fixed-size box centred on the screen.
-        # It now anchors on the token being completed and its window
-        # adapts to the viewport (a taller terminal shows more of the
-        # list), while still stopping clear of the status line.
+        # The dropdown anchors on the token being completed and grows with
+        # the viewport (a taller terminal shows more items), stopping one
+        # row clear of the status line.
         from core.scripted import final_response
 
         heights = {}
@@ -264,10 +258,9 @@ class WheelRoutingTest(_SurfaceTest):
     """Where a wheel notch goes: conversation, prompt, card, or scrollbar."""
 
     def test_wheel_over_single_line_composer_scrolls_transcript(self):
-        # Regression: the composer row swallowed wheel events, and for a
-        # single-line prompt scroll_by is a no-op - so wheeling near the
-        # bottom of the window (where the prompt box sits) did nothing.
-        # The composer only claims the wheel while it is multi-line.
+        # Regression: the composer row swallowed wheel events; for a
+        # single-line prompt that is a no-op, so wheeling near the bottom
+        # did nothing. The composer claims the wheel only when multi-line.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(60):
@@ -286,9 +279,8 @@ class WheelRoutingTest(_SurfaceTest):
 
     def test_wheel_over_multiline_composer_scrolls_transcript(self):
         # The wheel always scrolls the conversation, even over a multi-line
-        # prompt box: routing notches into the composer made the box
-        # swallow the wheel, so the operator could not scroll the
-        # transcript from the lower half of the window.
+        # prompt box; routing notches into the composer used to swallow
+        # them and block scrolling from the lower half of the window.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(60):
@@ -428,10 +420,9 @@ class WheelRoutingTest(_SurfaceTest):
         self.assertGreater(app.transcript.scrolled, before)
 
     def test_wheel_over_a_slash_popup_scrolls_the_conversation(self):
-        # Regression: with a completion dropdown open (the state right
-        # after typing "/" or "@"), the wheel must still scroll the
-        # conversation - the dropdown is a shortcut, never a scroll
-        # target, wherever the pointer sits.
+        # With a completion dropdown open (just after typing "/" or "@"),
+        # the wheel must still scroll the conversation: the dropdown is a
+        # shortcut, never a scroll target.
         app, session, backend = _make_app([])
         app.composer.completer = _FakeCompleter()
         with app.lock:
@@ -454,10 +445,9 @@ class WheelRoutingTest(_SurfaceTest):
             )
 
     def test_wheel_on_the_scrollbar_drags_the_thumb_one_step(self):
-        # The bar is a drag target, not just a readout: a notch on its own
-        # column moves the view by exactly one thumb-step (the inverse of
-        # the render mapping), while a notch one column to the left keeps
-        # the conversation's page-sized step.
+        # The bar is a drag target: a notch on its column moves one
+        # thumb-step (the inverse of the render mapping); a notch one
+        # column left keeps the conversation's page-sized step.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(2000):
@@ -607,9 +597,8 @@ class WheelRoutingTest(_SurfaceTest):
 
     def test_wheel_over_composer_scrolls_the_transcript(self):
         # The wheel always scrolls the conversation, even over a long
-        # multi-line prompt box: routing notches into the composer made
-        # the box swallow the wheel, so the operator could not scroll the
-        # transcript from the lower half of the window.
+        # multi-line prompt box; routing notches into the composer used to
+        # swallow them and block scrolling from the lower half of the window.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(200):
@@ -641,7 +630,10 @@ class WheelRoutingTest(_SurfaceTest):
         import core.tui.app as app_module
 
         app, session, backend = _make_app([])
-        trace = os.path.join(self.tmp if hasattr(self, "tmp") else tempfile.mkdtemp(), "trace.log")
+        trace_dir = self.tmp if hasattr(self, "tmp") else tempfile.mkdtemp()
+        if not hasattr(self, "tmp"):
+            self.addCleanup(shutil.rmtree, trace_dir, True)
+        trace = os.path.join(trace_dir, "trace.log")
         original = app_module._INPUT_DEBUG_PATH
         app_module._INPUT_DEBUG_PATH = trace
         try:
@@ -698,10 +690,9 @@ class WheelRoutingTest(_SurfaceTest):
         self.assertEqual(app.transcript.offset, offset_before, "drag without press still scrolled")
 
     def test_scrollbar_track_click_pages_toward_the_press(self):
-        # Clicking the bare track pages one viewport toward the click,
-        # clamped at the ends; clicking the thumb itself does not page.
-        # Enough content that one page (~viewport rows) cannot reach
-        # either end of the pool.
+        # A click on the bare track pages one viewport toward it (clamped);
+        # clicking the thumb does not. Enough content is loaded that one
+        # page cannot reach either end of the pool.
         app, session, backend = _make_app([])
         with app.lock:
             for i in range(600):
@@ -974,10 +965,9 @@ class SmallTerminalTest(_SurfaceTest):
 
 class ComposerColumnTest(unittest.TestCase):
     def test_column_for_agrees_with_the_rendered_caret(self):
-        # ``column_for`` is what anchors the completion popup on the token
-        # being completed, so it must map a buffer offset onto exactly the
-        # cell ``render`` puts it in - across short buffers, buffers that
-        # slide sideways, wide characters and multi-line prompts.
+        # ``column_for`` anchors the popup on the token, so it must map an
+        # offset to the cell ``render`` uses: across short and sliding
+        # buffers, wide characters and multi-line prompts.
         samples = [
             ("", 0),
             ("@fi", 3),

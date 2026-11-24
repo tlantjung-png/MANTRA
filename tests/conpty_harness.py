@@ -478,12 +478,9 @@ class _ConsoleSession:
 
     def close(self) -> None:
         self._alive = False
-        # Reap the child before destroying the session: closing a
-        # console while its client is still attached can deadlock. Wait
-        # briefly for exit, force-terminate a stuck client, then release
-        # the process and thread handles so no zombie or open handle
-        # outlives the harness. Idempotent: close_all() may call this
-        # again, and the second pass must not re-close stale handles.
+        # Reap the child before closing the console (a still-attached
+        # client can deadlock): wait briefly, force-kill if stuck, then
+        # release handles. Idempotent so close_all() can call this again.
         if self._hprocess:
             if k32.WaitForSingleObject(self._hprocess, 5000) == 0x102:  # WAIT_TIMEOUT
                 k32.TerminateProcess(self._hprocess, 1)

@@ -23,6 +23,16 @@ from core.mcp import protocol
 from core.types import Sandbox
 from core.types import Tool
 
+# Keep one tool result from becoming one unbounded protocol line.
+_MAX_OBSERVATION_CHARS = 100_000
+
+
+def _bounded(text: str, cap: int = _MAX_OBSERVATION_CHARS) -> str:
+    """Truncate an observation with a visible note before serializing it."""
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "\n... [truncated: observation exceeded the size cap]"
+
 
 class MCPServer:
     """A minimal MCP server over one tool mapping and one sandbox."""
@@ -147,9 +157,9 @@ class MCPServer:
             self._note(f"tool {name!r} raised: {exc}")
             return protocol.result(
                 message_id,
-                protocol.tool_result(f"tool {name!r} failed: {exc}", is_error=True),
+                protocol.tool_result(_bounded(f"tool {name!r} failed: {exc}"), is_error=True),
             )
-        return protocol.result(message_id, protocol.tool_result(str(observation)))
+        return protocol.result(message_id, protocol.tool_result(_bounded(str(observation))))
 
     def _allowed(self, name: str, arguments: dict[str, Any]) -> bool:
         if self.approvals is None:
@@ -167,20 +177,41 @@ class MCPServer:
         """Read messages until EOF, answering each request.
 
         A malformed line is reported and the stream continues: one bad
-        message must not take the server down.
+        message must not take the server down. Physical reads are capped so
+        a peer cannot force an unbounded allocation with one huge line.
         """
-        for raw in reader:
-            line = raw.strip()
-            if not line:
+        if not hasattr(reader, "readline"):
+            for raw in reader:
+                self._handle_line(raw, writer)
+            return
+        while True:
+            raw = reader.readline(protocol.MAX_LINE_CHARS + 1)
+            if not raw:
+                break
+            if len(raw) > protocol.MAX_LINE_CHARS and not raw.endswith("\n"):
+                # Drain the remainder in bounded chunks, then report the
+                # oversized line instead of parsing a truncated message.
+                while raw and not raw.endswith("\n"):
+                    raw = reader.readline(protocol.MAX_LINE_CHARS + 1)
+                self._write(
+                    writer,
+                    protocol.error(None, protocol.INVALID_REQUEST, "line too long"),
+                )
                 continue
-            try:
-                message = protocol.loads(line)
-            except protocol.ProtocolError as exc:
-                self._write(writer, protocol.error(None, exc.code, exc.message))
-                continue
-            response = self.handle(message)
-            if response is not None:
-                self._write(writer, response)
+            self._handle_line(raw, writer)
+
+    def _handle_line(self, raw: str, writer: IO[str]) -> None:
+        line = raw.strip()
+        if not line:
+            return
+        try:
+            message = protocol.loads(line)
+        except protocol.ProtocolError as exc:
+            self._write(writer, protocol.error(None, exc.code, exc.message))
+            return
+        response = self.handle(message)
+        if response is not None:
+            self._write(writer, response)
 
     def _write(self, writer: IO[str], message: dict[str, Any]) -> None:
         try:

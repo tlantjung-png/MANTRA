@@ -45,11 +45,9 @@ class DockerSandbox(Sandbox):
     def setup(self, task: dict) -> None:
         self._container_id = f"mantra-{uuid.uuid4().hex[:12]}"
         network = "--network none" if not self.network_enabled_for_lifetime else ""
-        # Detached container kept alive with `sleep infinity` so later
-        # docker exec calls have a running target. Hardened: pids-limit
-        # bounds runaway processes, cap-drop ALL and no-new-privileges
-        # shrink the root-user attack surface, and a non-root --user keeps
-        # the container from operating as root at all.
+        # Detached container kept alive with sleep infinity so docker exec
+        # has a target. Hardened: pids-limit bounds runaway processes;
+        # cap-drop ALL, no-new-privileges and non-root --user limit root access.
         completed = self._run_cli(
             [
                 "docker",
@@ -101,8 +99,10 @@ class DockerSandbox(Sandbox):
                     commit_str = str(commit)
                     if not self._is_safe_commit(commit_str):
                         raise SandboxError(f"base_commit rejected: {commit_str!r}")
+                    # Trailing "--" ends option parsing after the revision,
+                    # so a value cannot be reinterpreted as a checkout option.
                     if self._exec_no_shell(
-                        ["git", "checkout", commit_str], timeout=60
+                        ["git", "checkout", commit_str, "--"], timeout=60
                     ).exit_code != 0:
                         raise SandboxError(f"git checkout failed for {commit_str}")
 
@@ -133,10 +133,9 @@ class DockerSandbox(Sandbox):
                 ["docker", "exec", self._container_id, "sh", "-lc", command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                # Same process-group isolation the host sandbox uses: the
-                # CLI client and anything it spawns die together, while
-                # in-container processes are reaped separately by
-                # _kill_container_children.
+                # Same process-group isolation as the host sandbox: the CLI
+                # client and its spawns die together; in-container processes
+                # are reaped separately by _kill_container_children.
                 **_POPEN_GROUP_KWARGS,
             )
         except OSError as exc:
@@ -209,15 +208,18 @@ class DockerSandbox(Sandbox):
     def _is_safe_path(self, path: str) -> bool:
         if not path or "\x00" in path or "\n" in path or "\r" in path or ":" in path:
             return False
-        # Validate fully joined container path. Container paths are POSIX
-        # paths regardless of the host OS, so posixpath is used throughout:
-        # os.path on a Windows host would treat "/workspace" as relative
-        # and normalise with backslashes.
+        # Validate the fully joined path with posixpath throughout: container
+        # paths are POSIX even on a Windows host, where os.path would treat
+        # "/workspace" as relative and normalise with backslashes.
         import posixpath
 
         joined = path if posixpath.isabs(path) else posixpath.join(self.workdir, path)
         normalized = posixpath.normpath(joined.replace("\\", "/"))
-        wd = self.workdir.rstrip("/")
+        # Build the base from a normalized workdir. An empty base (the "/"
+        # case) made every absolute path look contained, so refuse it.
+        wd = posixpath.normpath(self.workdir).rstrip("/")
+        if not wd:
+            return False
         if normalized == wd or normalized.startswith(wd + "/"):
             if ".." in normalized.split("/"):
                 return False
@@ -243,10 +245,9 @@ class DockerSandbox(Sandbox):
     def read_file(self, path: str) -> str:
         if not self._is_safe_path(path):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
-        # Resolve and read in a single exec so a symlink cannot be swapped
-        # between a separate readlink round-trip and the read. The shell
-        # re-validates that the resolved target stays inside the workdir
-        # before cat'ing it; exit 9 means the resolved path escaped.
+        # Resolve and read in one exec so a symlink cannot be swapped between
+        # a readlink round-trip and the read; the shell re-validates containment
+        # before cat'ing (exit 9 means the resolved path escaped).
         import posixpath
 
         joined = path if posixpath.isabs(path) else posixpath.join(self.workdir, path)
@@ -478,6 +479,10 @@ class DockerSandbox(Sandbox):
         norm = posixpath.normpath(w)
         if norm != w:
             raise ValueError(f"workdir must be normalized, got {wd!r} expected {norm!r}")
+        # The filesystem root strips to an empty base in _is_safe_path,
+        # which would disable confinement for every absolute path.
+        if not w.rstrip("/"):
+            raise ValueError(f"workdir must not be the filesystem root, got {wd!r}")
         return w
 
     @staticmethod

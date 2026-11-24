@@ -89,9 +89,8 @@ class _StructureExtractor(HTMLParser):
 
     def close(self) -> None:
         super().close()
-        # Inline <style> blocks are skipped by _SKIP, so count them from
-        # the raw source as a cheap proxy for inline CSS.
-        # (handled in _parse_structure via counting start tags separately)
+        # Inline <style> blocks are skipped by _SKIP, so _parse_structure
+        # counts raw "<style" occurrences as a cheap inline-CSS proxy.
 
 
 def _parse_structure(html: str) -> StructureData:

@@ -19,6 +19,7 @@ silently regress:
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import tempfile
@@ -43,11 +44,15 @@ from core.types import Tool
 
 
 def _workspace() -> str:
-    return tempfile.mkdtemp(prefix="mantra-round2-")
+    path = tempfile.mkdtemp(prefix="mantra-round2-")
+    atexit.register(shutil.rmtree, path, True)
+    return path
 
 
 def _logger() -> JsonlLogger:
-    return JsonlLogger(os.path.join(tempfile.mkdtemp(prefix="mantra-log-"), "run.jsonl"))
+    path = tempfile.mkdtemp(prefix="mantra-log-")
+    atexit.register(shutil.rmtree, path, True)
+    return JsonlLogger(os.path.join(path, "run.jsonl"))
 
 
 class _BoomTool(Tool):

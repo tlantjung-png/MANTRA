@@ -79,7 +79,9 @@ def parse_ansi_spans(text: str, table: StyleTable) -> list[tuple[str, int]]:
         flush()
         i = m.end()
         body, final = m.group(1) or "", m.group(2) or "m"
-        if final != "m":
+        if m.group(1) is None or final != "m":
+            # OSC (and other non-CSI) matches have no parameter groups;
+            # they must not masquerade as an SGR reset.
             continue
         parts = body.split(";") if body else [""]
         j = 0
@@ -146,7 +148,9 @@ class Buffer:
         """Write text at (x, y); returns the ending column (clipped)."""
         if not 0 <= y < self.rows:
             return x
-        limit = self.cols if max_width is None else min(self.cols, x + max_width)
+        # max_width is an absolute column bound, matching set_spans' own
+        # stop check; callers pass the full column count.
+        limit = self.cols if max_width is None else min(self.cols, max_width)
         cx = x
         # Per-scan ZWJ state so a ZWJ sequence inside this text is counted
         # as one grapheme without leaking into other set_str calls.
@@ -200,6 +204,10 @@ class Renderer:
 
     def set_cursor(self, x: int, y: int) -> None:
         self._cursor = (x, y)
+
+    def reset_cursor(self) -> None:
+        """Drop a cursor placed by an earlier frame (modals hide it)."""
+        self._cursor = None
 
     def force_full_repaint(self) -> None:
         self._front_chars = []

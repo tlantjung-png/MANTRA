@@ -77,8 +77,8 @@ class MidStreamDropTest(unittest.TestCase):
 
         with self.assertRaises(LLMError) as ctx:
             self._run(client, times_out_after_output)
-        # A silent reasoning stretch is recoverable: the loop nudges and
-        # bumps the budget instead of failing the turn.
+        # A read timeout after output is retryable: the loop nudges and
+        # bumps the budget rather than failing the turn.
         self.assertTrue(getattr(ctx.exception, "retryable_truncation", False))
         self.assertIn("read timeout", str(ctx.exception))
 

@@ -16,13 +16,14 @@ from core.term import _WidthScanner, _char_width
 
 # Word-wrap for styled text: escape sequences carry no width, are never
 # split, and open SGR codes are re-emitted on continuation rows. Wide
-# (CJK) characters count double.
-_ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
+# (CJK) characters count double. OSC runs are matched whole too, so their
+# payload cannot survive ingest as printable transcript text.
+_ANSI_RE = re.compile(
+    r"\033\[[0-9;?]*[ -/]*[@-~]|\033\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+)
 
-# Bare C0/C1 controls (ESC c, BEL, BS, C1 CSI bytes, ...) can reset or
-# corrupt the terminal frame. \n is handled by line-splitting at ingest;
-# \t is expanded to spaces here so a tab stop can never reach the
-# terminal.
+# Bare C0/C1 controls can corrupt the frame. Newlines are split at
+# ingest; tabs expand to spaces here so no tab stop reaches the terminal.
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]")
 
 
@@ -46,7 +47,9 @@ def sanitize_ingest(text: str) -> str:
         ch = text[i]
         if ch == "\x1b":
             m = _ANSI_RE.match(text, i)
-            if m and m.group(0).endswith("m"):
+            # Only CSI ... m is a style code; an OSC payload that happens
+            # to end in "m" must still be dropped with its whole body.
+            if m and m.group(0).startswith("\x1b[") and m.group(0).endswith("m"):
                 out.append(m.group(0))  # SGR: kept whole
                 i = m.end()
             else:
@@ -232,8 +235,12 @@ class Transcript:
                 cut = _PARTIAL_CAP
                 for match in _ANSI_RE.finditer(tail[:cut + 32]):
                     if match.start() < cut < match.end():
-                        cut = match.start()
+                        # Back up before a straddling escape, but never to
+                        # zero: an escape at offset zero would append an
+                        # empty chunk and leave the loop spinning forever.
+                        cut = max(1, match.start())
                         break
+                cut = max(1, min(cut, len(tail) - 1))  # re-check: always consume
                 parts.append(tail[:cut])
                 tail = tail[cut:]
             self.partial = tail

@@ -126,10 +126,8 @@ def test_newest_unanswered_assistant_not_evicted() -> None:
 
 # ── the rolling digest ────────────────────────────────────────────────────
 #
-# Eviction used to be lossy: a dropped turn was gone. The manager now
-# detaches evicted turns into a pending queue and keeps a rolling digest of
-# the ones already folded away, so the loss can be repaired by whoever owns
-# the model client.
+# Evicted turns go to a pending queue with a rolling digest of the ones
+# already folded away, so the model client's owner can repair the loss.
 
 def test_evicted_turns_are_retained_not_dropped():
     ctx = ContextManager(max_messages=8, max_chars=100000)

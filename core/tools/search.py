@@ -169,12 +169,9 @@ class SearchCodeTool(Tool):
             return "ERROR: query too long"
         root = getattr(sandbox, "root", None)
         if root is None:
-            # Fall back to shell grep for sandboxes without a file view.
-            # -F keeps the query a literal substring instead of a regex;
-            # -- ends option parsing so a dash-prefixed query is never
-            # read as a flag. --exclude-dir flags must precede the --
-            # terminator to stay options; they mirror the walk's fixed
-            # skip set.
+            # Shell grep fallback for sandboxes without a file view. -F
+            # keeps the query literal; -- stops dash-prefixed queries being
+            # read as flags, so --exclude-dir must precede it.
             quoted = shlex.quote(query)
             skip_flags = " ".join(f"--exclude-dir={d}" for d in sorted(_SKIP_DIRS))
             result = sandbox.exec(f"grep -Frn {skip_flags} -- {quoted} .")

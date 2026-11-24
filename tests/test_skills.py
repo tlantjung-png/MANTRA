@@ -107,6 +107,9 @@ class SkillsFixtureTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        prior = os.environ.get(skills._OVERRIDE_ENV)
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, skills._OVERRIDE_ENV, prior)
         self.addCleanup(os.environ.pop, skills._OVERRIDE_ENV, None)
         self.root = os.path.join(self.tmp, "skills")
         os.environ[skills._OVERRIDE_ENV] = self.root
@@ -219,6 +222,9 @@ class CommandTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         for var in ("MANTRA_SETTINGS", skills._OVERRIDE_ENV):
+            prior = os.environ.get(var)
+            if prior is not None:
+                self.addCleanup(os.environ.setdefault, var, prior)
             self.addCleanup(os.environ.pop, var, None)
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
         self.root = os.path.join(self.tmp, "skills")
@@ -545,6 +551,9 @@ class AutoRouteTest(SkillsFixtureTest):
     def setUp(self):
         super().setUp()
         for var in ("MANTRA_SETTINGS",):
+            prior = os.environ.get(var)
+            if prior is not None:
+                self.addCleanup(os.environ.setdefault, var, prior)
             self.addCleanup(os.environ.pop, var, None)
         self.settings_file = os.path.join(self.tmp, "config.json")
         os.environ["MANTRA_SETTINGS"] = self.settings_file
@@ -658,6 +667,9 @@ class AutoCommandTest(SkillsFixtureTest):
 
     def setUp(self):
         super().setUp()
+        prior = os.environ.get("MANTRA_SETTINGS")
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, "MANTRA_SETTINGS", prior)
         self.addCleanup(os.environ.pop, "MANTRA_SETTINGS", None)
         os.environ["MANTRA_SETTINGS"] = os.path.join(self.tmp, "config.json")
         from core.config import merge_defaults
@@ -732,6 +744,9 @@ class RootDiscoveryTest(unittest.TestCase):
     """
 
     def setUp(self):
+        prior = os.environ.get(skills._OVERRIDE_ENV)
+        if prior is not None:
+            self.addCleanup(os.environ.setdefault, skills._OVERRIDE_ENV, prior)
         self.addCleanup(os.environ.pop, skills._OVERRIDE_ENV, None)
 
     @mock.patch.object(skills.Path, "home")

@@ -89,9 +89,8 @@ def _redact_model_line_keys(text: str) -> str:
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATION_INTERVAL = 0.08
 
-# Minimum time a tool activity word stays visible before a fresh
-# Channeling (next chat) may replace it. Tool execution is usually
-# faster than a glance; the hold stops the words from flickering away.
+# Minimum time a tool activity word stays visible before the next chat
+# label may replace it; without the hold fast tools never read.
 _ACTIVITY_MIN_HOLD = 1.0
 
 
@@ -320,6 +319,7 @@ class TuiApp:
         # Turn-scoped context kept for turn teardown bookkeeping.
         self._turn_user_prompt = ""
         self._turn_tool_text: list[str] = []
+        self._last_turn_tool_text: list[str] = []  # drained under lock at turn end
         self._turn_pending = False
         self._turn_was_command = False
         self._turn_had_error = False
@@ -369,7 +369,8 @@ class TuiApp:
 
         self.overlay: Any = None          # menu / question / line prompt
         self._overlay_reply: queue.Queue | None = None
-        self._overlay_lock = threading.Lock()  # serialize concurrent prompts
+        self._overlay_lock = threading.Lock()  # guards the overlay/reply slot
+        self._prompt_gate = threading.Lock()   # one blocking prompt at a time
         self._composer_press = False  # a press started inside the prompt box
         self.queued = ""                  # prompt submitted mid-turn
         self._last_ctrl_c = 0.0
@@ -419,9 +420,9 @@ class TuiApp:
         self.transcript.set_width(cols)
 
     def stop(self) -> None:
-        # A dedicated flag, not `running`: the KeyboardInterrupt handlers
-        # clear `running` before `stop()` runs, so gating on it would skip
-        # backend.stop() and leave the terminal in raw mode forever.
+        # Use a dedicated flag, not `running`: interrupt handlers clear
+        # `running` first, which would skip backend.stop() and leave raw
+        # mode on.
         if self._stopped:
             return
         self._stopped = True
@@ -429,10 +430,9 @@ class TuiApp:
         # A worker blocked in ask_line/ask_approval/choose/confirm must not
         # hang forever once the app stops: wake it with a None sentinel
         # (the helpers already treat None as cancelled/empty).
-        reply = self._overlay_reply
+        reply = self._take_overlay_reply()
         if reply is not None:
             reply.put(None)
-            self._overlay_reply = None
         time.sleep(0.05)
         self.backend.stop()
 
@@ -443,11 +443,8 @@ class TuiApp:
             self.transcript.append_partial(text)
         # First real content replaces the centered welcome card.
         self._welcome_card = False
-        # Output arriving while scrolled away: pulse the chip so the
-        # operator sees the transcript growing underneath them, not
-        # just when the turn ends. Throttled: a fast token stream
-        # re-arms at most once per CHIP_PULSE_THROTTLE seconds, so the
-        # accent blinks rather than burning solid-on all turn.
+        # Output while detached pulses the chip; throttle so a fast token
+        # stream blinks instead of holding the accent on all turn.
         now = time.monotonic()
         if self.transcript.scrolled > 0 and now - self._chip_last_pulse >= CHIP_PULSE_THROTTLE:
             self._chip_last_pulse = now
@@ -485,6 +482,13 @@ class TuiApp:
         self._toast_until = time.monotonic() + seconds
         self.mark_dirty()
 
+    def take_turn_tool_text(self) -> list[str]:
+        """Drain the worker-thread tool evidence under the application lock."""
+        with self.lock:
+            collected = list(self._turn_tool_text)
+            self._turn_tool_text = []
+            return collected
+
     def run_detached(self, fn) -> None:
         threading.Thread(target=self._guard, args=(fn,), daemon=True).start()
 
@@ -503,18 +507,15 @@ class TuiApp:
         text = text.strip()
         if not text:
             return
-        # /model lines can carry an API key as the 2nd or 3rd positional
-        # argument; echo and history see the redacted form, but the
-        # actual command dispatched to the harness must keep the real key
-        # so the endpoint switch can store and use it.
+        # Echo and history see a redacted /model line, but the dispatched
+        # command keeps the real key so the endpoint switch can store it.
         display_text = _redact_model_line_keys(text) if text.startswith("/model") else text
-        if not self._history or self._history[-1] != display_text:
-            self._history.append(display_text)
-        self._history_idx = len(self._history)
-        # The busy check and the queue write are one critical section, so a
-        # prompt arriving while a turn's finally-block is ending is either
-        # seen as busy (queued) or as idle (started) — never both.
+        # History, recall index, busy check and queue write share one lock:
+        # submit is reachable from both the presenter and the turn worker.
         with self.lock:
+            if not self._history or self._history[-1] != display_text:
+                self._history.append(display_text)
+            self._history_idx = len(self._history)
             if self.busy:
                 self.queued = text
                 self.toast_message("queued — runs when the current turn ends")
@@ -534,14 +535,9 @@ class TuiApp:
         # (pinned by test_turn_end_does_not_yank_a_detached_scroll), so
         # submit never jumps — and never fades the chip either.
         stamp = time.strftime("%H:%M")
-        # The operator's own line must be scannable in a wall of tool
-        # output: timestamp on a subtle dark chip, the text in the accent
-        # colour (the same hue as the wordmark and spinner, so "what I
-        # typed" reads as one visual family). No "you" label: the chip
-        # already marks the line as the operator's, and the bare word
-        # reads as chatter in a wall of tool output. The same formatter
-        # renders the line when a session is resumed, so a loaded history
-        # looks like the conversation it saves.
+        # Timestamp on a dark chip plus accent text make the operator's
+        # line scannable among tool output; the same formatter renders
+        # resumed sessions so history looks like the saved conversation.
         self.feed_output(
             operator_line(self.session.style, display_text, stamp=stamp) + "\n"
         )
@@ -566,16 +562,16 @@ class TuiApp:
             self._turn_had_error = True
             self.feed_output(f"\033[38;5;167m  !! {exc}\033[0m\n")
         finally:
-            # Clear busy and take the queued prompt inside the same lock
-            # submit() checks, so the handoff between the two threads is
-            # atomic: a prompt submitted mid-teardown is either seen as
-            # busy (queued) or as idle (started a fresh turn) — never lost.
+            # Clear busy and take the queued prompt under submit()'s lock
+            # so the thread handoff is atomic: a prompt is queued or starts
+            # a fresh turn, never lost.
             with self.lock:
                 self.busy = False
                 self.activity = ""
                 self.activity_detail = ""
                 queued = self.queued
                 self.queued = ""
+                self._last_turn_tool_text = self.take_turn_tool_text()
             self.status_text = ""
             self.mark_dirty()
         if queued and self.running:
@@ -585,13 +581,21 @@ class TuiApp:
 
     # ── blocking interactive helpers (worker-thread side) ─────
 
-    def _prompt_with_overlay(self, overlay: Any) -> Any:
-        # Serialize prompts so concurrent callers cannot overwrite the
-        # shared reply slot and orphan the first waiter.
+    def _take_overlay_reply(self) -> queue.Queue | None:
+        """Detach the reply slot under the overlay lock."""
         with self._overlay_lock:
+            reply = self._overlay_reply
+            self._overlay_reply = None
+            return reply
+
+    def _prompt_with_overlay(self, overlay: Any) -> Any:
+        # The gate serializes whole prompts; the overlay lock guards only
+        # the shared slot, so a finisher can publish while the worker waits.
+        with self._prompt_gate:
             reply: queue.Queue = queue.Queue()
-            self.overlay = overlay
-            self._overlay_reply = reply
+            with self._overlay_lock:
+                self.overlay = overlay
+                self._overlay_reply = reply
             self.mark_dirty()
             return reply.get()
 
@@ -622,9 +626,10 @@ class TuiApp:
         )
 
     def _finish_overlay(self, value: Any) -> None:
-        self.overlay = None
-        reply = self._overlay_reply
-        self._overlay_reply = None
+        with self._overlay_lock:
+            self.overlay = None
+            reply = self._overlay_reply
+            self._overlay_reply = None
         if reply is not None:
             reply.put(value)
         self.mark_dirty()
@@ -712,10 +717,8 @@ class TuiApp:
 
     def handle_event(self, event) -> None:
         if _INPUT_DEBUG_PATH is not None:
-            # Opt-in ground truth for input-routing bugs: every event the
-            # backend hands the app, exactly as decoded, so a report like
-            # "the wheel scrolled the prompt box" can be told apart from
-            # "the wheel never arrived as a wheel event".
+            # Opt-in trace of every decoded event, for telling a routing
+            # bug from a decode bug in reports.
             try:
                 with open(_INPUT_DEBUG_PATH, "a", encoding="utf-8") as handle:
                     handle.write(f"{time.time():.3f} {event!r}\n")
@@ -800,10 +803,8 @@ class TuiApp:
                 self._abort_turn()
                 return
             if self.composer.popup_open:
-                # The completion popup owns ESC first: dismiss it here
-                # before the generic handlers claim the key, otherwise
-                # the popup can never be closed by ESC and keeps
-                # swallowing wheel events over its rect.
+                # The popup owns ESC first; dismiss it here or it can never
+                # close and keeps swallowing wheel events over its rect.
                 self.composer._dismissed = True
                 self.composer.completion = None
                 self._popup_rect = None
@@ -887,15 +888,23 @@ class TuiApp:
             self.mark_dirty()
             return
         if key == "enter" and not self.composer.buffer and not self.composer.popup_open:
-            # Empty enter pages through capped tool output, as before.
-            if self.session._pending_pages:
+            # Empty enter pages through capped tool output. The queue is
+            # written from the turn worker, so test it under the same lock
+            # page_next() takes instead of reading the list unlocked.
+            pager_lock = getattr(self.session, "_pager_lock", None)
+            if pager_lock is None:
+                has_pages = bool(getattr(self.session, "_pending_pages", None))
+            else:
+                with pager_lock:
+                    has_pages = bool(self.session._pending_pages)
+            if has_pages:
                 self.session.page_next()
                 self.mark_dirty()
             return
         if key == "ctrl+y":
             text = self._selection_text()
             if text:
-                copy_text(text)
+                copy_text(text, self.backend.write)
                 self.toast_message("copied")
             self.mark_dirty()
             return
@@ -920,20 +929,13 @@ class TuiApp:
         if ev.kind == "wheel":
             if self._overlay_takes_wheel(ev):
                 return
-            # The wheel always scrolls the conversation; the completion
-            # popup never claims it. That dropdown is a tall floating box
-            # over the lower half of the transcript, so letting it swallow
-            # wheel events left the conversation unscrollable whenever a
-            # "/" or "@" completion was open - which is most of the time
-            # while a path or command is being typed. The list is walked
-            # with the arrow keys, or paged by clicking an item / its
-            # "… more" row.
+            # Wheel never goes to the completion popup: it covers much of
+            # the transcript and would block scrolling while typing. Use
+            # arrows or click its rows to navigate the list instead.
             if self._wheel_over_scrollbar(ev):
                 return
-            # The wheel always scrolls the conversation, even over the
-            # prompt box: routing notches to a multi-line composer made the
-            # box swallow the wheel, so the operator could not scroll the
-            # transcript from the lower half of the window.
+            # Wheel scrolls the conversation even over the prompt box;
+            # giving notches to the composer blocked transcript scrolling.
             with self.lock:
                 # ~10 rows per notch: a full page overshot past the
                 # context around the target, three rows took forever.
@@ -1023,7 +1025,7 @@ class TuiApp:
                     ev.x, ev.y, self.row_at, self._text_at
                 )
                 if result and result[0]:
-                    copy_text(result[0])
+                    copy_text(result[0], self.backend.write)
                     n = len(result[0].splitlines())
                     self.toast_message(f"copied {n} line{'s' if n != 1 else ''}")
                 self.mark_dirty()
@@ -1219,16 +1221,16 @@ class TuiApp:
         buf = renderer.buffer
         cols, rows = buf.cols, buf.rows
         buf.reset()
+        # A cursor placed by a previous normal frame must not sit over a
+        # modal/minimal frame, none of which set one. Flush hides it.
+        renderer.reset_cursor()
         styles = renderer.styles
         hair_style = styles.id_for(STYLE_HAIR)
         select_style = styles.id_for(STYLE_SELECT)
 
-        # Below the minimum size the chrome cannot be laid out without
-        # overlapping itself (the info bar, the transcript, the popup and
-        # the prompt box all compete for the same few rows), so the frame
-        # degrades to a single line of guidance. An open modal is still
-        # drawn - clamped to the frame - so an approval waiting behind it
-        # is never lost.
+        # Below the minimum size the chrome overlaps; draw one guidance
+        # line, but still render an open modal so a pending prompt
+        # survives.
         if cols < MIN_COLS or rows < MIN_ROWS:
             self._render_minimal_frame(buf, styles, cols, rows)
             renderer.flush()
@@ -1271,11 +1273,9 @@ class TuiApp:
         first_display = visible[0][0] if visible else 0
         for i, (_idx, text) in enumerate(visible):
             buf.set_styled_line(0, content_top + i, text, styles, cols)
-        # Scrollbar on the right edge while the view is detached from
-        # the tail: hairline track with a bone-coloured thumb sized to
-        # the viewport's share of the pool (never smaller than one row).
-        # Thumb position follows convention: at the oldest content it
-        # rides the top of the track, toward the tail it slides down.
+        # Detached view: a hairline track on the right edge with a thumb
+        # sized to the viewport's share of the pool (at least one row),
+        # top for the oldest content, sliding down toward the tail.
         if scrolled > 0 and total_rows > height and height >= 4:
             track_x = cols - 1
             thumb_span = min(height, max(1, height * height // total_rows))
@@ -1303,18 +1303,9 @@ class TuiApp:
         else:
             self._scrollbar = None
 
-        # "↓ bottom" jump chip while the view is detached from the tail:
-        # one click re-follows the live output without wheeling down. A
-        # counter rides along ("+14") when output streamed in while
-        # detached, so the operator can see how far behind they are.
-        #
-        # Two timed states layered on top of the live chip:
-        #  - flash: output streamed in or a turn just finished while
-        #    detached — chip and count render in the accent colour for
-        #    CHIP_FLASH_SECONDS.
-        #  - fade: just returned to the tail — the chip (with the missed
-        #    count it had at jump time) lingers in faint style for
-        #    CHIP_FADE_SECONDS instead of vanishing instantly.
+        # The bottom-jump chip re-follows the tail in one click; a "+N" count
+        # shows growth while detached. Flash marks late output in accent;
+        # fade lingers the frozen chip after jumping back.
         now = time.monotonic()
         chip_flashing = now < self._chip_flash_until
         chip_fading = not chip_flashing and now < self._chip_fade_until
@@ -1408,13 +1399,8 @@ class TuiApp:
 
         # Completion popup above the border row.
         comp = self.composer
-        # Adaptive window: the dropdown grows with the viewport (a tall
-        # terminal shows more of the list than the composer's own
-        # preference) but never eats the conversation, and always leaves
-        # room for the box borders plus the two overflow rows
-        # ("… n above" / "… n more") above the status line. Under two item
-        # rows there is nothing worth drawing, so the dropdown is skipped
-        # rather than colliding with the info bar.
+        # Dropdown height tracks the viewport but leaves room for borders
+        # and the two overflow rows; skip it below two item rows.
         space = border_row - content_top - 4
         if comp.popup_open and space >= 2:
             max_rows = max(1, min(max(comp.max_popup, space // 2), space, _POPUP_ROWS_CAP))
@@ -1646,7 +1632,9 @@ class TuiApp:
     def _render_session_panel_frame(self, buf, styles, cols: int, rows: int) -> None:
         panel = self.session_panel
         frame = render_session_panel(panel, cols, rows)
-        panel.clamp(frame.total, max(1, rows - 2))
+        # Each entry renders two rows; clamp in entry units like the key
+        # handler, not in screen rows.
+        panel.clamp(frame.total, max(1, max(2, rows - 2) // 2))
         buf.set_styled_line(0, 0, _styled(frame.header[:cols], theme.BONE_BOLD), styles, cols)
         body_top = 1
         body_bottom = rows - 2
@@ -1709,9 +1697,8 @@ class TuiApp:
                 elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
             label = self.busy_label if elapsed >= 1 else "Channeling"
             if self.activity:
-                # The themed word for the current activity; the spinner
-                # frame and elapsed counter carry the motion, and the
-                # label stays short enough that the counter stays visible.
+                # Activity word supplies meaning; spinner and elapsed time
+                # supply motion, and the label stays short for the counter.
                 label = self.activity
                 if self.activity_detail:
                     label += f" · {self.activity_detail}"

@@ -61,12 +61,16 @@ def test_jsonl_rotation(tmp_path) -> None:
 
 
 def test_jsonl_close_idempotent(tmp_path) -> None:
-    logger = JsonlLogger(str(tmp_path / "run.jsonl"))
-    logger.log("evt", {})
+    path = tmp_path / "run.jsonl"
+    logger = JsonlLogger(str(path))
+    logger.log("evt", {"n": 1})
     logger.close()
     logger.close()  # must not raise
-    logger.log("evt2", {})  # reopens lazily; must not raise
+    logger.log("evt2", {"n": 2})  # reopens lazily; must not raise
     logger.close()
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [r["event"] for r in records] == ["evt", "evt2"]
+    assert [r["n"] for r in records] == [1, 2]
 
 
 def test_command_evaluator_passes_on_zero_exit() -> None:

@@ -15,9 +15,8 @@ import subprocess
 import threading
 
 # Spawn each child in its own process group/session so a timeout or abort
-# can kill the whole tree (grandchildren included), not just the direct
-# child — otherwise survivors keep the stdout/stderr pipes open and the
-# reader threads never see EOF.
+# kills the whole tree (grandchildren too); otherwise survivors keep the
+# pipes open and reader threads never see EOF.
 POPEN_GROUP_KWARGS: dict = {}
 if os.name == "nt":
     POPEN_GROUP_KWARGS["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

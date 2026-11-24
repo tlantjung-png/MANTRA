@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,7 @@ class D2KillTreeTest(unittest.TestCase):
         from core.tools.commands import KillShellTool
 
         prefix = tempfile.mkdtemp(prefix="mantra-fix-d2-")
+        self.addCleanup(shutil.rmtree, prefix, True)
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             cwd=prefix,
@@ -183,6 +185,7 @@ class D5EditBlocklistTest(unittest.TestCase):
         from core.tools.files import EditFileTool
 
         ws = tempfile.mkdtemp(prefix="mantra-fix-d5-")
+        self.addCleanup(shutil.rmtree, ws, True)
         sandbox = LocalSandbox(ws)
         sandbox.setup({})
         tool = EditFileTool()
@@ -199,6 +202,7 @@ class D5EditBlocklistTest(unittest.TestCase):
         from core.tools.ledger import EditLedger
 
         ws = tempfile.mkdtemp(prefix="mantra-fix-d5b-")
+        self.addCleanup(shutil.rmtree, ws, True)
         sandbox = LocalSandbox(ws)
         sandbox.setup({})
         tool = EditFileTool()
@@ -274,6 +278,7 @@ class D18FloatWindowTest(unittest.TestCase):
         from core.tools.files import ReadFileTool
 
         ws = tempfile.mkdtemp(prefix="mantra-fix-d18-")
+        self.addCleanup(shutil.rmtree, ws, True)
         sandbox = LocalSandbox(ws)
         sandbox.setup({})
         sandbox.write_file("a.txt", "line1\nline2\n")
@@ -288,6 +293,7 @@ class D18FloatWindowTest(unittest.TestCase):
         from core.tools.files import ReadFileTool
 
         ws = tempfile.mkdtemp(prefix="mantra-fix-d18b-")
+        self.addCleanup(shutil.rmtree, ws, True)
         sandbox = LocalSandbox(ws)
         sandbox.setup({})
         sandbox.write_file("a.txt", "l1\nl2\nl3\n")
@@ -333,6 +339,7 @@ class D24ByteBudgetResumeOffsetTest(unittest.TestCase):
         from core.tools.files import ReadFileTool
 
         ws = tempfile.mkdtemp(prefix="mantra-fix-d24-")
+        self.addCleanup(shutil.rmtree, ws, True)
         sandbox = LocalSandbox(ws)
         sandbox.setup({})
         content = "".join(
@@ -357,6 +364,7 @@ class D24ByteBudgetResumeOffsetTest(unittest.TestCase):
         from core.tools.files import ReadFileTool
 
         ws = tempfile.mkdtemp(prefix="mantra-fix-d24b-")
+        self.addCleanup(shutil.rmtree, ws, True)
         sandbox = LocalSandbox(ws)
         sandbox.setup({})
         content = "".join(

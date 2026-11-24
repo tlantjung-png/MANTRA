@@ -134,11 +134,29 @@ class SeamTest(_IsolatedSessionTest):
     def test_patched_menu_value_is_the_one_used(self):
         # A patched seam returning a name must drive the resume path,
         # proving the call goes through the console namespace at runtime.
-        with mock.patch.object(console, "_menu", return_value="no-such-session"):
+        import core.agent.sessions as sessions
+
+        sessions.save(
+            "demo",
+            {
+                "workspace": self.tmp,
+                "model": "test-model",
+                "summary": "seeded",
+                "totals": {},
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ],
+                "show_tool_output": True,
+                "pending_pages": [],
+            },
+        )
+        with mock.patch.object(console, "_menu", return_value="demo") as menu, \
+             mock.patch.object(self.session, "resume_session", return_value=True) as resume:
             chosen = self.session.pick_session()
-        # "no-such-session" does not exist, so resume reports failure -
-        # but only after the seam's return was actually used.
-        self.assertFalse(chosen)
+        menu.assert_called_once()
+        resume.assert_called_once_with("demo")
+        self.assertTrue(chosen)
 
 
 if __name__ == "__main__":

@@ -157,10 +157,9 @@ class FetchTest(unittest.TestCase):
         self.sandbox = LocalSandbox()
 
     def _fetch(self, response=None, side_effect=None, **kwargs):
-        # web_tools does `from urllib.request import urlopen`, so the name
-        # lives in that module. Patching urllib.request.urlopen would
-        # leave the real one bound here and every fetch would hit the
-        # network - which is how the first run of this file failed.
+        # The tool binds `urlopen` into its own module, so patch that name;
+        # patching urllib.request.urlopen leaves the live one bound and
+        # every fetch hits the network.
         target = "core.tools.web.urlopen"
         if side_effect is not None:
             patcher = mock.patch(target, side_effect=side_effect)

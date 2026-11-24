@@ -36,6 +36,38 @@ def _observation_ceiling(config: dict) -> int:
         return DEFAULT_MAX_CHARS
     return value
 
+
+def _close_mcp_clients(clients: list) -> None:
+    """Close every MCP client; a shutdown failure must not mask the outcome."""
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _closing_summary(result) -> str:
+    """One plain prose line: outcome, steps, detail and the next action."""
+    outcome = "passed" if result.passed else "failed"
+    steps = result.steps_used
+    step_word = "step" if steps == 1 else "steps"
+    detail = " ".join((result.evaluation_detail or "").split())
+    detail_bit = f" ({detail[:160]})" if detail else ""
+    reason = result.stopped_reason
+    if reason == "final":
+        nxt = "Next: review the result and any changes before continuing."
+    elif reason == "max_steps":
+        nxt = "Next: split the work into smaller requests or raise the step limit."
+    elif reason == "aborted":
+        nxt = "Next: re-run the task when you are ready."
+    else:
+        nxt = "Next: read the error above and retry a narrower task."
+    return (
+        f"Summary: the task {outcome} in {steps} {step_word} "
+        f"({reason}, {result.elapsed_seconds:.1f}s){detail_bit}. {nxt}"
+    )
+
+
 # Same ceiling the configuration loader applies: a task document is
 # operator-supplied but must not be read without a bound.
 _MAX_TASK_BYTES = 1_000_000
@@ -111,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         print("error: task file must contain 'problem_statement'", file=sys.stderr)
         return 2
 
+    mcp_clients: list = []
+    built = False
     try:
         llm = build_llm(config["llm"])
         sandbox = build_sandbox(config["sandbox"])
@@ -124,13 +158,24 @@ def main(argv: list[str] | None = None) -> int:
         tools.extend(mcp_tools)
         evaluator = build_evaluator(config["evaluator"])
         logger = build_logger(config["logging"])
+        built = True
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    finally:
+        # A later builder failure must not leave spawned servers running.
+        if not built:
+            _close_mcp_clients(mcp_clients)
     events = EventBus()
     events.subscribe(lambda name, payload: print(f"[{name}] {_brief(payload)}"))
 
-    approval_mode = config.get("approvals", "yolo")
+    approval_mode = config.get("approvals", "default")
+    if approval_mode == "yolo":
+        print(
+            "[approvals] warning: yolo mode auto-approves every tool call; "
+            "use it only in a trusted, disposable workspace",
+            file=sys.stderr,
+        )
     print(f"[approvals] headless policy: {approval_mode} "
           "(plan refuses mutations; default/auto refuse destructive commands "
           "and interpreter one-liners; yolo allows all)")
@@ -154,11 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = loop.run(task)
     finally:
-        for client in mcp_clients:
-            try:
-                client.close()
-            except Exception:
-                pass  # shutdown must not mask the run's outcome
+        _close_mcp_clients(mcp_clients)
         logger.close()  # flush and release the append handle
 
     verdict = "PASS" if result.passed else "FAIL"
@@ -168,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if result.evaluation_detail:
         print(result.evaluation_detail)
+    # Plain-language closing summary must be the last visible element.
+    print(_closing_summary(result))
     return 0 if result.passed else 1
 
 

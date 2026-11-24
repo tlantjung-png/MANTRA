@@ -199,10 +199,9 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertGreater(seen[0], len(context_copy), "the UI copy was reshaped too")
 
     def test_failure_tracking_still_sees_the_raw_error(self):
-        # The loop marks a call failed by a leading ERROR in the *raw*
-        # observation and blocks the third identical repeat off that mark.
-        # If reshaping ran first, a capped error line could silently
-        # disable repeat-blocking and the agent would spin on a bad call.
+        # Failure tracking reads a leading ERROR in the raw observation to
+        # block repeats. Reshaping first could cap that line, disable the
+        # block and leave the agent spinning on a bad call.
         app, session, _backend = _make_app([
             tool_call_response("read_file", {"path": "missing.py"}),
             tool_call_response("read_file", {"path": "missing.py"}),

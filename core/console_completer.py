@@ -125,11 +125,9 @@ class ConsoleCompleter:
             return self._complete_path(start, trim_end, trim_token[1:])
         if trim_token.startswith("@"):
             return self._complete_path(start, trim_end, trim_token[1:])
-        # Slash commands: allow leading whitespace and invisible chars, but only when the slash
-        # token is the first non-space token (so "hello /help" does not
-        # trigger, but "  /help" does). Strip trailing punctuation so
-        # "/help," still offers completions.
-        # Handle both normal and full-width slash, and be forgiving of invisible leading chars
+        # Slash completion fires only when the slash is the first token
+        # ("  /help" yes, "hello /help" no); normal and full-width slashes
+        # and trailing punctuation are accepted.
         slash_token = trim_token
         if slash_token.startswith("／") or slash_token.startswith("\uff0f"):
             slash_token = "/" + slash_token[1:]
@@ -201,8 +199,8 @@ class ConsoleCompleter:
         )
 
     def _complete_skills(self, buffer: str, start: int, cursor: int, token: str):
-        # EASY: /skills space [anything] → shows matching skills, filtered by name/type
-        # No other commands, no menu — just skills.
+        # Only the first /skills argument is completed: skills, filtered
+        # by name or description.
         prefix = buffer[:start]
         parts = prefix.strip().split()
         if not parts or parts[0] != "/skills":

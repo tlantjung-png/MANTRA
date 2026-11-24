@@ -32,10 +32,8 @@ WARN  = "38;5;214"        # warnings — amber
 LINK  = "38;5;75"         # links — sky blue (distinct from the accent)
 INFO  = "38;5;117"        # info values (model / endpoint in the top bar)
 
-# Diff text colours — no backgrounds. Removed lines run in a soft dusty
-# red and added lines in a soft sage green, so a before/after pane reads
-# clearly without any band or wash on the terminal. Aliases of the
-# semantic tones above, kept so a future split (e.g. brighter diff text)
-# changes in one place.
+# Diff text colours — no backgrounds; removed/added use soft dusty red and
+# sage green so before/after panes read clearly without a wash. Aliases of
+# the semantic tones above, kept so a future split changes one place.
 DIFF_REMOVE = EMBER  # soft dusty red
 DIFF_ADD    = SAGE   # soft sage green

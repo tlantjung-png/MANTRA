@@ -27,10 +27,14 @@ from typing import Any
 
 from core.agent.approvals import register_external_tool
 from core.mcp import protocol
+from core.procutil import POPEN_GROUP_KWARGS as _POPEN_GROUP_KWARGS
+from core.procutil import kill_process_tree as _kill_process_tree
 from core.types import Sandbox
 from core.types import Tool
 
 _STDERR_KEEP = 40
+# Bounds both the response queue and each physical line read from the pipes.
+MAX_QUEUED_LINES = 1000
 _NAME_SAFE = re.compile(r"[^a-z0-9_]+")
 
 
@@ -65,10 +69,16 @@ class MCPClient:
         if env:
             self._env.update({str(k): str(v) for k, v in env.items()})
         self._proc: subprocess.Popen[str] | None = None
-        self._lines: queue.Queue[str | None] = queue.Queue()
+        self._lines: queue.Queue[str | None] = queue.Queue(maxsize=MAX_QUEUED_LINES)
         self._stderr: list[str] = []
         self._next_id = 0
         self._closed = False
+        # One in-flight request at a time: a single waiter consumes the
+        # shared response queue, so overlapping calls would drop each
+        # other's replies. Set by the reader on an unbounded flood.
+        self._request_lock = threading.Lock()
+        self._overflow = threading.Event()
+        self._readers: list[threading.Thread] = []
 
     # ------------------------------------------------------------------ start
 
@@ -88,30 +98,60 @@ class MCPClient:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                **_POPEN_GROUP_KWARGS,
             )
         except OSError as exc:
             raise MCPError(f"cannot start MCP server {self.name!r}: {exc}") from exc
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+        # Keep handles to the readers so close() can join them after reaping.
+        self._readers = [
+            threading.Thread(target=self._read_stdout, daemon=True),
+            threading.Thread(target=self._read_stderr, daemon=True),
+        ]
+        for reader in self._readers:
+            reader.start()
 
     def _read_stdout(self) -> None:
         proc = self._proc
         if proc is None or proc.stdout is None:
             return
         try:
-            for line in proc.stdout:
-                self._lines.put(line)
+            while True:
+                line = proc.stdout.readline(protocol.MAX_LINE_CHARS + 1)
+                if not line:
+                    break
+                if len(line) > protocol.MAX_LINE_CHARS and not line.endswith("\n"):
+                    # Discard the rest of an overlong line in bounded chunks:
+                    # one hostile line must never force a huge allocation.
+                    while line and not line.endswith("\n"):
+                        line = proc.stdout.readline(protocol.MAX_LINE_CHARS + 1)
+                    continue
+                try:
+                    self._lines.put(line, timeout=0.5)
+                except queue.Full:
+                    # A flood with no consumer must not grow the queue.
+                    self._overflow.set()
+                    break
         except (OSError, ValueError):
             pass
         # EOF sentinel: a waiter blocked on a dead server must not hang.
-        self._lines.put(None)
+        try:
+            self._lines.put(None, timeout=0.5)
+        except queue.Full:
+            self._overflow.set()
 
     def _read_stderr(self) -> None:
         proc = self._proc
         if proc is None or proc.stderr is None:
             return
         try:
-            for line in proc.stderr:
+            while True:
+                line = proc.stderr.readline(protocol.MAX_LINE_CHARS + 1)
+                if not line:
+                    break
+                if len(line) > protocol.MAX_LINE_CHARS and not line.endswith("\n"):
+                    while line and not line.endswith("\n"):
+                        line = proc.stderr.readline(protocol.MAX_LINE_CHARS + 1)
+                    line = "line too long\n"
                 self._stderr.append(line.rstrip("\n"))
                 if len(self._stderr) > _STDERR_KEEP:
                     del self._stderr[0]
@@ -135,11 +175,17 @@ class MCPClient:
             raise MCPError(f"cannot write to MCP server {self.name!r}: {exc}") from exc
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Send a request and return its result payload."""
-        self._next_id += 1
-        message_id = self._next_id
-        self._write(protocol.request(message_id, method, params))
-        return self._await(message_id, method)
+        """Send a request and return its result payload.
+
+        The write and the await are one critical section: all responses share
+        a single queue, so a second waiter could otherwise consume and drop
+        the first one's reply.
+        """
+        with self._request_lock:
+            self._next_id += 1
+            message_id = self._next_id
+            self._write(protocol.request(message_id, method, params))
+            return self._await(message_id, method)
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         """Send a notification (no answer expected)."""
@@ -148,6 +194,10 @@ class MCPClient:
     def _await(self, message_id: int, method: str) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
         while True:
+            if self._overflow.is_set():
+                raise MCPError(
+                    f"MCP server {self.name!r} flooded stdout; response queue overflow"
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise MCPError(
@@ -159,6 +209,10 @@ class MCPClient:
                 raise MCPError(
                     f"timeout waiting for {method!r} from MCP server {self.name!r}"
                 ) from None
+            if self._overflow.is_set():
+                raise MCPError(
+                    f"MCP server {self.name!r} flooded stdout; response queue overflow"
+                )
             if line is None:
                 tail = "\n".join(self.stderr_tail()[-5:])
                 raise MCPError(
@@ -236,20 +290,24 @@ class MCPClient:
                 proc.stdin.close()
         except (OSError, ValueError):
             pass
+        # Tree-kill so grandchildren cannot survive shutdown and keep the
+        # inherited pipes (and therefore the reader threads) alive.
+        _kill_process_tree(proc)
         try:
-            proc.terminate()
-            proc.wait(timeout=3)
+            proc.wait(timeout=2)
         except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            pass
+        # Closing the pipes unblocks a reader still parked on a handle held
+        # by a descendant that outlived the tree-kill.
         for stream in (proc.stdout, proc.stderr):
             try:
                 if stream is not None:
                     stream.close()
             except (OSError, ValueError):
                 pass
+        for reader in self._readers:
+            reader.join(timeout=2)
+        self._readers = []
         self._proc = None
 
 
@@ -326,5 +384,12 @@ def build_mcp_tools(
                 on_error(str(exc))
             continue
         clients.append(client)
-        tools.extend(MCPToolAdapter(client, item) for item in specs)
+        # A single malformed advertisement must not abort the whole harness:
+        # skip just that tool and report it through the error callback.
+        for item in specs:
+            try:
+                tools.append(MCPToolAdapter(client, item))
+            except Exception as exc:  # noqa: BLE001 - one bad spec is not fatal
+                if callable(on_error):
+                    on_error(f"MCP server {name!r} advertised a bad tool: {exc}")
     return tools, clients

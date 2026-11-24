@@ -106,11 +106,9 @@ _CTRL_NAMES = {
 
 _SGR_MOUSE = re.compile(r"^<(-?\d+);(\d+);(\d+)([Mm])")
 
-# Bracketed paste markers. On Windows the console delivers a paste as
-# key records rather than a byte stream, but a host that wraps pastes
-# (e.g. Windows Terminal after ``?2004h``) sends the markers too; the
-# reader reassembles them into one Paste event so newlines inside the
-# paste cannot submit the composer mid-paste.
+# Bracketed-paste markers. Some hosts wrap pastes in these even though
+# the console delivers key records; reassemble them into one Paste event
+# so newlines inside cannot submit the composer mid-paste.
 _PASTE_START = "\x1b[200~"
 _PASTE_END = "\x1b[201~"
 _PASTE_CAP = 200000
@@ -128,6 +126,7 @@ class Backend:
         # POSIX self-pipe: a SIGWINCH handler writes one byte so the
         # reader's select() wakes up and emits a Resize event.
         self._winch_r = self._winch_w = -1
+        self._saved_winch = signal.SIG_DFL  # restored on exit
         # Windows console mode to restore on exit.
         self._saved_in_mode: int | None = None
         self._saved_out_mode: int | None = None
@@ -136,11 +135,8 @@ class Backend:
 
     # ── lifecycle ─────────────────────────────────────────────
 
-    # Mouse tracking (SGR) so reports arrive as structured records
-    # instead of being decomposed into keystrokes, plus bracketed paste
-    # for multi-line input. Mode 1002 (button-event tracking) is what
-    # delivers motion while a button is held - without it a terminal
-    # reports only press/release and drag selection can never start.
+    # Request SGR mouse reports and bracketed paste. Mode 1002 delivers
+    # motion while a button is held, which drag selection needs.
     _MOUSE_ON = "\033[?1000h\033[?1002h\033[?1006h"
     _MOUSE_OFF = "\033[?1000l\033[?1002l\033[?1003l\033[?1006l"
     _PASTE_OFF = "\033[?2004l"
@@ -150,10 +146,8 @@ class Backend:
         self._stop.clear()
         self._size = term_size()
         self._enter()
-        # Clear any tracking modes a crashed previous session may have
-        # left armed, then claim the modes this application services.
-        # Without the claim, mouse reports arrive decomposed into raw
-        # keystrokes and get typed into the prompt as literal text.
+        # Clear stale modes from a crashed session, then claim our own;
+        # otherwise mouse reports arrive as keystrokes typed into the prompt.
         self.write(
             "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1004l"
             + self._MOUSE_ON
@@ -193,10 +187,9 @@ class Backend:
 
     def write(self, text: str) -> None:
         if os.name == "nt":
-            # Frames are pure escape sequences: if anything in the process
-            # tree cleared virtual-terminal processing, the next frame
-            # would paint as literal text. Verify on every frame (one
-            # syscall) and restore immediately when lost.
+            # Frames are escape sequences; if another process cleared VT
+            # processing they would paint as literal text. Verify (one
+            # syscall per write) and restore immediately.
             self._ensure_vt()
         with self._write_lock:
             try:
@@ -225,9 +218,8 @@ class Backend:
             if not mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
                 kernel32.SetConsoleMode(handle, mode.value | 0x0004)
         except Exception:
-            # ctypes/Win32 surface: a missing kernel32 or non-console
-            # handle simply means there is nothing to restore; frames
-            # still write (the UnicodeEncodeError fallback covers output).
+            # No kernel32 or no console handle means nothing to restore;
+            # the output fallback still covers plain writes.
             pass
 
     def current_size(self) -> tuple[int, int]:
@@ -266,11 +258,9 @@ class Backend:
         if kernel32.GetConsoleMode(self._stdout_handle, ctypes.byref(mode)):
             self._saved_out_mode = mode.value
             kernel32.SetConsoleMode(self._stdout_handle, mode.value | 0x0004)
-        # Request VT input as well as mouse/window records. Windows Terminal
-        # can translate wheel motion in the alternate screen to arrow keys
-        # unless the application requests terminal-encoded mouse input.
-        # The reader below reassembles VT sequences delivered as key records
-        # (including arrows, backspace and SGR wheel reports).
+        # Request VT input plus mouse/window records; some hosts otherwise
+        # turn wheel motion into arrow keys in the alternate screen. The
+        # reader reassembles VT sequences delivered as key records.
         mode = wintypes.DWORD()
         if kernel32.GetConsoleMode(self._stdin_handle, ctypes.byref(mode)):
             self._saved_in_mode = mode.value
@@ -325,11 +315,16 @@ class Backend:
             self._fd = -1
             self._saved_attr = None
         # Self-pipe for SIGWINCH so resize wakes the reader immediately.
+        # Remember the embedding process' handler so teardown restores it.
         try:
             self._winch_r, self._winch_w = os.pipe()
+            # A handler installed from C can read back as None; fall back
+            # to the default rather than leaving ours installed.
+            self._saved_winch = signal.getsignal(signal.SIGWINCH) or signal.SIG_DFL
             signal.signal(signal.SIGWINCH, self._on_winch)
         except (OSError, ValueError):
             self._winch_r = self._winch_w = -1
+            self._saved_winch = signal.SIG_DFL
 
     def _leave_posix(self) -> None:
         import termios
@@ -340,9 +335,10 @@ class Backend:
             except termios.error:
                 pass  # fd closed or not a tty anymore; nothing to restore
         try:
-            signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+            signal.signal(signal.SIGWINCH, self._saved_winch)
         except (OSError, ValueError):
             pass
+        self._saved_winch = signal.SIG_DFL
         for fd in (self._winch_r, self._winch_w):
             if fd is not None and fd >= 0:
                 try:
@@ -425,12 +421,9 @@ class Backend:
             return frozenset(mods)
 
         last_buttons = 0
-        # ConPTY sometimes decomposes terminal control sequences (most
-        # importantly SGR mouse reports) into individual KEY_EVENTs. A
-        # sequence started by escape is accumulated here and parsed by
-        # the same escape decoder the POSIX byte stream uses; when it
-        # turns out to be a plain escape press, that is handed through
-        # as one.
+        # The console may split control sequences into individual key
+        # records. Accumulate Escape-led runs and parse them with the
+        # shared decoder; a lone escape is passed through as a key.
         pending = ""
         pending_at = 0.0
         last_size_poll = 0.0
@@ -450,15 +443,9 @@ class Backend:
                         break
                 self.events.put(Paste(body))
             else:
-                # Decode every complete escape sequence in the buffer
-                # through the shared parser: a decomposed SGR wheel
-                # report, arrow, or PageUp becomes its real event here,
-                # not a shower of "[<64;55;15M" keystrokes. Whatever the
-                # parser cannot consume is dropped, never typed: the
-                # fragments of a truncated report would otherwise land
-                # in the prompt box as literal text (exactly the bug
-                # where wheel motion "typed" into the composer while
-                # the transcript never scrolled).
+                # Decode complete sequences through the shared parser so a
+                # split wheel report or arrow becomes one event, not typed
+                # keystrokes. Unparseable fragments are dropped.
                 for event in self._decode_win_sequence_buffer(pending):
                     self.events.put(event)
             pending = ""
@@ -490,12 +477,9 @@ class Backend:
                 last_size_poll = now
                 self._ensure_windows_input_mode()
                 self.emit_resize_if_changed()
-            # A decomposed sequence whose records arrive gappily gets a
-            # generous grace window: flushing early would spray the
-            # report's parameter bytes into the composer as typing. A
-            # real key press never needs this long, and a still-growing
-            # sequence resets the timer on every new record, so the
-            # worst case is one delayed event, not a lost one.
+            # Gappy sequences get a grace window: flushing early would
+            # type the report's parameter bytes. Each new record resets
+            # the timer, so the worst case is a delay, not a lost event.
             if pending and now - pending_at > 0.3 and not pending_is_incomplete():
                 flush_pending()
             count = wintypes.DWORD()
@@ -534,16 +518,11 @@ class Backend:
                         continue
                     mods = mods_of(key.dwControlKeyState)
                     ch = key.uChar
-                    # Sequence reassembly: an escape character opens a
-                    # possible control sequence; a completed one is
-                    # decoded below into its real event (prefix-matched
-                    # so a burst of reports in one buffer is consumed
-                    # one report at a time).
+                    # Escape opens a possible sequence; completed ones are
+                    # decoded below, consuming one report at a time.
                     if pending:
-                        # Repeats arrive as one record with wRepeatCount
-                        # (held key or paste of identical chars); expand
-                        # them while collecting a bracketed paste so the
-                        # body is not shortened.
+                        # Expand key repeats while collecting a paste so
+                        # its body is not shortened.
                         if key.wRepeatCount > 1 and pending.startswith(_PASTE_START):
                             pending += ch * key.wRepeatCount
                         else:
@@ -558,12 +537,9 @@ class Backend:
                                 flush_pending()
                             pending_at = time.monotonic()
                             continue
-                        # Decode complete sequences immediately through
-                        # the shared parser (SGR wheel reports, arrows,
-                        # PageUp...): a decomposed report fires its real
-                        # event the moment its final record lands, and a
-                        # burst of reports in one buffer is consumed one
-                        # at a time.
+                        # Decode complete sequences at once through the
+                        # shared parser; a report fires when its final
+                        # record lands, one report per burst iteration.
                         while pending.startswith("\x1b"):
                             consumed, event, _ = self._parse_escape(pending, 0)
                             if consumed == 0:
@@ -662,10 +638,9 @@ class Backend:
             # VT input encodes Backspace as DEL even when the virtual key
             # field is absent. Keep it out of the composer text buffer.
             return [Key("backspace", mods)]
-        # Control characters arrive as their control code in uChar. A NUL
-        # uChar means the key carries no character at all (arrows, function
-        # keys): it must fall through to the virtual-key lookup below
-        # instead of being misread as Ctrl+Space.
+        # Control codes arrive in uChar; a NUL means no character at all
+        # (arrows, function keys) and must fall through to the virtual-key
+        # lookup below rather than become Ctrl+Space.
         if ch and ord(ch) < 32 and ch != "\x00":
             name = _CTRL_NAMES.get(ord(ch))
             if name == "enter" and "shift" in mods:
@@ -700,6 +675,23 @@ class Backend:
 
     # ── POSIX: byte stream parser ─────────────────────────────
 
+    def _idle_replay_posix(self, pending: str) -> str:
+        """Resolve an idle read; return the buffer that must stay pending.
+
+        A bracketed paste with no end marker yet is kept intact across the
+        gap: replaying it would type the marker bytes and embedded newlines
+        into the composer, where a newline submits the prompt mid-paste.
+        The cap in _parse_escape bounds it instead. Only incomplete
+        ordinary escapes are replayed as keys.
+        """
+        if not pending or pending.startswith(_PASTE_START):
+            return pending
+        if time.monotonic() - getattr(self, "_pending_at", 0.0) > 0.05:
+            for ch in pending:
+                self._feed_char(ch)
+            return ""
+        return pending
+
     def _read_loop_posix(self) -> None:
         import select
 
@@ -731,11 +723,7 @@ class Backend:
                 self.emit_resize_if_changed()
                 continue
             if fd not in ready:
-                if pending and time.monotonic() - getattr(self, "_pending_at", 0.0) > 0.05:
-                    # An unterminated sequence: hand the escape back.
-                    for ch in pending:
-                        self._feed_char(ch)
-                    pending = ""
+                pending = self._idle_replay_posix(pending)
                 continue
             try:
                 data = os.read(fd, 4096)
@@ -826,15 +814,18 @@ class Backend:
             body = seq[2:]
             if not body:
                 return 0, None, last_buttons
-            # Bracketed paste start: 200~ ... 201~
-            if body.startswith("200"):
+            # Bracketed paste start: 200~ ... 201~. Match the whole marker,
+            # not just "200": CSI 200A is an ordinary key, not a paste.
+            if seq.startswith(_PASTE_START):
                 idx = seq.find(_PASTE_END)
                 if idx < 0:
                     # Bound memory: a paste whose end marker never shows
                     # is cut off at the cap and delivered as-is.
                     if len(seq) > _PASTE_CAP + len(_PASTE_START):
                         cut = _PASTE_CAP + len(_PASTE_START)
-                        return len(seq), Paste(seq[len(_PASTE_START):cut]), last_buttons
+                        # Consume only through the cap so bytes that came
+                        # in the same read are decoded, not discarded.
+                        return cut, Paste(seq[len(_PASTE_START):cut]), last_buttons
                     return 0, None, last_buttons
                 text = seq[len(_PASTE_START):idx]
                 return idx + len(_PASTE_END), Paste(text), last_buttons
@@ -847,11 +838,8 @@ class Backend:
                 col = max(0, int(m.group(2)) - 1)
                 row = max(0, int(m.group(3)) - 1)
                 pressed = m.group(4) == "M"
-                # Wheel codes carry the modifier bits (shift +4, alt +8,
-                # ctrl +16), and the spec adds 66/67 for horizontal tilt.
-                # Classify with the modifiers stripped: an unstripped
-                # shift+wheel (68) fell through to the press path below
-                # and became a click wherever the cursor rested.
+                # Strip modifier bits (4/8/16) before classifying wheels;
+                # otherwise shift+wheel falls through and becomes a click.
                 base = button & ~0x1C
                 if base in (_WHEEL_UP, _WHEEL_DOWN):
                     return len(m.group(0)) + 2, Mouse("wheel", base, col, row), last_buttons

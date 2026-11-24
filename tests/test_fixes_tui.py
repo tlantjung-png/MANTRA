@@ -133,10 +133,8 @@ class D3SessionPanelUnitsTest(unittest.TestCase):
         for _ in range(20):
             app.handle_event(Key("j"))
         panel = app.session_panel
-        # j moves the cursor down and scrolls the offset to keep it
-        # visible. After 20 j's, the cursor sits at entry 20 (clamped
-        # before total) and the offset has rolled forward so the
-        # selected entry is on screen.
+        # Twenty j's put the cursor at entry 20; the offset rolls forward
+        # so the selected entry stays on screen.
         self.assertEqual(panel.index, 20)
         self.assertEqual(panel.offset, 20 - (app.rows - 2) // 2 + 1)
         app.render_frame()

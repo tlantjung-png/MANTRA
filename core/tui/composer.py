@@ -49,10 +49,8 @@ class Composer:
         # selected range; caret moves clear it.
         self.sel_anchor: int | None = None
         self.sel_head: int | None = None
-        # Wheel-driven view offset (first visible line) for a multi-line
-        # buffer: independent of the caret so the operator can read the
-        # top of a long prompt while the caret stays deep below. Typing
-        # or any caret move re-anchors the view to the caret line.
+        # Wheel view offset (first visible line) for a multi-line buffer,
+        # independent of the caret; typing or a caret move re-anchors it.
         self._view_first: int | None = None  # None = follow the caret
 
     # ── state ─────────────────────────────────────────────────
@@ -318,9 +316,8 @@ class Composer:
         return i
 
     # ── mouse geometry ────────────────────────────────────────
-    # Maps screen cells back onto buffer offsets with the same layout
-    # math as rendering, so a press/drag in the prompt box positions
-    # the caret and selects text for editing.
+    # Screen cells map back to buffer offsets with the render layout
+    # math, so clicks place the caret and drags select text.
 
     def _label_vis(self) -> int:
         return visible_len(f"│ {self.label} ")
@@ -344,10 +341,8 @@ class Composer:
         max_lines = max(1, height - 1)
         first = self._view_start(box_height)
         y = rows_total - box_height
-        # Free view: the shown window is [first, first + max_lines); the
-        # caret line keeps its horizontal window, other rows are clipped
-        # from column 0 — the caret must stay where the caret column math
-        # says it is.
+        # Free view: only the caret line keeps its horizontal window;
+        # other rows clip from column 0.
         last = min(len(lines) - 1, first + max_lines - 1)
         caret_line = min(self._caret_line_index(), len(lines) - 1)
         caret_col = self.cursor - sum(len(lines[i]) + 1 for i in range(caret_line))
@@ -535,10 +530,8 @@ class Composer:
             col = self.cursor - start
         else:
             col = self.cursor
-        # The caret lives on the rendered line, so it moves in display
-        # columns: a wide character before it pushes the caret two cells,
-        # not one. Counting string indexes put the caret inside the wide
-        # character it sits after.
+        # Caret position is in display columns: a wide char before it
+        # advances two cells, so string indexes would land inside it.
         line = lines[cl] if self.is_multiline else self.buffer
         col_in_line = min(col, len(line))
         display = visible_len(line[:col_in_line])

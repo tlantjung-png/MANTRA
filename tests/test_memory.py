@@ -6,9 +6,8 @@ import os
 import tempfile
 import unittest
 
-# Isolate the settings store for direct runs of this file; suite runs
-# already redirect it in tests/__init__.py. The temp dir is removed at
-# process exit instead of leaking.
+# Isolate the settings store for direct runs of this file; the suite
+# redirects it in conftest.py. The temp dir is removed at process exit.
 _SETTINGS_TMP = tempfile.TemporaryDirectory(prefix="mantra-memory-settings-")
 os.environ.setdefault("MANTRA_SETTINGS", os.path.join(_SETTINGS_TMP.name, "config.json"))
 atexit.register(_SETTINGS_TMP.cleanup)

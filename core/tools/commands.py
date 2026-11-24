@@ -37,19 +37,35 @@ _TASK_COUNTER = 0
 _MAX_TASKS = 100
 _TASK_TTL_SECONDS = 3600  # 1 hour; completed tasks older than this are pruned
 
-# Full-output log files written by _format_result when a command's output
-# exceeds the inline budget. Each is a tempfile that nothing removes, so
-# the files are tracked here and pruned on every new allocation: entries
-# older than the TTL are deleted, and the registry is size-capped.
+# Full-output logs from _format_result are tempfiles nothing else removes;
+# this registry prunes them by TTL and size on every new allocation.
 _FULL_LOG_FILES: dict[str, float] = {}
 _FULL_LOG_LOCK = threading.Lock()
 _FULL_LOG_TTL_SECONDS = 3600
 _MAX_FULL_LOGS = 50
 
-# Background task logs stop growing past this ceiling; a chatty command
-# can run up to 600s and must not be able to fill the disk. The pumper
-# writes a marker and the truncated flag is surfaced by shell_output.
+# A background command may run up to 600s; its log stops at this ceiling so
+# it cannot fill the disk. shell_output surfaces the truncation flag.
 _LOG_BYTE_CEILING = 10 * 1024 * 1024
+
+
+def _join_output_pump(pumper: threading.Thread, proc: subprocess.Popen, task_id: str) -> None:
+    """Join the output pump; on timeout close the pipe and record the leak."""
+    pumper.join(timeout=2)
+    if pumper.is_alive():
+        # A grandchild may still hold the pipe, leaving the daemon reader
+        # blocked until process exit. Force the handle shut and make it
+        # visible through the task record instead of failing silently.
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+        with _TASKS_LOCK:
+            if task_id in _TASKS:
+                _TASKS[task_id]["cleanup_warning"] = (
+                    "output pump still alive after join; pipe closed"
+                )
 
 
 def _register_full_log(path: str) -> None:
@@ -92,10 +108,8 @@ def _prune_tasks_locked() -> None:
                 os.remove(lp)
             except OSError:
                 pass
-    # If still over capacity, remove oldest completed first. A registry
-    # full of running tasks is left over capacity: evicting a live entry
-    # would orphan its process — unfindable by kill_shell, unreadable by
-    # shell_output — which is worse than a temporarily larger registry.
+    # Evict only completed tasks: removing a live one would orphan its
+    # process from kill_shell and shell_output, worse than a large registry.
     while len(_TASKS) > _MAX_TASKS:
         # Prefer to evict oldest completed task
         oldest_completed = None
@@ -199,10 +213,9 @@ def _prune_done_logs(log_path: str) -> None:
         pass
 
 
-# Unix-only utilities that do not exist on the native Windows shell. When
-# one leads a command, fail fast with the Windows equivalent instead of
-# letting cmd.exe print a confusing "'x' is not recognized" line that
-# costs the agent a turn.
+# Unix-only utilities absent from the native Windows shell. When one leads a
+# command, fail fast with its Windows equivalent instead of a confusing
+# "'x' is not recognized" error from cmd.exe.
 _UNIX_ONLY_COMMANDS: dict[str, str] = {
     "cat": "Get-Content <file>",
     "tail": "Get-Content <file> -Tail <n>",
@@ -232,15 +245,61 @@ _UNIX_ONLY_COMMANDS: dict[str, str] = {
 }
 
 
+def _split_unquoted_segments(command: str) -> list[str]:
+    """Split chain separators only outside quotes.
+
+    Splitting the raw string first can turn a quoted payload like
+    ``echo "a; grep b"`` into a segment that appears to start with ``grep``
+    and produce a misleading refusal.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"' and i + 1 < len(command):
+                i += 1
+                current.append(command[i])
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if command.startswith("||", i) or command.startswith("&&", i):
+            segments.append("".join(current))
+            current = []
+            i += 2
+            continue
+        if ch in ";|\n":
+            segments.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    segments.append("".join(current))
+    return segments
+
+
 def _windows_unix_guard(command: str) -> str | None:
     """Guidance when a pipeline/chain segment starts with a Unix-only utility."""
     if os.name != "nt":
         return None
-    for segment in re.split(r"\|\||&&|;|\n|\|", command or ""):
+    for segment in _split_unquoted_segments(command or ""):
         token = segment.strip()
         if not token:
             continue
-        first = re.split(r"\s+", token, maxsplit=1)[0].strip("\"'")
+        first = re.split(r"\s+", token, maxsplit=1)[0]
+        if first.startswith(("'", '"')):
+            # A quoted command name is not a bare command-position token.
+            continue
         base = first.lower().rstrip(".exe")
         if base in _UNIX_ONLY_COMMANDS and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\-\.]*", first):
             return (
@@ -344,10 +403,9 @@ class RunCommandTool(Tool):
         return self._format_result(result, command)
 
     def _execute_background(self, sandbox: Sandbox, command: str, timeout: float) -> str:
-        # Background execution spawns the process directly on the host, so
-        # it is only safe for the host-local sandbox. Any other sandbox
-        # (e.g. a container) must refuse here rather than silently escape
-        # its isolation boundary.
+        # Background execution spawns directly on the host; only the
+        # host-local sandbox may use it, so a container cannot escape its
+        # isolation boundary.
         if getattr(sandbox, "root", None) is None or not hasattr(sandbox, "screen_command"):
             return (
                 "ERROR: background execution is only supported by the host "
@@ -450,11 +508,9 @@ class RunCommandTool(Tool):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    # Same isolation as the foreground path: the task runs
-                    # in its own process group so a timeout or abort can
-                    # kill the whole tree instead of orphaning descendants.
-                    # The env is filtered so background children do not
-                    # inherit the harness's credential-shaped variables.
+                    # Own process group so timeout/abort can kill the whole
+                    # tree; filtered env keeps credential-shaped variables
+                    # out of background children.
                     env=_filtered_env(os.environ),
                     **_POPEN_GROUP_KWARGS,
                 )
@@ -469,11 +525,8 @@ class RunCommandTool(Tool):
                     _TASKS[task_id]["process"] = proc
             screened.set()
 
-            # Stream output incrementally so shell_output can follow the
-            # run's progress instead of seeing nothing until exit. Writes
-            # are capped at a byte ceiling so a chatty command cannot grow
-            # the log without bound; past the ceiling the tail is dropped
-            # and a marker + flag record the truncation.
+            # Stream output so shell_output can follow progress; the byte
+            # ceiling bounds the log and a marker plus flag record truncation.
             def _pump():
                 try:
                     written = 0
@@ -512,15 +565,14 @@ class RunCommandTool(Tool):
             timed_out = False
             while True:
                 if abort is not None and abort.is_set():
-                    # Operator abort: kill the whole tree (the task leads
-                    # its own process group), join the pumper, and finalize
-                    # the task as interrupted.
+                    # On abort: tree-kill the process group, join the pumper,
+                    # and finalize the task as interrupted.
                     _kill_task_tree(proc)
                     try:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         pass
-                    pumper.join(timeout=2)
+                    _join_output_pump(pumper, proc, task_id)
                     _finish_task(
                         task_id, log_path,
                         proc.returncode if proc.returncode is not None else -1,
@@ -545,7 +597,7 @@ class RunCommandTool(Tool):
                         pass
                     exit_code = 143 if proc.returncode is None else proc.returncode
                     break
-            pumper.join(timeout=2)
+            _join_output_pump(pumper, proc, task_id)
             _finish_task(
                 task_id, log_path,
                 exit_code if exit_code is not None else -1,
@@ -571,12 +623,9 @@ class RunCommandTool(Tool):
                 "done": False,
             }
 
-        # The worker screens the command before spawning; the event is set
-        # on every early exit (refusal, spawn failure) and right after the
-        # pid is recorded. Waiting on it keeps the response honest: it
-        # never claims success for a refused command and never shows pid
-        # "?" for one that did start. A timeout only fires if the screener
-        # itself stalls; the old "?" fallback remains for that case.
+        # The event is set on every early exit and just after the pid is
+        # recorded, so the response never claims success for a refused
+        # command. A timeout only fires if the screener itself stalls.
         screened = threading.Event()
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
@@ -607,10 +656,8 @@ class RunCommandTool(Tool):
         )
 
     def _format_result(self, result: ExecResult, command: str) -> str:
-        # Honest exits: signal deaths map to 128+n; grep/Select-String
-        # exiting 1 means "no matches", not an error. Timed-out runs read
-        # 143; screen refusals and cap kills surface as -1, not a signal
-        # death.
+        # Honest exits: signals map to 128+n, grep/Select-String 1 means
+        # "no matches", timeouts read 143, refusals/cap kills surface -1.
         result_exit, exit_note = _map_exit_status(result, command)
 
         parts = [f"exit_code: {result_exit}{exit_note}"]
@@ -758,12 +805,9 @@ class ShellOutputTool(Tool):
                     pass
                 time.sleep(0.1)
 
-        # The cursor is a byte offset, in the same unit the next_write wait
-        # compares against (os.path.getsize). Reading in binary keeps the
-        # two in one unit; a text-mode stream's tell() cookie is an opaque
-        # number that drifts away from the byte size as soon as multi-byte
-        # characters enter the log, which used to make the wait spin past
-        # its timeout while output sat unread.
+        # Cursor and next_write both use byte offsets; binary mode keeps
+        # them in one unit. Text-mode tell() cookies drift on multi-byte
+        # output and made the wait time out with unread output.
         try:
             with open(log_path, "rb") as f:
                 f.seek(from_offset)
@@ -812,11 +856,9 @@ class KillShellTool(Tool):
     }
 
     def execute(self, sandbox: Sandbox, task_id: str = "", pid: Any = None, port: Any = None) -> str:  # type: ignore[override]
-        # Direct pid/port signalling reaches the host operating system, so
-        # it must never fire from inside a container sandbox — the tool
-        # would be an isolation escape exactly like an unguarded background
-        # exec. Only the host sandbox may use those forms; task_id killing
-        # is registry-local and safe everywhere.
+        # Direct pid/port signalling reaches the host OS, so only the host
+        # sandbox may use it; task_id killing is registry-local and safe
+        # everywhere.
         host_sandbox = (
             hasattr(sandbox, "screen_command")
             and getattr(sandbox, "root", None) is not None

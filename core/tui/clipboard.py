@@ -12,7 +12,9 @@ import base64
 import os
 
 
-def copy_text(text: str) -> None:
+def copy_text(text: str, writer=None) -> None:
+    """Copy text; ``writer`` routes the OSC 52 fallback through the app's
+    locked terminal writer when supplied by the TUI."""
     if not text:
         return
     if os.name == "nt":
@@ -21,7 +23,10 @@ def copy_text(text: str) -> None:
     else:
         if _copy_posix(text):
             return
-    _copy_osc52(text)
+    if writer is None:
+        _copy_osc52(text)
+    else:
+        _copy_osc52(text, writer)
 
 
 def paste_text() -> str:
@@ -78,9 +83,8 @@ def _copy_windows(text: str) -> bool:
         finally:
             user32.CloseClipboard()
     except Exception:
-        # ctypes/Win32 surface is heterogeneous (AttributeError on exotic
-        # builds, OSError on denied access); any failure just means this
-        # route lost, and the OSC 52 fallback still runs.
+        # Any ctypes/Win32 failure just loses this route; the OSC 52
+        # fallback still runs.
         return False
 
 
@@ -168,13 +172,15 @@ def _paste_posix() -> str:
 # ── portable fallback ─────────────────────────────────────────────
 
 
-def _copy_osc52(text: str) -> None:
+def _copy_osc52(text: str, writer=None) -> None:
     """Ask the terminal itself to set its clipboard.
 
     Many terminals honour this only for the local session or require an
     explicit opt-in, so it is the last route tried, never the first.
     """
     payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
-    from core.term import safe_write
+    if writer is None:
+        from core.term import safe_write
 
-    safe_write(f"\033]52;c;{payload}\x07")
+        writer = safe_write
+    writer(f"\033]52;c;{payload}\x07")

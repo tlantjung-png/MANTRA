@@ -538,9 +538,8 @@ class FirstRunTest(TempStorage, unittest.TestCase):
         llm = self.session.config["llm"]
         llm["base_url"] = "https://api.openai.com/v1"
         llm["api_key_env"] = "OPENAI_API_KEY"
-        # Drop the env var so only the stored key can satisfy the check.
-        # The dict is snapshotted rather than cleared: wiping the
-        # environment also removes HOME, which Path.home() needs.
+        # Drop the env var so only the stored key satisfies the check.
+        # Snapshot the dict: clearing it would remove HOME for Path.home().
         with mock.patch.dict(os.environ):
             os.environ.pop("OPENAI_API_KEY", None)
             self.assertFalse(_needs_first_run(self.session))

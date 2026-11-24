@@ -293,10 +293,9 @@ def load_bundles() -> dict[str, list[str]]:
             name = cells[0].strip().strip("`").lower()
             skills = _backticked(cells[1])
             if name and skills:
-                # Earlier roots win, matching load_skill precedence for
-                # individual skills: the repo-shipped library is searched
-                # first, so its bundles are authoritative and the personal
-                # tree only supplies bundles the library does not carry.
+                # Earlier roots win, as in load_skill: the shipped library
+                # is authoritative and the personal tree only supplies
+                # bundles the library lacks.
                 bundles.setdefault(name, skills)
     _cache_bundles = dict(bundles)
     _cache_bundles_ts = now
@@ -462,10 +461,9 @@ def route(query: str, limit: int = 5) -> list[tuple[Skill, float]]:
     return scored[:limit]
 
 
-# A skill is offered unasked only when it answers at least this much of
-# what was said, and is this far ahead of the runner-up. Below either,
-# the request is too vague or too contested to guess, and attaching the
-# wrong procedure quietly is worse than attaching nothing.
+# Auto-attach only above this coverage and margin over the runner-up;
+# below either, the request is too vague or contested, and a wrong
+# procedure is worse than none.
 _CONFIDENCE = 0.34
 _MARGIN = 1.25
 
