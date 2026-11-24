@@ -26,7 +26,7 @@ Credentials are not written to the run configuration. They resolve first from th
 
 ## Everyday Use
 
-An operator types a natural-language request at the prompt and submits it. The harness explores the workspace, makes changes through approved tools, and runs verification steps. Follow-up messages continue the same conversation and workspace so work can be iterated.
+An operator types a natural-language request at the prompt and submits it. The harness explores the workspace, makes changes through approved tools, and runs verification steps. Follow-up messages continue the same conversation and workspace so work can be iterated. Prompts submitted while a turn is still running are queued in order and each is processed after the current turn finishes.
 
 Workspace files can be referenced inline by prefixing a path or pattern with an at-sign. A reference resolves to file contents, a directory listing, or every file a pattern matches. Paths are relative to the workspace and cannot escape it.
 

@@ -1191,7 +1191,9 @@ class ConsoleSession(
                 self.last_reply = result.final_message or ""
         finally:
             self._restore_sigint()
-            self._set_busy(False)
+            # The terminal application owns the busy flag and clears it in
+            # its turn worker. Clearing it here races that teardown and lets
+            # a prompt submitted near turn end bypass the queue.
             # Last, so the skill the router chose is in force for the whole
             # turn - including the divider row - and not a moment less.
             self._detach_auto()

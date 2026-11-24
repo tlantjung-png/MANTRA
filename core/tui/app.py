@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import queue
 import re
+from collections import deque
 import tempfile
 import threading
 import time
@@ -372,11 +373,23 @@ class TuiApp:
         self._overlay_lock = threading.Lock()  # guards the overlay/reply slot
         self._prompt_gate = threading.Lock()   # one blocking prompt at a time
         self._composer_press = False  # a press started inside the prompt box
-        self.queued = ""                  # prompt submitted mid-turn
+        self._prompt_queue: deque[str] = deque()  # prompts submitted mid-turn, FIFO
         self._last_ctrl_c = 0.0
         self._drag_autoscroll = 0
         self._dirty = True
         self._turn_started = time.monotonic()
+
+    @property
+    def queued(self) -> str:
+        """First mid-turn prompt still waiting to run, for the status row."""
+        return self._prompt_queue[0] if self._prompt_queue else ""
+
+    @queued.setter
+    def queued(self, text: str) -> None:
+        """Compatibility setter used by the status-row stub and tests."""
+        self._prompt_queue.clear()
+        if text:
+            self._prompt_queue.append(text)
 
     # ── lifecycle ─────────────────────────────────────────────
 
@@ -517,8 +530,13 @@ class TuiApp:
                 self._history.append(display_text)
             self._history_idx = len(self._history)
             if self.busy:
-                self.queued = text
-                self.toast_message("queued — runs when the current turn ends")
+                self._prompt_queue.append(text)
+                count = len(self._prompt_queue)
+                self.toast_message(
+                    "queued — runs when the current turn ends"
+                    if count == 1
+                    else f"queued ({count}) — each runs after the current turn"
+                )
                 self.mark_dirty()
                 return
             self.busy = True
@@ -562,22 +580,19 @@ class TuiApp:
             self._turn_had_error = True
             self.feed_output(f"\033[38;5;167m  !! {exc}\033[0m\n")
         finally:
-            # Clear busy and take the queued prompt under submit()'s lock
-            # so the thread handoff is atomic: a prompt is queued or starts
-            # a fresh turn, never lost.
+            # Hand the oldest queued prompt to a fresh turn inside the same
+            # lock that submit() uses, so no prompt can be overwritten or
+            # dropped by an unexpected exception from the turn body.
             with self.lock:
                 self.busy = False
                 self.activity = ""
                 self.activity_detail = ""
-                queued = self.queued
-                self.queued = ""
+                handoff = self._prompt_queue.popleft() if self._prompt_queue else ""
                 self._last_turn_tool_text = self.take_turn_tool_text()
-            self.status_text = ""
-            self.mark_dirty()
-        if queued and self.running:
-            # Let the turn's own tail lines settle before the next one.
-            time.sleep(0.05)
-            self.submit(queued)
+                self.status_text = ""
+                self.mark_dirty()
+                if handoff and self.running:
+                    self.submit(handoff)
 
     # ── blocking interactive helpers (worker-thread side) ─────
 

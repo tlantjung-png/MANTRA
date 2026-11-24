@@ -44,6 +44,8 @@ Mitigated with residual risk, not eliminated:
 
 Two new behaviours were added beyond the findings: every interactive turn, the headless verdict, and saved-session replay now end with a plain-language closing summary, and the system prompt requires the model's own final answer to end with the same structure. This directly addresses the reported confusion where a conversation ended on a raw tool-output box.
 
+A further defect was reported after the audit and fixed: prompts submitted while a turn was running were held in a single slot, so a second prompt overwrote the first, and an unexpected turn error discarded the slot before handoff. `core/tui/app.py` now uses an ordered queue drained inside the turn worker's teardown, and `core/console.py` no longer clears the application busy flag before that teardown. Regression coverage is in `tests/test_queued_prompt_delivery.py`. Note that input typed while a blocking approval card or completion popup is open is still consumed by that overlay rather than the prompt box; that is separate from the queued-prompt path.
+
 ---
 
 ## Bug Registry
