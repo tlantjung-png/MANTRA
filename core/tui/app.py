@@ -1379,10 +1379,11 @@ class TuiApp:
             # window clips the card instead of letting it paint over the
             # status row and the prompt box below it.
             card = self._welcome_lines[:height]
-            card_w = max((visible_len(ln) for ln in card), default=0)
-            x = max(0, (cols - card_w) // 2)
             y = content_top + max(0, (height - len(card)) // 2)
             for i, ln in enumerate(card):
+                # Center each line on its own width; sharing one block x
+                # makes shorter lines look left-aligned under the logo.
+                x = max(0, (cols - visible_len(ln)) // 2)
                 buf.set_styled_line(x, y + i, ln, styles, cols)
 
         # Bottom border row with status. The chip starts at column 2
@@ -1746,6 +1747,7 @@ class TuiApp:
             f"\033[{theme.BLOOD_BOLD}mM A N T R A\033[0m",
             f"\033[{theme.FAINT}mSpells Matter\033[0m",
             f"\033[{theme.HAIR}m{__version__}\033[0m",
+            f"\033[{theme.FAINT}mModular Harness Coding Agents\033[0m",
         ]
         self._welcome_card = True
         self.mark_dirty()

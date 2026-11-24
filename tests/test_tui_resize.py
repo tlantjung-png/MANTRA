@@ -41,6 +41,21 @@ class WelcomeCardResizeTest(unittest.TestCase):
 
         _cleanup_temp_workspaces()
 
+    def test_each_welcome_line_is_centered_on_its_own_width(self):
+        app, _, _ = _make_app([])
+        app.render_frame()
+        grid = grid_rows(app.renderer.buffer)
+        cols = app.renderer.buffer.cols
+        for label in (
+            "M A N T R A",
+            "Spells Matter",
+            "3.1.3",
+            "Modular Harness Coding Agents",
+        ):
+            row = next(r for r in grid if label in r)
+            indent = len(row) - len(row.lstrip())
+            self.assertEqual(indent, max(0, (cols - len(label)) // 2))
+
     def test_welcome_card_is_centered_and_follows_resizes(self):
         # The welcome card is drawn centered in the content area (not
         # top-left), re-centers when the window is resized, and is
